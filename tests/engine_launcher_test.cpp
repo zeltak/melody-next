@@ -34,6 +34,7 @@ class EngineLauncherTest final : public QObject {
     void nothingStartsOneUnlessAllowed();
     void onlyTheEngineBesideItIsStarted();
     void sharingSettingsReachTheEngine();
+    void upnpSettingsDraftReachesBothWindowsAndLauncher();
     void theEnginePlaysForTheRemoteWithoutAnAgent();
     void anOutdatedEngineIsSeenAndStopped();
 };
@@ -175,6 +176,33 @@ void EngineLauncherTest::onlyTheEngineBesideItIsStarted() {
     qputenv("PATH", path);
     qputenv("TRACKKNIFE_ENGINE", saved);
     QVERIFY(!program.startsWith(bin.path()));
+}
+
+void EngineLauncherTest::upnpSettingsDraftReachesBothWindowsAndLauncher() {
+    QSettings settings;
+    settings.clear();
+    const auto cleanup = qScopeGuard([] { QSettings{}.clear(); });
+    settings.setValue(QLatin1String(SettingsKeys::engine_upnp_key), true);
+    SettingsSession draft;
+    QCOMPARE(draft.value(QLatin1String(SettingsKeys::engine_upnp_key)).toBool(),
+             bool(TRACKKNIFE_ENABLE_UPNP));
+    draft.setValue(QLatin1String(SettingsKeys::engine_upnp_key), false);
+    QVERIFY(!draft.value(QLatin1String(SettingsKeys::engine_upnp_key)).toBool());
+    // Cancel leaves the persisted preference untouched.
+    QVERIFY(settings.value(QLatin1String(SettingsKeys::engine_upnp_key)).toBool());
+    draft.setValue(QLatin1String(SettingsKeys::engine_upnp_key), true);
+    QVERIFY(!draft.save());
+    QCOMPARE(localEngineSharing().upnp, bool(TRACKKNIFE_ENABLE_UPNP));
+    QTemporaryDir directory;
+    LocalEngine engine;
+    engine.socket = directory.filePath(QStringLiteral("engine.sock")).toStdString();
+    engine.state = directory.path().toStdString();
+    const auto arguments = localEngineArguments(engine, localEngineSharing());
+    QCOMPARE(arguments.contains(QStringLiteral("--upnp")), bool(TRACKKNIFE_ENABLE_UPNP));
+#if TRACKKNIFE_ENABLE_UPNP
+    QVERIFY(arguments.contains(QStringLiteral("--http")));
+    QVERIFY(arguments.contains(QStringLiteral("0.0.0.0:6601")));
+#endif
 }
 
 // ADR-0226/0228: sharing this computer's engine is a setting, which reaches

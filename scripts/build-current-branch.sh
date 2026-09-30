@@ -16,7 +16,8 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-current-branch.sh [options]
 
-Build the current committed branch without fetching or merging main. After the
+Build Trackknife, Trackknife Quick and Melody from the current committed branch
+without fetching or merging main. After the
 desktop build succeeds, push that branch to the fork and build the exact same
 commit in a temporary worktree on the server. The server checkout itself is
 left on its existing branch.
@@ -132,9 +133,9 @@ if [[ $(uname -s) == Darwin ]] && command -v brew >/dev/null 2>&1; then
 fi
 
 printf 'Building desktop branch %s at %s\n' "$branch" "$commit"
-cmake --preset "$desktop_preset" "${configure_arguments[@]}"
-cmake --build --preset "$desktop_preset" --target trackknife melodyd --parallel "$jobs"
-printf 'Built desktop Trackknife and Melody from %s at %s\n' "$branch" "$commit"
+cmake --preset "$desktop_preset" -DTRACKKNIFE_BUILD_QUICK=ON "${configure_arguments[@]}"
+cmake --build --preset "$desktop_preset" --target trackknife trackknife-quick melodyd --parallel "$jobs"
+printf 'Built desktop Trackknife, Trackknife Quick and Melody from %s at %s\n' "$branch" "$commit"
 
 if [[ $build_server == false ]]; then
     exit 0
