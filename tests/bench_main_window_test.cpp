@@ -388,6 +388,8 @@ class BenchMainWindowTest final : public QObject {
     void localListHistoryBranchesAndBounds();
     void crossTabMoveUndoIsOneTransaction();
     void localListUndoActionsRespectAuthorityAndTextEditing();
+    void deleteInUpNextTakesItsTrackNotTheLists();
+    void settingsLeftOffReadAsOff();
     void localListOrderingActionsRespectAuthorityAndPersist();
     void portablePlaylistImportsPreserveAuthorityAndPersist();
     void trackListFindActionsFollowActiveTab();
@@ -1386,7 +1388,10 @@ void BenchMainWindowTest::transportIsOneRowWithCoverAndPills() {
     QVERIFY(window.findChild<QAction*>(QStringLiteral("action-backup-workspace")) != nullptr);
     QVERIFY(window.findChild<QAction*>(QStringLiteral("action-restore-workspace")) != nullptr);
     QVERIFY(!window.menuBar()->isHidden());
-    QCOMPARE(window.menuBar()->actions().size(), 4);
+    // File, Edit, Workspace, Playback, and Help with the language references.
+    QCOMPARE(window.menuBar()->actions().size(), 5);
+    QVERIFY(window.findChild<QAction*>(QStringLiteral("action-reference-tkfmt")) != nullptr);
+    QVERIFY(window.findChild<QAction*>(QStringLiteral("action-reference-scripts")) != nullptr);
     QCOMPARE(device->toolButtonStyle(), Qt::ToolButtonIconOnly);
     // Nothing to name, no chevron squeezed beside the icon.
     QVERIFY(device->findChild<QLabel*>(QStringLiteral("bench-device-chevron"))->isHidden());
@@ -1976,6 +1981,17 @@ void BenchMainWindowTest::libraryAndFoldersAddToAChosenList() {
     emit window.localLibrary()->browser().addToListRequested(page->entries, chosen_id);
     QTRY_COMPARE(chosen->model->rowCount(), 1);
     QCOMPARE(current->model->rowCount(), before);
+    QTRY_VERIFY(!window.discovery_running_);
+
+    // Or into a new list, called what it was named.
+    const auto tabs_before = window.list_tabs_.size();
+    emit window.localLibrary()->browser().newListRequested(page->entries,
+                                                           QStringLiteral("Picked"));
+    QTRY_COMPARE(window.list_tabs_.size(), tabs_before + 1U);
+    auto* picked = window.list_tabs_.back().get();
+    QCOMPARE(picked->document.name, std::string{"Picked"});
+    QTRY_COMPARE(picked->model->rowCount(), 1);
+    QCOMPARE(chosen->model->rowCount(), 1);
     QTRY_VERIFY(!window.discovery_running_);
 
     // The folder, dragged from the folder browser onto the list on screen.
@@ -4920,10 +4936,11 @@ void BenchMainWindowTest::metadataTransformationChainPreviewsAndStagesOneUndo() 
     QVERIFY(stage != nullptr);
     QVERIFY(preview_table != nullptr);
     QVERIFY(preview_summary != nullptr);
-    // 19 step kinds under 4 unselectable group headers; kinds are found by
+    // 20 step kinds under 4 unselectable group headers; kinds are found by
     // name because the row index no longer matches the action kind.
-    QCOMPARE(kind->count(), 23);
+    QCOMPARE(kind->count(), 24);
     for (const auto& kind_name : {QStringLiteral("Capitalize first character"),
+                                  QStringLiteral("Convert rating to FMPS_RATING"),
                                   QStringLiteral("Remove exact matching values"),
                                   QStringLiteral("Replace exact matching values"),
                                   QStringLiteral("Number by selected-file order"),
@@ -9906,6 +9923,39 @@ void BenchMainWindowTest::ratingsInTagsIsAnEngineOption() {
     QTRY_COMPARE_WITH_TIMEOUT(scale(), std::string{"100"}, 5'000);
     choose_scale(QStringLiteral("off"));
     QTRY_COMPARE_WITH_TIMEOUT(scale(), std::string{"off"}, 5'000);
+
+    // ADR-0245: the backup tag, named in Settings, is the engine's; an
+    // official name is written but warned about.
+    const auto backup = [&client] {
+        auto answer = (*client)->call("ratings.tags");
+        return answer ? answer->value("backup_tag", std::string{"?"}) : std::string{"?"};
+    };
+    QCOMPARE(backup(), std::string{});
+    {
+        window.findChild<QAction*>(QStringLiteral("action-settings"))->trigger();
+        auto* dialog = window.findChild<SettingsDialog*>();
+        QVERIFY(dialog != nullptr);
+        auto* writing =
+            dialog->findChild<QCheckBox*>(QStringLiteral("bench-settings-ratings-in-tags"));
+        auto* copy = dialog->findChild<QCheckBox*>(QStringLiteral("bench-settings-rating-backup"));
+        auto* name = dialog->findChild<QLineEdit*>(QStringLiteral("bench-settings-rating-backup-tag"));
+        auto* note = dialog->findChild<QLabel*>(QStringLiteral("bench-settings-rating-backup-note"));
+        QVERIFY(writing && copy && name && note);
+        QVERIFY(!copy->isEnabled());
+        writing->setChecked(true);
+        QVERIFY(copy->isEnabled());
+        copy->setChecked(true);
+        QCOMPARE(name->text(), QStringLiteral("TRACKKNIFE_RATING"));
+        QVERIFY(note->isHidden());
+        name->setText(QStringLiteral("COMMENT"));
+        QVERIFY(!note->isHidden() && note->text().contains(QStringLiteral("official")));
+        QPointer<SettingsDialog> lifetime = dialog;
+        dialog->findChild<QDialogButtonBox*>(QStringLiteral("bench-settings-buttons"))
+            ->button(QDialogButtonBox::Save)
+            ->click();
+        QTRY_VERIFY(lifetime.isNull());
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(backup(), std::string{"COMMENT"}, 5'000);
     (*client)->close();
 }
 
@@ -12144,6 +12194,74 @@ void BenchMainWindowTest::crossTabMoveUndoIsOneTransaction() {
     window.replayListEdit(false);
     QCOMPARE(source->rows(), (std::vector<LocalTrackRow>{second}));
     QCOMPARE(target->rows(), (std::vector<LocalTrackRow>{first, second, first}));
+}
+
+// An INI file hands every value back as text, and the text "false" is true to
+// anything that only asks whether a value is there: the Qt Quick window once
+// showed every option left off as on. Settings come out as their type.
+void BenchMainWindowTest::settingsLeftOffReadAsOff() {
+    QSettings stored;
+    stored.setValue(QLatin1String(SettingsKeys::ratings_in_tags_key), QStringLiteral("false"));
+    stored.setValue(QLatin1String(SettingsKeys::rating_backup_key), QStringLiteral("false"));
+    stored.setValue(QStringLiteral("playback/rg-preamp-with"), QStringLiteral("-3.5"));
+    stored.setValue(QLatin1String(SettingsKeys::rating_tag_scale_key), QStringLiteral("10"));
+    stored.sync();
+    const SettingsSession session;
+    const auto values = session.values();
+    const auto in_tags = values.value(QLatin1String(SettingsKeys::ratings_in_tags_key));
+    QCOMPARE(in_tags.metaType(), QMetaType::fromType<bool>());
+    QVERIFY(!in_tags.toBool());
+    const auto backup = values.value(QLatin1String(SettingsKeys::rating_backup_key));
+    QCOMPARE(backup.metaType(), QMetaType::fromType<bool>());
+    QVERIFY(!backup.toBool());
+    const auto preamp = values.value(QStringLiteral("playback/rg-preamp-with"));
+    QCOMPARE(preamp.metaType(), QMetaType::fromType<double>());
+    QCOMPARE(preamp.toDouble(), -3.5);
+    QCOMPARE(values.value(QLatin1String(SettingsKeys::rating_tag_scale_key)).toString(),
+             QStringLiteral("10"));
+    stored.remove(QLatin1String(SettingsKeys::ratings_in_tags_key));
+    stored.remove(QLatin1String(SettingsKeys::rating_backup_key));
+    stored.remove(QStringLiteral("playback/rg-preamp-with"));
+    stored.remove(QLatin1String(SettingsKeys::rating_tag_scale_key));
+}
+
+// Delete takes what is chosen where the keyboard is: in Up Next, its track,
+// never the row chosen in the list behind it.
+void BenchMainWindowTest::deleteInUpNextTakesItsTrackNotTheLists() {
+    BenchMainWindow window;
+    window.show();
+    auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("bench-tabs"));
+    QVERIFY(tabs);
+    QTRY_COMPARE(tabs->count(), 1);
+    auto* view = qobject_cast<QTableView*>(tabs->currentWidget());
+    QVERIFY(view);
+    auto* model = qobject_cast<LocalListModel*>(view->model());
+    QVERIFY(model);
+    LocalTrackRow row;
+    row.raw_path = "/unavailable/track.flac";
+    row.probed = true;
+    model->replaceRows({row, row, row});
+    // Nothing chosen in the list: Delete still works in Up Next.
+    view->clearSelection();
+
+    row.title = "Asked for";
+    window.enqueueLocalRequests({row, row});
+    QCOMPARE(window.up_next_display_ids_.size(), std::size_t{2});
+    window.findChild<QAction*>(QStringLiteral("action-show-up-next"))->trigger();
+    QTRY_VERIFY(window.up_next_view_->isVisible());
+    window.up_next_view_->setCurrentIndex(window.up_next_view_->model()->index(0, 0));
+    window.up_next_view_->setFocus();
+    QTRY_VERIFY(window.up_next_view_->hasFocus());
+    QTest::keyClick(window.up_next_view_, Qt::Key_Delete);
+    QTRY_COMPARE(window.up_next_display_ids_.size(), std::size_t{1});
+    QCOMPARE(model->rowCount(), 3);
+
+    // In the list, the list's row.
+    view->setCurrentIndex(model->index(1, 0));
+    view->setFocus();
+    QTest::keyClick(view, Qt::Key_Delete);
+    QCOMPARE(model->rowCount(), 2);
+    QCOMPARE(window.up_next_display_ids_.size(), std::size_t{1});
 }
 
 void BenchMainWindowTest::localListUndoActionsRespectAuthorityAndTextEditing() {

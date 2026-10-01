@@ -1668,7 +1668,7 @@ The rest of the Workspace menu (Jump to playing Ctrl+J, Cursor follows playback,
 3. Otherwise run `save()` (`:1009-1058`), then accept.
 
 **After accept** (`bench_workspace_layout.cpp:1136-1182`).
-- The AcoustID key, ratings-in-tags and rating scale are pushed to every file-work engine (`set_acoustid_key`, `set_rating_tags`, `set_rating_scale`).
+- The AcoustID key, ratings-in-tags, rating scale and backup tag are pushed to every file-work engine (`set_acoustid_key`, `set_rating_tags`, `set_rating_scale`, `set_rating_backup_tag`).
 - Then: `syncRemoteEngines()`, `applyLocalLibraryVisibility()`, `applyListsDisplay()`.
 - If sharing settings changed, the local engine restarts (wait cursor). Status messages: "This computer's engine restarted with its new settings" / "This computer's engine did not restart; see its log".
 - Then: `reloadPlaybackPreferences()`, and `refreshStoragePolicy()` on every artwork section.
@@ -1701,6 +1701,7 @@ Page enum (`hpp:50-61`): general, playback, library, engine, naming, replaygain,
 #### 1.3 Library (`:321-360`)
 - Top: the injected `LocalLibraryPanel::createFoldersWidget()` (§9.7). Without a workspace: "Library folders are available from the running workspace."
 - Checkbox "Also write track ratings into the files". Tooltip: "Ratings stay in each engine's library either way. With this on, each engine also writes a track's rating into its files as FMPS_RATING, which other players read. Album ratings are not written." Key `library/ratings-in-tags` (false).
+- The page is two sections, "Music folders" and "Ratings". Ratings is a form: "In the files:" the checkbox above ("Write track ratings into the files"); "Backup copy:" (ADR-0245) a checkbox "Also write to the tag" (`library/rating-backup`, false), enabled while ratings are written, beside a name field (`library/rating-backup-tag`, `TRACKKNIFE_RATING`), with a note under it saying why a name cannot be used or warning that an official tag's content is replaced; "Other players' RATING tags:" the scale combo.
 - **RATING tags from other players:** combo with "Don't import" (off), "1–5 (foobar2000)" (5), "0–10" (10), "0–100 (MusicBee, MediaMonkey)" (100). Tooltip: "Ratings other players left in your files are taken into the library. FMPS_RATING and MP3 POPM always are; a plain RATING tag has no agreed scale, so it is read only on the one chosen here." Key `library/rating-tag-scale` ("off").
 
 #### 1.4 Engine (`:362-680`)
@@ -2073,7 +2074,7 @@ A `QTabWidget` `bench-output-profile-sections` with two tabs, plus a shared stat
 
 **Raw script tab**
 - `QPlainTextEdit`. Placeholder `$if($eq(%totaldiscs%,1),$delete(discnumber)$delete(totaldiscs))`. Tooltip: "Valid source compiles into the steps on the Steps tab; arbitrary script is never executed".
-- Read-only diagnostics box (max 110 px): "Error|Warning · line L, column C · msg", "Ready · N typed rules …", "Raw mode is unavailable: …", "Enter cleanup source to generate typed rules."
+- Read-only diagnostics box (max 110 px): "Error|Warning · line L, column C · msg", "Ready · N steps …", "Raw mode is unavailable: …", "Write steps such as $set(FIELD,tkfmt-1 value) or $delete(FIELD), one per line." The text is the native script of ADR-0241.
 
 **Right pane**
 - Bold "Preview" heading. Tooltip: "Updates automatically as you edit; nothing enters the draft until you add the previewed changes".

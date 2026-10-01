@@ -304,12 +304,20 @@ ApplicationWindow {
                 onTriggered: window.openSettings(0)
             }
             MenuSeparator {}
+            // What is chosen where the keyboard is: Up Next's tracks while its
+            // list has it, else the list's rows.
             KeyedAction {
                 objectName: "action-remove-selected"
                 text: "Remove selected"
                 defaultKey: "Delete"
-                enabled: (Tk.selection.count ?? 0) > 0
-                onTriggered: Tk.removeSelectedRows()
+                enabled: upNextPanel.keyboardHere ? upNextPanel.canRemove
+                                                  : (Tk.selection.count ?? 0) > 0
+                onTriggered: {
+                    if (upNextPanel.keyboardHere)
+                        upNextPanel.edit(1);
+                    else
+                        Tk.removeSelectedRows();
+                }
             }
         }
         Menu {
@@ -574,6 +582,20 @@ ApplicationWindow {
                 onTriggered: Tk.refreshOutputs()
             }
         }
+        // The language references, opened in the browser.
+        Menu {
+            title: qsTr("&Help")
+            Action {
+                objectName: "action-reference-tkfmt"
+                text: qsTr("tkfmt-1 reference")
+                onTriggered: Tk.openReference(0)
+            }
+            Action {
+                objectName: "action-reference-scripts"
+                text: qsTr("Tagging script reference")
+                onTriggered: Tk.openReference(1)
+            }
+        }
     }
 
     header: TransportBar {
@@ -806,6 +828,7 @@ ApplicationWindow {
                         SplitView.minimumWidth: 160
                         SplitView.minimumHeight: 120
                         onNotYet: what => window.notYet(what)
+                        onNameRequested: (title, current, then) => nameDialog.ask(title, current, then)
                         Rectangle {
                             anchors.fill: parent
                             visible: panelsHost.panels.editing ?? false

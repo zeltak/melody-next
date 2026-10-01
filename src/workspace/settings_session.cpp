@@ -5,6 +5,7 @@
 #include "trackknife/audio/local_audition.hpp"
 #include "trackknife/audio/local_playback.hpp"
 #include "trackknife/discovery/mdns.hpp"
+#include "trackknife/metadata/ratings.hpp"
 
 #include <QPointer>
 #include <QSettings>
@@ -41,8 +42,16 @@ const QString lastfm_key = QStringLiteral("lastfm/api-key");
 
 SettingsSession::SettingsSession(QObject* parent) : QObject(parent) {
     const QSettings settings;
+    // As the type its default has: an INI file hands every value back as text,
+    // and the text "false" is true to anything that only asks whether a
+    // value is there -- the Qt Quick window's checkboxes showed every option
+    // left off as on.
     const auto read = [this, &settings](const QString& key, const QVariant& fallback) {
-        values_.insert(key, settings.value(key, fallback));
+        auto value = settings.value(key, fallback);
+        if (value.metaType() != fallback.metaType() && !value.convert(fallback.metaType())) {
+            value = fallback;
+        }
+        values_.insert(key, value);
     };
     read(notifications_key, false);
     read(notifications_background_key, false);
@@ -66,6 +75,9 @@ SettingsSession::SettingsSession(QObject* parent) : QObject(parent) {
     read(preamp_without_key, 0.0);
     read(QLatin1String(SettingsKeys::ratings_in_tags_key), false);
     read(QLatin1String(SettingsKeys::rating_tag_scale_key), QStringLiteral("off"));
+    read(QLatin1String(SettingsKeys::rating_backup_key), false);
+    read(QLatin1String(SettingsKeys::rating_backup_tag_key),
+         QString::fromLatin1(metadata::default_rating_backup_tag));
     read(QLatin1String(SettingsKeys::engine_password_key), QString{});
     read(QLatin1String(SettingsKeys::library_show_local_key), true);
     read(QLatin1String(SettingsKeys::engine_upnp_key), false);
@@ -167,6 +179,19 @@ std::vector<SettingsSession::Choice> SettingsSession::bufferProfiles() {
             {QStringLiteral("Balanced"), QStringLiteral("balanced")},
             {QStringLiteral("Resilient"), QStringLiteral("resilient")},
             {QStringLiteral("Custom"), QStringLiteral("custom")}};
+}
+
+QString SettingsSession::ratingBackupNote(const QString& name) {
+    const auto tag = name.trimmed().toStdString();
+    if (auto problem = metadata::rating_backup_tag_problem(tag)) {
+        return QString::fromStdString(*problem) + QStringLiteral(": nothing is copied.");
+    }
+    if (metadata::official_tag_name(tag)) {
+        return QStringLiteral("%1 is an official tag other players show and use. Whatever it "
+                              "holds now is replaced by the rating, in every rated file.")
+            .arg(name.trimmed().toUpper());
+    }
+    return {};
 }
 
 std::vector<SettingsSession::Choice> SettingsSession::ratingScales() {

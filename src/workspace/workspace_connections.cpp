@@ -270,6 +270,8 @@ void Workspace::connectRemoteEngine(const RemoteEngineSetting& setting, const bo
         // that rather than its address (an engine too old to say keeps it).
         static_cast<void>(link->catalogue->open());
         adoptEngineIdentity(*link);
+        // Reached: it plays with this window's ReplayGain, as every engine does.
+        syncReplayGain();
         view_->engineAttached(*link);
         // The remote tabs were restored before there was a remote to ask for
         // their covers and missing tags -- or while it was away: they ask now.
@@ -371,6 +373,10 @@ void Workspace::watchFileWork(EngineLink& link) {
                         chosen.value(QLatin1String(SettingsKeys::rating_tag_scale_key))
                             .toString()
                             .toStdString()));
+                }
+                if (chosen.contains(QLatin1String(SettingsKeys::rating_backup_key))) {
+                    static_cast<void>(
+                        work->set_rating_backup_tag(SettingsKeys::ratingBackupTag()));
                 }
                 if (auto answer = work->interrupted()) {
                     // What it finished or rolled back at its start, itself.

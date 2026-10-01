@@ -12,6 +12,7 @@
 #include "uicommon/list_persistence_service.hpp"
 
 #include "uicommon/track_row_roles.hpp"
+#include "workspace/language_reference.hpp"
 #include "workspace/shortcut_session.hpp"
 #include <QAction>
 #include <QActionGroup>
@@ -73,6 +74,7 @@ BenchMainWindow::BenchMainWindow(QWidget* parent) : QMainWindow(parent) {
     buildWorkspace();
     buildTransport();
     buildLastFm();
+    buildHelpMenu();
     buildShortcuts();
     initializePersistence();
 
@@ -86,6 +88,24 @@ BenchMainWindow::BenchMainWindow(QWidget* parent) : QMainWindow(parent) {
 }
 
 BenchMainWindow::~BenchMainWindow() { stopBackgroundWork(); }
+
+void BenchMainWindow::buildHelpMenu() {
+    auto* help_menu = menuBar()->addMenu(QStringLiteral("&Help"));
+    const auto add = [this, help_menu](const QString& name, const QString& text,
+                                       const LanguageReference reference) {
+        auto* action = help_menu->addAction(text);
+        action->setObjectName(name);
+        connect(action, &QAction::triggered, this, [this, reference] {
+            if (QString error; !openLanguageReference(reference, &error)) {
+                showMessage(error, 6000);
+            }
+        });
+    };
+    add(QStringLiteral("action-reference-tkfmt"), QStringLiteral("tkfmt-1 reference"),
+        LanguageReference::formatting);
+    add(QStringLiteral("action-reference-scripts"), QStringLiteral("Tagging script reference"),
+        LanguageReference::scripts);
+}
 
 void BenchMainWindow::showMessage(const QString& text, const int timeout_ms) {
     statusBar()->showMessage(text, timeout_ms);
@@ -636,34 +656,7 @@ QIcon BenchMainWindow::oneShotIcon(const QIcon& plain) const {
 }
 
 void BenchMainWindow::buildLocalPlaybackControls(QMenu* playback_menu) {
-    const QSettings settings;
-    playback_.modes.repeat =
-        settings.value(QStringLiteral("playback/local-repeat"), false).toBool();
-    playback_.modes.random =
-        settings.value(QStringLiteral("playback/local-random"), false).toBool();
-    playback_.modes.album_random =
-        settings.value(QStringLiteral("playback/local-album-random"), false).toBool();
-    if (playback_.modes.album_random)
-        playback_.modes.random = false;
-    playback_.modes.single = audio::mode_state_from_int(
-        settings.value(QStringLiteral("playback/local-single"), 0).toInt());
-    playback_.modes.consume = audio::mode_state_from_int(
-        settings.value(QStringLiteral("playback/local-consume"), 0).toInt());
-    local_replaygain_ =
-        settings.value(QStringLiteral("playback/local-replaygain"), QStringLiteral("off"))
-            .toString();
-    if (local_replaygain_ != QStringLiteral("track") &&
-        local_replaygain_ != QStringLiteral("album") &&
-        local_replaygain_ != QStringLiteral("auto")) {
-        local_replaygain_ = QStringLiteral("off");
-    }
-    const auto preamp_limit = static_cast<double>(audio::maximum_replay_gain_preamp_db);
-    local_rg_preamp_with_ =
-        std::clamp(settings.value(QStringLiteral("playback/rg-preamp-with"), 0.0).toDouble(),
-                   -preamp_limit, preamp_limit);
-    local_rg_preamp_without_ =
-        std::clamp(settings.value(QStringLiteral("playback/rg-preamp-without"), 0.0).toDouble(),
-                   -preamp_limit, preamp_limit);
+    // The modes themselves the workspace read when it was made.
     const auto add_mode = [&](const QString& id, const QString& label, const QString& icon) {
         auto* action = new QAction(label, this);
         action->setObjectName(QStringLiteral("action-local-%1").arg(id));
