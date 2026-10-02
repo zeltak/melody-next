@@ -89,8 +89,7 @@
         "TRACKKNIFE_BUILD_WATCH": "OFF",
         "TRACKKNIFE_ENABLE_LOCAL_AUDIO": "ON",
         "TRACKKNIFE_ENABLE_UPNP": "ON",
-        "TRACKKNIFE_WARNINGS_AS_ERRORS": "ON",
-        "TRACKKNIFE_BUILD_QUICK": "ON"
+        "TRACKKNIFE_WARNINGS_AS_ERRORS": "ON"
       },
       "condition": {
         "type": "equals",
