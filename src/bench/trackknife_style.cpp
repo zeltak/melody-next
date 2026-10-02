@@ -2,6 +2,7 @@
 #include "bench/trackknife_style.hpp"
 
 #include <QAbstractItemView>
+#include <QAbstractSpinBox>
 #include <QComboBox>
 #include <QHeaderView>
 #include <QMouseEvent>
@@ -17,6 +18,15 @@
 
 namespace trackknife::bench {
 namespace {
+
+// A combo box's list item, drawn as a menu item (Fusion's own test).
+[[nodiscard]] bool combo_popup_item(const QStyleOption* option, const QWidget* widget) {
+    return qobject_cast<const QComboBox*>(widget) != nullptr ||
+           (option->styleObject != nullptr &&
+            option->styleObject->property("_q_isComboBoxPopupItem").toBool());
+}
+// Room for the tick before a combo box list item's text.
+constexpr int combo_tick_column = 20;
 
 // A rounded rectangle on whole pixels, its 1 px edge on the pixel centres.
 void fill_rounded(QPainter* painter, const QRectF& rect, const QColor& fill, const qreal radius,
@@ -42,8 +52,8 @@ void fill_rounded(QPainter* painter, const QRectF& rect, const QColor& fill, con
 
 // The accent: a checked button, or the one a window names as its primary
 // (QPushButton::isDefault) -- not every button that is the default for a
-// moment because it has focus in a dialog (autoDefault); Quick's accent is
-// on the accepting button alone.
+// moment because it has focus in a dialog (autoDefault): the accent is on
+// the accepting button alone.
 [[nodiscard]] bool accented(const QStyleOptionButton* button, const QWidget* widget) {
     if (button == nullptr) {
         return false;
@@ -136,7 +146,7 @@ QColor TrackknifeStyle::dim(const QPalette& p) {
 void TrackknifeStyle::polish(QWidget* widget) {
     QProxyStyle::polish(widget);
     widget->setAttribute(Qt::WA_Hover, true);
-    // Columns read from the left, as Quick's do; a model's own alignment
+    // Columns read from the left; a model's own alignment
     // (a right-aligned length) still wins.
     if (auto* header = qobject_cast<QHeaderView*>(widget);
         header != nullptr && header->orientation() == Qt::Horizontal) {
@@ -265,6 +275,10 @@ QSize TrackknifeStyle::sizeFromContents(const ContentsType type, const QStyleOpt
         const auto* item = qstyleoption_cast<const QStyleOptionMenuItem*>(option);
         if (item != nullptr && item->menuItemType != QStyleOptionMenuItem::Separator) {
             size.setHeight(std::max(size.height(), 26));
+            if (combo_popup_item(option, widget) &&
+                item->checkType != QStyleOptionMenuItem::NotCheckable) {
+                size.rwidth() += combo_tick_column;
+            }
         }
         return size;
     }
@@ -325,7 +339,7 @@ void TrackknifeStyle::drawPrimitive(const PrimitiveElement element, const QStyle
     switch (element) {
     case PE_PanelButtonCommand: {
         const auto* button = qstyleoption_cast<const QStyleOptionButton*>(option);
-        // Flat, as Quick's icon buttons are: a fill only under the pointer.
+        // Flat, as icon buttons are: a fill only under the pointer.
         if (button != nullptr && button->features.testFlag(QStyleOptionButton::Flat)) {
             const bool flat_down = option->state.testFlag(State_Sunken);
             const bool flat_hover =
@@ -336,7 +350,7 @@ void TrackknifeStyle::drawPrimitive(const PrimitiveElement element, const QStyle
             }
             return;
         }
-        // The accent stays on a disabled default button, faded, as Quick's.
+        // The accent stays on a disabled default button, faded.
         const bool accent =
             button != nullptr ? accented(button, widget) : option->state.testFlag(State_On);
         const bool down = option->state.testFlag(State_Sunken);
@@ -389,7 +403,14 @@ void TrackknifeStyle::drawPrimitive(const PrimitiveElement element, const QStyle
     case PE_PanelLineEdit: {
         const auto* frame = qstyleoption_cast<const QStyleOptionFrame*>(option);
         if (frame != nullptr && frame->lineWidth <= 0) {
-            // Inside a spin box or combo box, which draws the frame.
+            // Inside a spin box or combo box, which draws the frame. Any
+            // other frameless edit -- a table cell's editor -- still needs
+            // its ground, or the cell's text shows through what is typed.
+            const auto* parent = widget != nullptr ? widget->parentWidget() : nullptr;
+            if (qobject_cast<const QAbstractSpinBox*>(parent) == nullptr &&
+                qobject_cast<const QComboBox*>(parent) == nullptr) {
+                painter->fillRect(rect, palette.color(QPalette::Base));
+            }
             return;
         }
         const bool read_only = option->state.testFlag(State_ReadOnly);
@@ -524,7 +545,7 @@ void TrackknifeStyle::drawPrimitive(const PrimitiveElement element, const QStyle
             painter->fillRect(option->rect, item->backgroundBrush);
         }
         // A list whose check boxes say what is chosen shows no second
-        // selection; only where the keyboard is, outlined (Quick's file list).
+        // selection; only where the keyboard is, outlined.
         if (widget != nullptr && widget->property(checks_show_selection).toBool()) {
             if (option->state.testFlag(State_MouseOver) && option->state.testFlag(State_Enabled)) {
                 fill_rounded(painter, rect.adjusted(2, 1, -2, -1), rowHover(palette), radius);
@@ -672,7 +693,7 @@ void TrackknifeStyle::drawControl(const ControlElement element, const QStyleOpti
                          radius);
             quiet.state.setFlag(State_Selected, false);
         }
-        // A chosen item is ticked, as Quick's MenuItem: no box, no dot.
+        // A chosen item is ticked: no box, no dot.
         if (item->checkType != QStyleOptionMenuItem::NotCheckable &&
             item->menuItemType != QStyleOptionMenuItem::Separator) {
             if (item->checked) {
@@ -694,6 +715,12 @@ void TrackknifeStyle::drawControl(const ControlElement element, const QStyleOpti
             }
             quiet.checked = false;
             quiet.checkType = QStyleOptionMenuItem::NotCheckable;
+        }
+        // Fusion leaves a combo box's list no column for the tick; the
+        // text moves over to make one.
+        if (combo_popup_item(option, widget) &&
+            item->checkType != QStyleOptionMenuItem::NotCheckable) {
+            quiet.rect.setLeft(quiet.rect.left() + combo_tick_column);
         }
         if (item->menuItemType == QStyleOptionMenuItem::Separator) {
             const int y = option->rect.center().y();

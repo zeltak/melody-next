@@ -18,7 +18,7 @@ class LocalListModel;
 // Dynamic playlists (ADR-0145): saved definitions -- library rules or a
 // Last.fm source -- refreshed into a list of matching tracks, in the library
 // of the engine chosen. Rules follow that library's changes while open; a
-// snapshot keeps a result stable. Both windows' Dynamic playlists draw it.
+// snapshot keeps a result stable. The window's Dynamic playlists dialog draws it.
 class DynamicPlaylistSession final : public QObject {
     Q_OBJECT
 
@@ -101,6 +101,8 @@ class DynamicPlaylistSession final : public QObject {
   signals:
     void changed();
     void catalogChanged();
+    // The definitions were written: a rule saved, edited or removed.
+    void definitionsSaved();
     // The results are about to be replaced, and were.
     void resultsAboutToChange();
     void resultsChanged();

@@ -75,8 +75,8 @@ class WorkspaceView;
 
 // ADR-0220: the workspace a window shows -- the engines it reaches, the lists
 // open from them, what plays and waits to, and the work under way -- without
-// any of the window. Both the widgets window and the Qt Quick one are drawn
-// over it, so each behaviour is written once.
+// any of the window, so each behaviour is written once, apart from how it is
+// drawn.
 //
 // For now it holds the state the widgets window kept; that window's logic
 // moves here next, a part at a time, and the window becomes what draws it.
@@ -200,6 +200,9 @@ class Workspace final : public QObject {
     std::vector<std::unique_ptr<ListTab>> list_tabs_;
     QHash<QString, QByteArray> restored_track_view_layouts_;
     MprisService* mpris_{nullptr};
+    // The cover file given to the desktop, and which album it is.
+    QString desktop_cover_key_;
+    QString desktop_cover_path_;
     DesktopNotifier* notifier_{nullptr};
     ui::ListPersistenceService* persistence_{nullptr};
     std::filesystem::path database_path_;
@@ -287,6 +290,14 @@ class Workspace final : public QObject {
     QElapsedTimer lastfm_clock_;
     qint64 lastfm_sample_time_{-1000};
     QString lastfm_user_;
+    // ADR-0253: the tkq-1 rules last seen in the definitions, so that one
+    // gone is told from another window's that this one never knew.
+    std::optional<QSet<QString>> known_rules_;
+    void syncContinuations(EngineLink& engine);
+    // Shows what `engine`'s tabs continue with as it says, and keeps its
+    // copies of the rules in step.
+    void followContinuations(EngineLink& engine);
+    void rememberContinuationRules();
     // Last explicitly played local list; transport stop does not release it.
     QString active_local_list_id_;
   public:
@@ -365,6 +376,22 @@ class Workspace final : public QObject {
     [[nodiscard]] ConvertPresetStore convertPresets();
     [[nodiscard]] EnginePlayback* playbackOf(const EngineKey& key) const;
     [[nodiscard]] CatalogueSource* catalogueOf(const EngineKey& key) const;
+
+    // ADR-0253: a list continues with a dynamic playlist's tkq-1 rule once
+    // it would end. The rules it can continue with, by identity and name.
+    struct ContinuationChoice {
+        QString rule_id;
+        QString name;
+    };
+    [[nodiscard]] std::vector<ContinuationChoice> continuationChoices() const;
+    // The rule `tab` continues with, as its engine keeps it; none, nothing.
+    [[nodiscard]] std::optional<EnginePlayback::Continuation>
+    continuationOf(const ListTab& tab) const;
+    // Continues `tab` with the rule `rule_id`, or with an empty one ends it.
+    void setContinuation(const ListTab& tab, const QString& rule_id);
+    // The rules were saved: the engines' copies are brought in step, and a
+    // rule deleted or made a Last.fm one ends the lists it continued.
+    void refreshContinuations();
     // An open list, by its document's identity -- or the list that goes on
     // playing after its tab was closed.
     [[nodiscard]] ListTab* tabForDocument(const QString& document_id);
@@ -649,6 +676,8 @@ class Workspace final : public QObject {
         bool playing{false};
         // Its files are an engine elsewhere's: an icon says so.
         bool remote{false};
+        // ADR-0253: the rule it continues with; empty, none.
+        QString continues;
     };
     [[nodiscard]] TabChrome tabChrome(const ListTab& tab) const;
     struct Summary {
@@ -789,6 +818,17 @@ class Workspace final : public QObject {
     void sampleLastFm(const EnginePlayback::State& state);
     // What plays, as MPRIS and the track-change notification show it.
     void publishDesktopState();
+    // The play order as MPRIS names it: repeat and single together loop the
+    // track ("Track"), repeat alone the list ("Playlist"), else "None"; and
+    // shuffled is random or album random. Set from the desktop, the modes
+    // follow and every engine is told (ADR-0135).
+    [[nodiscard]] QString loopStatus() const;
+    void setLoopStatus(const QString& status);
+    [[nodiscard]] bool shuffled() const;
+    void setShuffled(bool shuffled);
+    // The playing album's cover as a file the desktop can read -- written
+    // once per album into the cache, the last one removed -- or empty.
+    [[nodiscard]] QString desktopCoverPath(const LocalTrackRow& track, const EngineKey& engine);
 
     // Files into lists: discovered from paths and folders (CUE sheets
     // expanded), probed for their tags a batch at a time, and -- for a list

@@ -14,6 +14,7 @@ qt_add_library(
     workspace.cpp
     workspace.hpp
     workspace_connections.cpp
+    workspace_continuation.cpp
     workspace_desktop.cpp
     workspace_drops.cpp
     workspace_engines.cpp
@@ -39,6 +40,8 @@ qt_add_library(
     folder_browser.cpp
     folder_browser.hpp
     library_browser.cpp
+    library_view_definitions.cpp
+    library_view_definitions.hpp
     library_browser.hpp
     list_edit_job.cpp
     list_find.cpp

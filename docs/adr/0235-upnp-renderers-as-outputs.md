@@ -82,14 +82,14 @@ and steps audibly at track changes.
 discovery and renderer output implementation is compiled and whether libupnp
 is required. In a build that includes it, discovery is still off until the
 user enables **Settings → Engine → Discover UPnP speakers**, or starts a
-headless engine with `--upnp`. Both the Widgets and Qt Quick windows use the
-same settings session and saved `engine/upnp` preference. `--upnp-interface` restricts discovery to one
+headless engine with `--upnp`. Trackknife uses the
+shared settings session and saved `engine/upnp` preference. `--upnp-interface` restricts discovery to one
 network interface. UPnP requires the HTTP stream listener on a LAN-reachable
 address.
 
 The `macos` CMake preset enables UPnP and the CoreAudio local output while
-disabling the Linux-only inotify watcher. It also enables `TRACKKNIFE_BUILD_QUICK`
-to build the `trackknife-quick` window alongside the Widgets application. Those capabilities have independent
+disabling the Linux-only inotify watcher. The Qt Quick window was retired by ADR-0252; the desktop executable is
+`trackknife`. Those capabilities have independent
 `TRACKKNIFE_ENABLE_LOCAL_AUDIO` and `TRACKKNIFE_BUILD_WATCH` switches, so the
 same source tree can produce a smaller build without UPnP or platform-specific
 helpers.

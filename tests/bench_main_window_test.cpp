@@ -398,6 +398,7 @@ class BenchMainWindowTest final : public QObject {
     void interfaceSizeIsChosenForTheNextStart();
     void headerPillsFollowAPaletteChangedLater();
     void listTabCloseButtonsClose();
+    void mprisOrderAndCoverFollowTheWorkspace();
     void windowListTabsCloseFromTheirButtons();
     void localListOrderingActionsRespectAuthorityAndPersist();
     void portablePlaylistImportsPreserveAuthorityAndPersist();
@@ -1025,6 +1026,7 @@ void BenchMainWindowTest::ffmpegEncoderIsTheTagTagLibCallsEncoding() {
 
 void BenchMainWindowTest::recentlyAddedComesFirstWhereAskedFor() {
     QSettings{}.remove(QStringLiteral("library/newest-first"));
+    QSettings{}.remove(QStringLiteral("library/view"));
     QTemporaryDir media;
     QVERIFY(media.isValid());
     const auto music = media.filePath(QStringLiteral("music"));
@@ -1068,12 +1070,18 @@ void BenchMainWindowTest::recentlyAddedComesFirstWhereAskedFor() {
                 .startsWith(QStringLiteral("Recently added")));
     QTest::keyClick(popup->input(), Qt::Key_Escape);
 
-    // The library panel's Recently added: albums, the new one first.
+    // The library panel's Recently added -- a view (ADR-0254): albums, the
+    // new one first.
     window.localLibrary()->refreshLibrary();
-    auto* newest =
-        window.localLibrary()->findChild<QToolButton*>(QStringLiteral("local-library-newest"));
-    QVERIFY(newest != nullptr && newest->isCheckable());
-    newest->setChecked(true);
+    auto* views = window.localLibrary()->findChild<QComboBox*>(QStringLiteral("local-library-view"));
+    QVERIFY(views != nullptr);
+    const auto choose = [views](const QString& id) {
+        const auto index = views->findData(id);
+        QVERIFY(index >= 0);
+        views->setCurrentIndex(index);
+        emit views->activated(index);
+    };
+    choose(QStringLiteral("recently-added"));
     auto* tree = window.localLibrary()->findChild<QTreeView*>();
     QTRY_COMPARE(tree->model()->rowCount(), 2);
     const auto first = tree->model()->index(0, 0).data(library_entry_role);
@@ -1081,11 +1089,12 @@ void BenchMainWindowTest::recentlyAddedComesFirstWhereAskedFor() {
     QCOMPARE(first.value<persistence::LibraryEntry>().kind, persistence::LibraryEntryKind::album);
     QVERIFY(first.value<persistence::LibraryEntry>().added >
             tree->model()->index(1, 0).data(library_entry_role).value<persistence::LibraryEntry>().added);
-    newest->setChecked(false);
+    choose(QStringLiteral("artist-album"));
     QTRY_VERIFY(tree->model()->rowCount() >= 1 &&
                 tree->model()->index(0, 0).data(library_entry_role).value<persistence::LibraryEntry>().kind ==
                     persistence::LibraryEntryKind::artist);
     QSettings{}.remove(QStringLiteral("library/newest-first"));
+    QSettings{}.remove(QStringLiteral("library/view"));
 }
 
 void BenchMainWindowTest::settingsListEnginesFoundOnTheNetwork() {
@@ -12319,6 +12328,58 @@ void BenchMainWindowTest::windowListTabsCloseFromTheirButtons() {
     QTest::mouseClick(under, Qt::LeftButton, {}, under->mapFrom(&window, at));
     QCOMPARE(requested.count(), 1);
     QCOMPARE(requested.front().front().toInt(), before - 1);
+}
+
+// ADR-0135: MPRIS's play order is the workspace's modes -- repeat and single
+// loop the track, repeat the list, random or album random shuffle -- both
+// ways; and the playing album's cover is a file, written once per album.
+void BenchMainWindowTest::mprisOrderAndCoverFollowTheWorkspace() {
+    BenchMainWindow window;
+    auto& workspace = window.workspace_;
+    workspace.setLoopStatus(QStringLiteral("Track"));
+    QCOMPARE(workspace.loopStatus(), QStringLiteral("Track"));
+    QVERIFY(workspace.modeTexts().repeat.checked && workspace.modeTexts().single.checked);
+    workspace.setLoopStatus(QStringLiteral("Playlist"));
+    QCOMPARE(workspace.loopStatus(), QStringLiteral("Playlist"));
+    QVERIFY(!workspace.modeTexts().single.checked);
+    workspace.setLoopStatus(QStringLiteral("None"));
+    QCOMPARE(workspace.loopStatus(), QStringLiteral("None"));
+    QVERIFY(!workspace.modeTexts().repeat.checked);
+    workspace.setAlbumRandom(true);
+    QVERIFY(workspace.shuffled());
+    workspace.setShuffled(false);
+    QVERIFY(!workspace.shuffled() && !workspace.modeTexts().album_random.checked);
+    workspace.setShuffled(true);
+    QVERIFY(workspace.shuffled() && workspace.modeTexts().random.checked);
+    workspace.setShuffled(false);
+
+    // The cover: a file per album, the last one gone when the album changes.
+    QTRY_VERIFY(!window.list_tabs_.empty());
+    auto& tab = *window.list_tabs_.front();
+    const auto row = [](const char* album) {
+        LocalTrackRow track;
+        track.raw_path = std::string{"/covers/"} + album + ".flac";
+        track.title = "Song";
+        track.artist = "Band";
+        track.album = album;
+        track.probed = true;
+        return track;
+    };
+    tab.model->replaceRows({row("First"), row("Second")});
+    QImage red{40, 40, QImage::Format_RGB32};
+    red.fill(Qt::red);
+    tab.model->setArtwork(tab.model->groupKey(0), red);
+    QImage blue{40, 40, QImage::Format_RGB32};
+    blue.fill(Qt::blue);
+    tab.model->setArtwork(tab.model->groupKey(1), blue);
+    const auto first = workspace.desktopCoverPath(tab.model->rows()[0], EngineKey::local());
+    QVERIFY(!first.isEmpty() && QFileInfo::exists(first));
+    QCOMPARE(QImage{first}.pixelColor(0, 0), QColor{Qt::red});
+    QCOMPARE(workspace.desktopCoverPath(tab.model->rows()[0], EngineKey::local()), first);
+    const auto second = workspace.desktopCoverPath(tab.model->rows()[1], EngineKey::local());
+    QVERIFY(second != first && QFileInfo::exists(second));
+    QVERIFY(!QFileInfo::exists(first));
+    QFile::remove(second);
 }
 
 void BenchMainWindowTest::colorSchemesAreChosenAndApplied() {

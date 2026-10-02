@@ -135,8 +135,8 @@ void BenchMainWindow::buildWorkspace() {
     // replaces the dropdown and static heading.
     const auto make_source_tabs = [this](const QString& object_name,
                                          const QString& accessible_name) {
-        // As the Qt Quick window's: one box split into its sources, the
-        // chosen one lifted out of it (ADR-0250).
+        // One box split into its sources, the chosen one lifted out of it
+        // (ADR-0250).
         auto* bar = new SegmentedTabBar(folders_panel_);
         bar->setObjectName(object_name);
         bar->setAccessibleName(accessible_name);
@@ -613,6 +613,11 @@ void BenchMainWindow::buildWorkspace() {
     tab_context_menu_->addAction(save_tab_action_);
     tab_context_menu_->addAction(pin_tab_action_);
     tab_context_menu_->addAction(duplicate_tab_action_);
+    tab_context_menu_->addSeparator();
+    continue_menu_ = tab_context_menu_->addMenu(tr("Continue with"));
+    continue_menu_->setObjectName(QStringLiteral("bench-tab-continue-menu"));
+    continue_menu_->setToolTip(
+        tr("When the list would end, add tracks from a dynamic playlist's rule"));
     tab_context_menu_->addSeparator();
     tab_context_menu_->addAction(close_tab_action_);
     tabs_->tabBar()->setContextMenuPolicy(Qt::CustomContextMenu);

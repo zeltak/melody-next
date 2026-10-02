@@ -20,7 +20,7 @@ usage() {
 Usage: scripts/build-latest.sh [options]
 
 Fast-forward this checkout from the fork's main branch, merge the latest
-original melody-next main branch, build Trackknife, Trackknife Quick and Melody
+original melody-next main branch, build Trackknife and Melody
 on this desktop,
 push the fork's main branch, then build and install Melody on the server.
 
@@ -140,9 +140,9 @@ if [[ $(uname -s) == Darwin ]] && command -v brew >/dev/null 2>&1; then
     configure_arguments+=("-DPKG_CONFIG_EXECUTABLE=$homebrew_prefix/bin/pkg-config")
 fi
 
-cmake --preset "$desktop_preset" -DTRACKKNIFE_BUILD_QUICK=ON "${configure_arguments[@]}"
-cmake --build --preset "$desktop_preset" --target trackknife trackknife-quick melodyd --parallel "$jobs"
-printf 'Built desktop Trackknife, Trackknife Quick and Melody in %s/build/%s\n' "$project_root" "$desktop_preset"
+cmake --preset "$desktop_preset" "${configure_arguments[@]}"
+cmake --build --preset "$desktop_preset" --target trackknife melodyd --parallel "$jobs"
+printf 'Built desktop Trackknife and Melody in %s/build/%s\n' "$project_root" "$desktop_preset"
 
 if [[ $update == true ]]; then
     git push "$fork_remote" "$deployment_branch"

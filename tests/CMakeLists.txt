@@ -337,6 +337,17 @@ target_link_libraries(
 )
 add_test(NAME remote-catalogue COMMAND trackknife_remote_catalogue_tests)
 
+# ADR-0254: library views, grouped by the engine from real tagged files.
+add_executable(trackknife_library_views_tests library_views_test.cpp)
+target_link_libraries(
+    trackknife_library_views_tests
+    PRIVATE Trackknife::Engine Trackknife::Protocol Trackknife::Core PkgConfig::TAGLIB
+            Threads::Threads trackknife_project_options trackknife_project_warnings
+)
+add_test(NAME library-views COMMAND trackknife_library_views_tests
+         "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/audio")
+set_tests_properties(library-views PROPERTIES TIMEOUT 60)
+
 # ADR-0222: the real client against the real server.
 add_executable(trackknife_protocol_roundtrip_tests protocol_roundtrip_test.cpp)
 target_link_libraries(
@@ -360,6 +371,13 @@ add_test(
 )
 
 # ADR-0228: an engine playing on an output agent, both real, in one process.
+add_executable(trackknife_list_continuation_tests list_continuation_test.cpp)
+target_link_libraries(trackknife_list_continuation_tests PRIVATE Trackknife::Engine
+    trackknife_project_options trackknife_project_warnings)
+add_test(NAME list-continuation COMMAND trackknife_list_continuation_tests
+                                        "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/audio")
+set_tests_properties(list-continuation PROPERTIES TIMEOUT 60)
+
 add_executable(trackknife_engine_lastfm_tests engine_lastfm_test.cpp)
 target_link_libraries(trackknife_engine_lastfm_tests PRIVATE Trackknife::Engine
     trackknife_project_options trackknife_project_warnings)
@@ -657,15 +675,6 @@ if(TRACKKNIFE_BUILD_UI)
     add_test(NAME language-reference COMMAND trackknife_language_reference_tests)
     set_tests_properties(language-reference PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-    qt_add_executable(trackknife_keyed_rows_model_tests keyed_rows_model_test.cpp
-                      ${PROJECT_SOURCE_DIR}/src/quick/keyed_rows_model.cpp)
-    target_include_directories(trackknife_keyed_rows_model_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
-    target_link_libraries(
-        trackknife_keyed_rows_model_tests
-        PRIVATE Qt6::Core Qt6::Test trackknife_project_options trackknife_project_warnings
-    )
-    add_test(NAME keyed-rows-model COMMAND trackknife_keyed_rows_model_tests)
-
     qt_add_executable(trackknife_track_view_layout_tests track_view_layout_test.cpp)
     target_link_libraries(
         trackknife_track_view_layout_tests
@@ -761,6 +770,19 @@ if(TRACKKNIFE_BUILD_UI)
         TRACKKNIFE_AUDIO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/audio")
     add_test(NAME library-panel-engine COMMAND trackknife_library_panel_engine_tests)
     set_tests_properties(library-panel-engine PROPERTIES TIMEOUT 60 ENVIRONMENT
+        "QT_QPA_PLATFORM=offscreen;LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan.supp")
+
+    # ADR-0254: the library panel shows a view the engine grouped.
+    qt_add_executable(trackknife_library_views_panel_tests library_views_panel_test.cpp)
+    target_link_libraries(
+        trackknife_library_views_panel_tests
+        PRIVATE Trackknife::BenchUi Trackknife::Engine Trackknife::Protocol Qt6::Test
+                PkgConfig::TAGLIB trackknife_project_options trackknife_project_warnings
+    )
+    target_compile_definitions(trackknife_library_views_panel_tests PRIVATE
+        TRACKKNIFE_AUDIO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/audio")
+    add_test(NAME library-views-panel COMMAND trackknife_library_views_panel_tests)
+    set_tests_properties(library-views-panel PROPERTIES TIMEOUT 60 ENVIRONMENT
         "QT_QPA_PLATFORM=offscreen;LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan.supp")
 
     # ADR-0220 Phase 2: playing a track drives the engine's local player, not
