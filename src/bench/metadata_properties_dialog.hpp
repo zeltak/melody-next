@@ -42,6 +42,11 @@ class QVBoxLayout;
 
 namespace trackknife::bench {
 
+// The Settings page a tagger asks for.
+[[nodiscard]] SettingsDialog::Page settingsPage(TaggerSession::SettingsPage page);
+
+class ApplyActionsPopover;
+
 class MetadataFieldReviewBar;
 
 // The "Edit tags" window of the widgets workspace: a view over a
@@ -103,7 +108,8 @@ class MetadataPropertiesDialog final : public QDialog {
     // ADR-0238: the Actions popover -- what Apply does, and with which
     // layout, destination, grouping and scripts -- all in view at once.
     void showActionsPopover();
-    void syncActionsPopover();
+    // A destination list's entry taken: a destination, or Choose folder….
+    void destinationActivated(QComboBox* combo, int index);
     void startIdentify();
     void exportReplayGainResults();
     void showLoudnessProvenance();
@@ -128,14 +134,7 @@ class MetadataPropertiesDialog final : public QDialog {
     QLabel* apply_summary_{nullptr};
     QToolButton* actions_button_{nullptr};
     // Deletes itself when it closes.
-    QPointer<QFrame> actions_popover_;
-    QCheckBox* actions_save_tags_{nullptr};
-    QCheckBox* actions_rename_{nullptr};
-    QCheckBox* actions_move_{nullptr};
-    QComboBox* actions_layout_{nullptr};
-    QComboBox* actions_destination_{nullptr};
-    QComboBox* actions_grouping_{nullptr};
-    QPushButton* actions_scan_{nullptr};
+    QPointer<ApplyActionsPopover> actions_popover_;
     QLabel* loading_{nullptr};
     QDialogButtonBox* buttons_{nullptr};
     QPushButton* undo_button_{nullptr};
@@ -151,6 +150,9 @@ class MetadataPropertiesDialog final : public QDialog {
     QAction* suggest_action_{nullptr};
     QPushButton* suggest_button_{nullptr};
     QPushButton* identify_button_{nullptr};
+    // ADR-0261: Identify albums… over every album open here.
+    QPushButton* identify_albums_button_{nullptr};
+    QPointer<QDialog> identify_albums_dialog_;
     QPushButton* transform_button_{nullptr};
     QWidget* transformation_panel_{nullptr};
     QWidget* grid_tools_{nullptr};

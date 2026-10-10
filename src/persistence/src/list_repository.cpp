@@ -3,6 +3,7 @@
 #include "trackknife/persistence/list_repository.hpp"
 #include "trackknife/core/sha256.hpp"
 #include "trackknife/core/unicode.hpp"
+#include "trackknife/persistence/list_edits.hpp"
 #include "trackknife/persistence/local_library.hpp"
 #include "trackknife/query/tkq.hpp"
 
@@ -16,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -26,7 +28,7 @@
 namespace trackknife::persistence {
 namespace {
 
-constexpr unsigned current_schema_version = 49U;
+constexpr unsigned current_schema_version = 53U;
 constexpr std::size_t maximum_documents = 1'024U;
 constexpr std::size_t maximum_items_per_document = 1'000'000U;
 constexpr std::size_t maximum_fields_per_item = 4'096U;
@@ -1493,6 +1495,75 @@ UPDATE schema_version SET version = 49;
             return result;
         }
     }
+    if (version <= 49) {
+        // ADR-0256: a list plays by reference, so an entry carries what a
+        // queue entry needs and the engine cannot read for itself.
+        constexpr auto migration = R"sql(-- SPDX-License-Identifier: GPL-3.0-only
+ALTER TABLE engine_list_items ADD COLUMN album_artist BLOB NOT NULL DEFAULT X'';
+ALTER TABLE engine_list_items ADD COLUMN date BLOB NOT NULL DEFAULT X'';
+ALTER TABLE engine_list_items ADD COLUMN track_gain_db REAL;
+ALTER TABLE engine_list_items ADD COLUMN track_peak REAL;
+ALTER TABLE engine_list_items ADD COLUMN album_gain_db REAL;
+ALTER TABLE engine_list_items ADD COLUMN album_peak REAL;
+UPDATE schema_version SET version = 50;
+)sql";
+        if (auto result = execute(database, migration); !result) {
+            rollback();
+            return result;
+        }
+    }
+    if (version <= 50) {
+        // ADR-0259: an unsaved edit of a saved list is a draft on the engine.
+        constexpr auto migration = R"sql(-- SPDX-License-Identifier: GPL-3.0-only
+ALTER TABLE engine_lists ADD COLUMN draft_of TEXT;
+ALTER TABLE engine_lists ADD COLUMN draft_base INTEGER;
+CREATE UNIQUE INDEX engine_lists_draft ON engine_lists(draft_of) WHERE draft_of IS NOT NULL;
+UPDATE schema_version SET version = 51;
+)sql";
+        if (auto result = execute(database, migration); !result) {
+            rollback();
+            return result;
+        }
+    }
+    if (version <= 51) {
+        // ADR-0263: the sources publications retain, for undo.
+        constexpr auto migration = R"sql(-- SPDX-License-Identifier: GPL-3.0-only
+CREATE TABLE file_publication_backups (
+    journal_id TEXT PRIMARY KEY NOT NULL
+        REFERENCES file_publication_journal(id) ON DELETE CASCADE,
+    state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 4),
+    undo_id TEXT,
+    completed_at_unix_seconds INTEGER NOT NULL,
+    updated_at_unix_seconds INTEGER NOT NULL,
+    error_code INTEGER,
+    error_message BLOB
+);
+CREATE INDEX file_publication_backups_state_time
+    ON file_publication_backups(state, completed_at_unix_seconds DESC);
+UPDATE schema_version SET version = 52;
+)sql";
+        if (auto result = execute(database, migration); !result) {
+            rollback();
+            return result;
+        }
+    }
+    if (version <= 52) {
+        // ADR-0266: where a publication's retained source is kept, when it
+        // was moved where undo copies are, and its identity there.
+        constexpr auto migration = R"sql(-- SPDX-License-Identifier: GPL-3.0-only
+ALTER TABLE file_publication_backups ADD COLUMN kept_path BLOB;
+ALTER TABLE file_publication_backups ADD COLUMN kept_device BLOB;
+ALTER TABLE file_publication_backups ADD COLUMN kept_inode BLOB;
+ALTER TABLE file_publication_backups ADD COLUMN kept_size BLOB;
+ALTER TABLE file_publication_backups ADD COLUMN kept_mtime_seconds BLOB;
+ALTER TABLE file_publication_backups ADD COLUMN kept_mtime_nanoseconds BLOB;
+UPDATE schema_version SET version = 53;
+)sql";
+        if (auto result = execute(database, migration); !result) {
+            rollback();
+            return result;
+        }
+    }
     // Foreign keys are off while the schema changes (see open()); a rebuild
     // that left a reference dangling is refused here rather than committed.
     auto dangling = prepare(database, "PRAGMA foreign_key_check");
@@ -1515,7 +1586,8 @@ UPDATE schema_version SET version = 49;
     return {};
 }
 
-[[nodiscard]] core::Result<void> validate(std::span<const ListDocument> documents) {
+template <typename Documents, typename DocumentOf>
+[[nodiscard]] core::Result<void> validate_each(const Documents& documents, DocumentOf document_of) {
     if (documents.size() > maximum_documents) {
         return std::unexpected(core::Error{.code = core::ErrorCode::limit_exceeded,
                                            .message = "At most 1024 list documents can be stored",
@@ -1523,7 +1595,8 @@ UPDATE schema_version SET version = 49;
     }
     std::unordered_set<std::string> ids;
     ids.reserve(documents.size());
-    for (const auto& document : documents) {
+    for (const auto& entry : documents) {
+        const ListDocument& document = document_of(entry);
         const auto id = document.id.to_string();
         if (document.id.is_nil() || !ids.insert(id).second) {
             return std::unexpected(core::Error{
@@ -1898,9 +1971,8 @@ serialize_transformation_action(const metadata::MetadataTransformationAction& ac
                 serialized.argument = typed.source_field;
                 serialized.integer_argument = typed.scale == metadata::PlainRatingScale::hundred
                                                   ? 100U
-                                              : typed.scale == metadata::PlainRatingScale::ten
-                                                  ? 10U
-                                                  : 5U;
+                                              : typed.scale == metadata::PlainRatingScale::ten ? 10U
+                                                                                               : 5U;
             }
             return serialized;
         },
@@ -2377,7 +2449,20 @@ core::Result<std::vector<ListDocument>> ListRepository::load_all() const {
 }
 
 core::Result<void> ListRepository::replace_all(const std::span<const ListDocument> documents) {
-    if (auto result = validate(documents); !result) {
+    std::vector<ListDocumentWrite> writes;
+    writes.reserve(documents.size());
+    for (const auto& document : documents) {
+        writes.push_back({.document = document, .items = true});
+    }
+    return save_workspace(writes);
+}
+
+core::Result<void>
+ListRepository::save_workspace(const std::span<const ListDocumentWrite> documents) {
+    if (auto result = validate_each(
+            documents,
+            [](const ListDocumentWrite& write) -> const ListDocument& { return write.document; });
+        !result) {
         return result;
     }
     auto* database = implementation_->database;
@@ -2391,14 +2476,59 @@ core::Result<void> ListRepository::replace_all(const std::span<const ListDocumen
         rollback();
         return std::unexpected(std::move(error));
     }
-    if (auto result = execute(database, "DELETE FROM list_documents"); !result) {
+    // Lists no longer in the workspace go, their items with them.
+    {
+        std::unordered_set<std::string> kept;
+        for (const auto& write : documents) {
+            kept.insert(write.document.id.to_string());
+        }
+        std::vector<std::string> gone;
+        auto existing = prepare(database, "SELECT id FROM list_documents");
+        if (!existing) {
+            auto error = std::move(existing.error());
+            rollback();
+            return std::unexpected(std::move(error));
+        }
+        while (sqlite3_step(existing->get()) == SQLITE_ROW) {
+            const auto* text =
+                reinterpret_cast<const char*>(sqlite3_column_text(existing->get(), 0));
+            if (text != nullptr && !kept.contains(text)) {
+                gone.emplace_back(text);
+            }
+        }
+        auto remove = prepare(database, "DELETE FROM list_documents WHERE id = ?");
+        if (!remove) {
+            auto error = std::move(remove.error());
+            rollback();
+            return std::unexpected(std::move(error));
+        }
+        for (const auto& id : gone) {
+            sqlite3_reset(remove->get());
+            if (!bind_text(remove->get(), 1, id)) {
+                auto error = database_error(database, "Could not bind list removal");
+                rollback();
+                return std::unexpected(std::move(error));
+            }
+            if (auto result = step_done(database, remove->get(), "Could not remove list document");
+                !result) {
+                rollback();
+                return result;
+            }
+        }
+    }
+    // Places are unique: moved out of the way first, so lists can trade them.
+    if (auto result = execute(database, "UPDATE list_documents SET position = -1 - position");
+        !result) {
         rollback();
         return result;
     }
     auto insert_document = prepare(
         database,
         "INSERT INTO list_documents(id, kind, name, pinned, dirty, position, remote, engine) "
-        "VALUES(?,?,?,?,?,?,?,?)");
+        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, "
+        "name = excluded.name, pinned = excluded.pinned, dirty = excluded.dirty, "
+        "position = excluded.position, remote = excluded.remote, engine = excluded.engine");
+    auto remove_items = prepare(database, "DELETE FROM list_items WHERE document_id = ?");
     auto insert_item = prepare(
         database,
         "INSERT INTO list_items(document_id, position, source, profile_id, source_reference, "
@@ -2409,8 +2539,9 @@ core::Result<void> ListRepository::replace_all(const std::span<const ListDocumen
     auto insert_field = prepare(
         database, "INSERT INTO list_item_fields(document_id, item_position, position, name, value, "
                   "native_name, provenance, language, description) VALUES(?,?,?,?,?,?,?,?,?)");
-    if (!insert_document || !insert_item || !insert_field) {
+    if (!insert_document || !remove_items || !insert_item || !insert_field) {
         auto error = !insert_document ? std::move(insert_document.error())
+                     : !remove_items  ? std::move(remove_items.error())
                      : !insert_item   ? std::move(insert_item.error())
                                       : std::move(insert_field.error());
         rollback();
@@ -2419,9 +2550,10 @@ core::Result<void> ListRepository::replace_all(const std::span<const ListDocumen
 
     for (std::size_t document_position = 0U; document_position < documents.size();
          ++document_position) {
-        const auto& document = documents[document_position];
+        const auto& document = documents[document_position].document;
         const auto id = document.id.to_string();
         auto* document_statement = insert_document->get();
+        sqlite3_reset(document_statement);
         if (!bind_text(document_statement, 1, id) ||
             sqlite3_bind_int(document_statement, 2, static_cast<int>(document.kind)) != SQLITE_OK ||
             !bind_blob(document_statement, 3, document.name) ||
@@ -2439,6 +2571,21 @@ core::Result<void> ListRepository::replace_all(const std::span<const ListDocumen
             !result) {
             rollback();
             return std::unexpected(std::move(result.error()));
+        }
+        // Unchanged since the last save: what is stored stands.
+        if (!documents[document_position].items) {
+            continue;
+        }
+        sqlite3_reset(remove_items->get());
+        if (!bind_text(remove_items->get(), 1, id)) {
+            auto error = database_error(database, "Could not bind list item removal");
+            rollback();
+            return std::unexpected(std::move(error));
+        }
+        if (auto result = step_done(database, remove_items->get(), "Could not clear list items");
+            !result) {
+            rollback();
+            return result;
         }
 
         // Entry identities are unique within a document; see the stamping
@@ -4060,11 +4207,10 @@ ListRepository::load_metadata_transformation_chains() const {
                           metadata::MetadataAllowlistFieldsAction{}};
             break;
         case 20: {
-            const auto scale = integer_argument == 5    ? metadata::PlainRatingScale::five
-                               : integer_argument == 10 ? metadata::PlainRatingScale::ten
-                               : integer_argument == 100
-                                   ? metadata::PlainRatingScale::hundred
-                                   : metadata::PlainRatingScale::off;
+            const auto scale = integer_argument == 5     ? metadata::PlainRatingScale::five
+                               : integer_argument == 10  ? metadata::PlainRatingScale::ten
+                               : integer_argument == 100 ? metadata::PlainRatingScale::hundred
+                                                         : metadata::PlainRatingScale::off;
             if (!argument || has_any_dialect || !has_integer_argument || has_integer_argument_2 ||
                 scale == metadata::PlainRatingScale::off) {
                 return std::unexpected(core::Error{
@@ -5348,14 +5494,16 @@ constexpr std::size_t maximum_engine_list_name_bytes = 1'024U;
 constexpr std::size_t maximum_engine_list_text_bytes = 4'096U;
 
 [[nodiscard]] core::Error engine_list_conflict(std::string message) {
-    return core::Error{.code = core::ErrorCode::conflict, .message = std::move(message), .context = {}};
+    return core::Error{
+        .code = core::ErrorCode::conflict, .message = std::move(message), .context = {}};
 }
 
 [[nodiscard]] core::Result<void> validate_engine_list(const std::string_view name,
-                                                   const std::vector<EngineListItem>& items) {
+                                                      const std::vector<EngineListItem>& items) {
     const auto invalid = [](std::string message) {
-        return std::unexpected(core::Error{
-            .code = core::ErrorCode::invalid_argument, .message = std::move(message), .context = {}});
+        return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                           .message = std::move(message),
+                                           .context = {}});
     };
     if (name.empty() || name.size() > maximum_engine_list_name_bytes) {
         return invalid("A list needs a name of at most 1024 bytes");
@@ -5372,16 +5520,18 @@ constexpr std::size_t maximum_engine_list_text_bytes = 4'096U;
         }
         if (item.title.size() > maximum_engine_list_text_bytes ||
             item.artist.size() > maximum_engine_list_text_bytes ||
-            item.album.size() > maximum_engine_list_text_bytes) {
-            return invalid("A list entry's title, artist and album are at most 4096 bytes");
+            item.album.size() > maximum_engine_list_text_bytes ||
+            item.album_artist.size() > maximum_engine_list_text_bytes ||
+            item.date.size() > maximum_engine_list_text_bytes) {
+            return invalid("A list entry's tags are at most 4096 bytes each");
         }
     }
     return {};
 }
 
 // The stored revision, or nothing for a list that does not exist.
-[[nodiscard]] core::Result<std::optional<std::uint64_t>> engine_list_revision(sqlite3* database,
-                                                                           const core::StableId& id) {
+[[nodiscard]] core::Result<std::optional<std::uint64_t>>
+engine_list_revision(sqlite3* database, const core::StableId& id) {
     auto statement = prepare(database, "SELECT revision FROM engine_lists WHERE id=?1");
     if (!statement || !bind_text(statement->get(), 1, id.to_string())) {
         return std::unexpected(database_error(database, "Could not read a list's revision"));
@@ -5418,11 +5568,11 @@ constexpr std::size_t maximum_engine_list_text_bytes = 4'096U;
 select_engine_list_summaries(sqlite3* database, const std::optional<core::StableId>& only) {
     auto statement = prepare(
         database, only ? "SELECT id, name, revision, modified_ms, (SELECT count(*) FROM "
-                         "engine_list_items i WHERE i.list_id=p.id), kind FROM engine_lists p "
-                         "WHERE id=?1"
+                         "engine_list_items i WHERE i.list_id=p.id), kind, draft_of, draft_base "
+                         "FROM engine_lists p WHERE id=?1"
                        : "SELECT id, name, revision, modified_ms, (SELECT count(*) FROM "
-                         "engine_list_items i WHERE i.list_id=p.id), kind FROM engine_lists p "
-                         "ORDER BY name, id");
+                         "engine_list_items i WHERE i.list_id=p.id), kind, draft_of, draft_base "
+                         "FROM engine_lists p ORDER BY name, id");
     if (!statement || (only && !bind_text(statement->get(), 1, only->to_string()))) {
         return std::unexpected(database_error(database, "Could not list lists"));
     }
@@ -5437,13 +5587,24 @@ select_engine_list_summaries(sqlite3* database, const std::optional<core::Stable
             summaries.size() >= maximum_engine_lists) {
             return std::unexpected(database_error(database, "Invalid stored list"));
         }
+        std::optional<core::StableId> draft_of;
+        if (sqlite3_column_type(row, 6) != SQLITE_NULL) {
+            const auto drafted = core::StableId::parse(column_text(row, 6));
+            if (!drafted) {
+                return std::unexpected(database_error(database, "Invalid stored list"));
+            }
+            draft_of = *drafted;
+        }
         summaries.push_back(
             EngineListSummary{.id = *id,
-                            .name = column_blob(row, 1),
-                            .kind = static_cast<EngineListKind>(kind),
-                            .revision = static_cast<std::uint64_t>(revision),
-                            .tracks = static_cast<std::size_t>(sqlite3_column_int64(row, 4)),
-                            .modified_ms = sqlite3_column_int64(row, 3)});
+                              .name = column_blob(row, 1),
+                              .kind = static_cast<EngineListKind>(kind),
+                              .revision = static_cast<std::uint64_t>(revision),
+                              .tracks = static_cast<std::size_t>(sqlite3_column_int64(row, 4)),
+                              .modified_ms = sqlite3_column_int64(row, 3),
+                              .draft_of = draft_of,
+                              .draft_base = static_cast<std::uint64_t>(
+                                  std::max<sqlite3_int64>(0, sqlite3_column_int64(row, 7)))});
     }
     if (step != SQLITE_DONE) {
         return std::unexpected(database_error(database, "Could not list lists"));
@@ -5457,6 +5618,20 @@ select_engine_list_summaries(sqlite3* database, const std::optional<core::Stable
                   : sqlite3_bind_null(statement, index)) == SQLITE_OK;
 }
 
+[[nodiscard]] bool bind_optional_real(sqlite3_stmt* statement, const int index,
+                                      const std::optional<double>& value) {
+    return (value ? sqlite3_bind_double(statement, index, *value)
+                  : sqlite3_bind_null(statement, index)) == SQLITE_OK;
+}
+
+[[nodiscard]] std::optional<double> column_optional_real(sqlite3_stmt* statement,
+                                                         const int column) {
+    if (sqlite3_column_type(statement, column) == SQLITE_NULL) {
+        return std::nullopt;
+    }
+    return sqlite3_column_double(statement, column);
+}
+
 [[nodiscard]] std::optional<std::int64_t> column_optional_int(sqlite3_stmt* statement,
                                                               const int column) {
     if (sqlite3_column_type(statement, column) == SQLITE_NULL) {
@@ -5465,13 +5640,16 @@ select_engine_list_summaries(sqlite3* database, const std::optional<core::Stable
     return sqlite3_column_int64(statement, column);
 }
 
-[[nodiscard]] core::Result<void> insert_engine_list_items(sqlite3* database, const core::StableId& id,
-                                                       const std::vector<EngineListItem>& items) {
+[[nodiscard]] core::Result<void> insert_engine_list_items(sqlite3* database,
+                                                          const core::StableId& id,
+                                                          std::span<const EngineListItem> items,
+                                                          const std::int64_t first_position = 0) {
     auto statement = prepare(
         database, "INSERT INTO engine_list_items(list_id, position, entry_id, raw_path, "
                   "logical_reference, segment_start_sample, segment_end_sample, "
-                  "audio_stream_index, subsong_index, duration_ms, title, artist, album) "
-                  "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)");
+                  "audio_stream_index, subsong_index, duration_ms, title, artist, album, "
+                  "album_artist, date, track_gain_db, track_peak, album_gain_db, album_peak) "
+                  "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)");
     if (!statement) {
         return std::unexpected(std::move(statement.error()));
     }
@@ -5480,6 +5658,7 @@ select_engine_list_summaries(sqlite3* database, const std::optional<core::Stable
         const auto& item = items[position];
         auto* raw = statement->get();
         const auto selection = item.source_selection.value_or(ListItemSourceSelection{});
+        const auto gain = item.replay_gain.value_or(ListItemReplayGain{});
         const auto stream = selection.audio_stream_index
                                 ? std::optional<std::int64_t>{*selection.audio_stream_index}
                                 : std::nullopt;
@@ -5488,17 +5667,23 @@ select_engine_list_summaries(sqlite3* database, const std::optional<core::Stable
                                  : std::nullopt;
         const bool bound =
             bind_text(raw, 1, list) &&
-            sqlite3_bind_int64(raw, 2, static_cast<sqlite3_int64>(position)) == SQLITE_OK &&
+            sqlite3_bind_int64(raw, 2,
+                               static_cast<sqlite3_int64>(first_position) +
+                                   static_cast<sqlite3_int64>(position)) == SQLITE_OK &&
             bind_text(raw, 3, item.entry_id.to_string()) && bind_blob(raw, 4, item.raw_path) &&
             (item.logical_reference ? bind_blob(raw, 5, *item.logical_reference)
                                     : sqlite3_bind_null(raw, 5) == SQLITE_OK) &&
-            bind_optional_int(raw, 6,
-                              item.segment ? std::optional{item.segment->start_sample}
-                                           : std::nullopt) &&
+            bind_optional_int(
+                raw, 6, item.segment ? std::optional{item.segment->start_sample} : std::nullopt) &&
             bind_optional_int(raw, 7, item.segment ? item.segment->end_sample : std::nullopt) &&
             bind_optional_int(raw, 8, stream) && bind_optional_int(raw, 9, subsong) &&
             bind_optional_int(raw, 10, item.duration_ms) && bind_blob(raw, 11, item.title) &&
-            bind_blob(raw, 12, item.artist) && bind_blob(raw, 13, item.album);
+            bind_blob(raw, 12, item.artist) && bind_blob(raw, 13, item.album) &&
+            bind_blob(raw, 14, item.album_artist) && bind_blob(raw, 15, item.date) &&
+            bind_optional_real(raw, 16, gain.track_gain_db) &&
+            bind_optional_real(raw, 17, gain.track_peak) &&
+            bind_optional_real(raw, 18, gain.album_gain_db) &&
+            bind_optional_real(raw, 19, gain.album_peak);
         if (!bound) {
             return std::unexpected(database_error(database, "Could not bind a list entry"));
         }
@@ -5507,6 +5692,72 @@ select_engine_list_summaries(sqlite3* database, const std::optional<core::Stable
         }
     }
     return {};
+}
+
+// A list's entries in order; with `positions`, where each is stored too.
+[[nodiscard]] core::Result<std::vector<EngineListItem>>
+select_engine_list_items(sqlite3* database, const core::StableId& id,
+                         std::vector<std::int64_t>* positions = nullptr) {
+    std::vector<EngineListItem> items;
+    auto statement = prepare(
+        database, "SELECT entry_id, raw_path, logical_reference, segment_start_sample, "
+                  "segment_end_sample, audio_stream_index, subsong_index, duration_ms, title, "
+                  "artist, album, album_artist, date, track_gain_db, track_peak, album_gain_db, "
+                  "album_peak, position FROM engine_list_items WHERE list_id=?1 ORDER BY position");
+    if (!statement || !bind_text(statement->get(), 1, id.to_string())) {
+        return std::unexpected(database_error(database, "Could not read a list"));
+    }
+    int step = SQLITE_ROW;
+    while ((step = sqlite3_step(statement->get())) == SQLITE_ROW) {
+        auto* row = statement->get();
+        const auto entry = core::StableId::parse(column_text(row, 0));
+        if (!entry) {
+            return std::unexpected(database_error(database, "Invalid stored list entry"));
+        }
+        EngineListItem item{.entry_id = *entry,
+                            .raw_path = column_blob(row, 1),
+                            .logical_reference = std::nullopt,
+                            .segment = std::nullopt,
+                            .source_selection = std::nullopt,
+                            .duration_ms = column_optional_int(row, 7),
+                            .title = column_blob(row, 8),
+                            .artist = column_blob(row, 9),
+                            .album = column_blob(row, 10),
+                            .album_artist = column_blob(row, 11),
+                            .date = column_blob(row, 12),
+                            .replay_gain = std::nullopt};
+        const ListItemReplayGain gain{.track_gain_db = column_optional_real(row, 13),
+                                      .track_peak = column_optional_real(row, 14),
+                                      .album_gain_db = column_optional_real(row, 15),
+                                      .album_peak = column_optional_real(row, 16)};
+        if (gain != ListItemReplayGain{}) {
+            item.replay_gain = gain;
+        }
+        if (positions != nullptr) {
+            positions->push_back(sqlite3_column_int64(row, 17));
+        }
+        if (sqlite3_column_type(row, 2) != SQLITE_NULL) {
+            item.logical_reference = column_blob(row, 2);
+        }
+        if (const auto start = column_optional_int(row, 3)) {
+            item.segment =
+                ListItemSegment{.start_sample = *start, .end_sample = column_optional_int(row, 4)};
+        }
+        const auto stream = column_optional_int(row, 5);
+        const auto subsong = column_optional_int(row, 6);
+        if (stream || subsong) {
+            item.source_selection = ListItemSourceSelection{
+                .audio_stream_index =
+                    stream ? std::optional<int>{static_cast<int>(*stream)} : std::nullopt,
+                .subsong_index =
+                    subsong ? std::optional<int>{static_cast<int>(*subsong)} : std::nullopt};
+        }
+        items.push_back(std::move(item));
+    }
+    if (step != SQLITE_DONE) {
+        return std::unexpected(database_error(database, "Could not read a list"));
+    }
+    return items;
 }
 
 // Runs `work` inside BEGIN IMMEDIATE, committing when it succeeds.
@@ -5544,59 +5795,18 @@ ListRepository::load_engine_list(const core::StableId& id) const {
         return std::optional<EngineList>{};
     }
     EngineList list{.summary = std::move(summaries->front()), .items = {}};
-    auto statement = prepare(
-        database, "SELECT entry_id, raw_path, logical_reference, segment_start_sample, "
-                  "segment_end_sample, audio_stream_index, subsong_index, duration_ms, title, "
-                  "artist, album FROM engine_list_items WHERE list_id=?1 ORDER BY position");
-    if (!statement || !bind_text(statement->get(), 1, id.to_string())) {
-        return std::unexpected(database_error(database, "Could not read a list"));
+    auto items = select_engine_list_items(database, id);
+    if (!items) {
+        return std::unexpected(std::move(items.error()));
     }
-    int step = SQLITE_ROW;
-    while ((step = sqlite3_step(statement->get())) == SQLITE_ROW) {
-        auto* row = statement->get();
-        const auto entry = core::StableId::parse(column_text(row, 0));
-        if (!entry) {
-            return std::unexpected(database_error(database, "Invalid stored list entry"));
-        }
-        EngineListItem item{.entry_id = *entry,
-                          .raw_path = column_blob(row, 1),
-                          .logical_reference = std::nullopt,
-                          .segment = std::nullopt,
-                          .source_selection = std::nullopt,
-                          .duration_ms = column_optional_int(row, 7),
-                          .title = column_blob(row, 8),
-                          .artist = column_blob(row, 9),
-                          .album = column_blob(row, 10)};
-        if (sqlite3_column_type(row, 2) != SQLITE_NULL) {
-            item.logical_reference = column_blob(row, 2);
-        }
-        if (const auto start = column_optional_int(row, 3)) {
-            item.segment = ListItemSegment{.start_sample = *start,
-                                           .end_sample = column_optional_int(row, 4)};
-        }
-        const auto stream = column_optional_int(row, 5);
-        const auto subsong = column_optional_int(row, 6);
-        if (stream || subsong) {
-            item.source_selection = ListItemSourceSelection{
-                .audio_stream_index = stream ? std::optional<int>{static_cast<int>(*stream)}
-                                             : std::nullopt,
-                .subsong_index = subsong ? std::optional<int>{static_cast<int>(*subsong)}
-                                         : std::nullopt};
-        }
-        list.items.push_back(std::move(item));
-    }
-    if (step != SQLITE_DONE) {
-        return std::unexpected(database_error(database, "Could not read a list"));
-    }
+    list.items = std::move(*items);
     return std::optional{std::move(list)};
 }
 
-core::Result<EngineListSummary>
-ListRepository::save_engine_list(const core::StableId& id, const std::string_view name,
-                              const EngineListKind kind,
-                              const std::vector<EngineListItem>& items,
-                              const std::optional<std::uint64_t> expected_revision,
-                              const std::int64_t now_ms) {
+core::Result<EngineListSummary> ListRepository::save_engine_list(
+    const core::StableId& id, const std::string_view name, const EngineListKind kind,
+    const std::vector<EngineListItem>& items, const std::optional<std::uint64_t> expected_revision,
+    const std::int64_t now_ms) {
     if (auto valid = validate_engine_list(name, items); !valid) {
         return std::unexpected(std::move(valid.error()));
     }
@@ -5623,16 +5833,14 @@ ListRepository::save_engine_list(const core::StableId& id, const std::string_vie
                 sqlite3_bind_int(update->get(), 4, static_cast<int>(kind)) != SQLITE_OK) {
                 return std::unexpected(database_error(database, "Could not update a list"));
             }
-            if (auto done = step_done(database, update->get(), "Could not update a list");
-                !done) {
+            if (auto done = step_done(database, update->get(), "Could not update a list"); !done) {
                 return std::unexpected(std::move(done.error()));
             }
             auto clear = prepare(database, "DELETE FROM engine_list_items WHERE list_id=?1");
             if (!clear || !bind_text(clear->get(), 1, id.to_string())) {
                 return std::unexpected(database_error(database, "Could not update a list"));
             }
-            if (auto done = step_done(database, clear->get(), "Could not update a list");
-                !done) {
+            if (auto done = step_done(database, clear->get(), "Could not update a list"); !done) {
                 return std::unexpected(std::move(done.error()));
             }
         } else {
@@ -5653,8 +5861,7 @@ ListRepository::save_engine_list(const core::StableId& id, const std::string_vie
                 sqlite3_bind_int(insert->get(), 4, static_cast<int>(kind)) != SQLITE_OK) {
                 return std::unexpected(database_error(database, "Could not create a list"));
             }
-            if (auto done = step_done(database, insert->get(), "Could not create a list");
-                !done) {
+            if (auto done = step_done(database, insert->get(), "Could not create a list"); !done) {
                 return std::unexpected(std::move(done.error()));
             }
         }
@@ -5669,10 +5876,197 @@ ListRepository::save_engine_list(const core::StableId& id, const std::string_vie
     });
 }
 
+core::Result<EngineList>
+ListRepository::edit_engine_list(const core::StableId& id, const std::uint64_t expected_revision,
+                                 const std::vector<ListEdit>& edits, const std::int64_t now_ms,
+                                 const std::optional<std::string_view> name,
+                                 const std::optional<EngineListKind> kind, const bool with_items) {
+    auto* database = implementation_->database;
+    return in_transaction(database, [&]() -> core::Result<EngineList> {
+        auto stored = engine_list_revision(database, id);
+        if (!stored) {
+            return std::unexpected(std::move(stored.error()));
+        }
+        if (!*stored) {
+            return std::unexpected(core::Error{.code = core::ErrorCode::not_found,
+                                               .message = "There is no such list",
+                                               .context = {}});
+        }
+        if (auto checked = check_revision(*stored, expected_revision); !checked) {
+            return std::unexpected(std::move(checked.error()));
+        }
+        auto summaries = select_engine_list_summaries(database, id);
+        if (!summaries || summaries->empty()) {
+            return std::unexpected(database_error(database, "Could not read a list"));
+        }
+        const auto list = id.to_string();
+        const auto list_name = name.value_or(summaries->front().name);
+        // Appends -- inserts, the first after the last entry, each after the
+        // one before ended -- are what making a long list in batches is, and
+        // they cost what they add: nothing is read back or written again.
+        auto last = prepare(database, "SELECT entry_id, position FROM engine_list_items "
+                                      "WHERE list_id=?1 ORDER BY position DESC LIMIT 1");
+        if (!last || !bind_text(last->get(), 1, list)) {
+            return std::unexpected(database_error(database, "Could not read a list"));
+        }
+        std::optional<core::StableId> tail;
+        std::int64_t tail_position = -1;
+        if (sqlite3_step(last->get()) == SQLITE_ROW) {
+            if (const auto parsed = core::StableId::parse(column_text(last->get(), 0))) {
+                tail = *parsed;
+            }
+            tail_position = sqlite3_column_int64(last->get(), 1);
+        }
+        bool appends = !edits.empty();
+        std::vector<EngineListItem> appended;
+        auto anchor = tail;
+        for (const auto& edit : edits) {
+            if (edit.kind != ListEdit::Kind::insert || edit.after != anchor) {
+                appends = false;
+                break;
+            }
+            appended.insert(appended.end(), edit.items.begin(), edit.items.end());
+            if (!edit.items.empty()) {
+                anchor = edit.items.back().entry_id;
+            }
+        }
+        std::vector<EngineListItem> items;
+        if (appends) {
+            if (auto valid = validate_engine_list(list_name, appended); !valid) {
+                return std::unexpected(std::move(valid.error()));
+            }
+            if (summaries->front().tracks + appended.size() > maximum_items_per_document) {
+                return std::unexpected(
+                    core::Error{.code = core::ErrorCode::invalid_argument,
+                                .message = "A list holds at most 1000000 entries",
+                                .context = {}});
+            }
+            auto held = prepare(database, "SELECT 1 FROM engine_list_items "
+                                          "WHERE list_id=?1 AND entry_id=?2");
+            if (!held) {
+                return std::unexpected(std::move(held.error()));
+            }
+            for (const auto& item : appended) {
+                if (!bind_text(held->get(), 1, list) ||
+                    !bind_text(held->get(), 2, item.entry_id.to_string())) {
+                    return std::unexpected(database_error(database, "Could not edit a list"));
+                }
+                const bool taken = sqlite3_step(held->get()) == SQLITE_ROW;
+                sqlite3_reset(held->get());
+                sqlite3_clear_bindings(held->get());
+                if (taken) {
+                    return std::unexpected(core::Error{
+                        .code = core::ErrorCode::invalid_argument,
+                        .message = "an inserted entry needs an identity the list does not hold",
+                        .context = {}});
+                }
+            }
+            if (auto stored_items =
+                    insert_engine_list_items(database, id, appended, tail_position + 1);
+                !stored_items) {
+                return std::unexpected(std::move(stored_items.error()));
+            }
+            if (with_items) {
+                auto read = select_engine_list_items(database, id);
+                if (!read) {
+                    return std::unexpected(std::move(read.error()));
+                }
+                items = std::move(*read);
+            }
+        } else {
+            std::vector<std::int64_t> positions;
+            auto read = select_engine_list_items(database, id, &positions);
+            if (!read) {
+                return std::unexpected(std::move(read.error()));
+            }
+            const auto before = *read;
+            items = std::move(*read);
+            if (auto applied = apply_list_edits(items, edits); !applied) {
+                return std::unexpected(std::move(applied.error()));
+            }
+            if (auto valid = validate_engine_list(list_name, items); !valid) {
+                return std::unexpected(std::move(valid.error()));
+            }
+            const bool only_removals = std::ranges::all_of(
+                edits, [](const ListEdit& edit) { return edit.kind == ListEdit::Kind::remove; });
+            if (only_removals) {
+                // Order is by position, and a gap is no matter: what is left
+                // stays where it is, so taking one entry from a long list --
+                // the consume mode does it at every track -- writes one row.
+                auto remove = prepare(
+                    database, "DELETE FROM engine_list_items WHERE list_id=?1 AND entry_id=?2");
+                if (!remove) {
+                    return std::unexpected(std::move(remove.error()));
+                }
+                for (const auto& edit : edits) {
+                    for (const auto& entry : edit.entries) {
+                        if (!bind_text(remove->get(), 1, list) ||
+                            !bind_text(remove->get(), 2, entry.to_string())) {
+                            return std::unexpected(
+                                database_error(database, "Could not edit a list"));
+                        }
+                        if (auto done = step_done(database, remove->get(), "Could not edit a list");
+                            !done) {
+                            return std::unexpected(std::move(done.error()));
+                        }
+                    }
+                }
+            } else {
+                // What leads the list unchanged stays where it is stored;
+                // from the first difference on, it is written again.
+                std::size_t same = 0;
+                while (same < before.size() && same < items.size() && before[same] == items[same]) {
+                    ++same;
+                }
+                if (same < before.size()) {
+                    auto clear = prepare(database, "DELETE FROM engine_list_items "
+                                                   "WHERE list_id=?1 AND position>=?2");
+                    if (!clear || !bind_text(clear->get(), 1, list) ||
+                        sqlite3_bind_int64(clear->get(), 2, positions[same]) != SQLITE_OK) {
+                        return std::unexpected(database_error(database, "Could not edit a list"));
+                    }
+                    if (auto done = step_done(database, clear->get(), "Could not edit a list");
+                        !done) {
+                        return std::unexpected(std::move(done.error()));
+                    }
+                }
+                const auto from = same > 0 ? positions[same - 1] + 1 : 0;
+                if (auto stored_items = insert_engine_list_items(
+                        database, id, std::span{items}.subspan(same), from);
+                    !stored_items) {
+                    return std::unexpected(std::move(stored_items.error()));
+                }
+            }
+            if (!with_items) {
+                items.clear();
+            }
+        }
+        auto bump = prepare(database, "UPDATE engine_lists SET revision=revision+1, "
+                                      "modified_ms=?2, name=coalesce(?3, name), "
+                                      "kind=coalesce(?4, kind) WHERE id=?1");
+        if (!bump || !bind_text(bump->get(), 1, list) ||
+            sqlite3_bind_int64(bump->get(), 2, now_ms) != SQLITE_OK ||
+            !(name ? bind_blob(bump->get(), 3, *name)
+                   : sqlite3_bind_null(bump->get(), 3) == SQLITE_OK) ||
+            (kind ? sqlite3_bind_int(bump->get(), 4, static_cast<int>(*kind))
+                  : sqlite3_bind_null(bump->get(), 4)) != SQLITE_OK) {
+            return std::unexpected(database_error(database, "Could not edit a list"));
+        }
+        if (auto done = step_done(database, bump->get(), "Could not edit a list"); !done) {
+            return std::unexpected(std::move(done.error()));
+        }
+        auto summary = select_engine_list_summaries(database, id);
+        if (!summary || summary->empty()) {
+            return std::unexpected(database_error(database, "Could not read an edited list"));
+        }
+        return EngineList{.summary = std::move(summary->front()), .items = std::move(items)};
+    });
+}
+
 core::Result<EngineListSummary>
 ListRepository::rename_engine_list(const core::StableId& id, const std::string_view name,
-                                const std::optional<std::uint64_t> expected_revision,
-                                const std::int64_t now_ms) {
+                                   const std::optional<std::uint64_t> expected_revision,
+                                   const std::int64_t now_ms) {
     if (auto valid = validate_engine_list(name, {}); !valid) {
         return std::unexpected(std::move(valid.error()));
     }
@@ -5708,8 +6102,9 @@ ListRepository::rename_engine_list(const core::StableId& id, const std::string_v
     });
 }
 
-core::Result<bool> ListRepository::delete_engine_list(const core::StableId& id,
-                                                   const std::optional<std::uint64_t> expected_revision) {
+core::Result<bool>
+ListRepository::delete_engine_list(const core::StableId& id,
+                                   const std::optional<std::uint64_t> expected_revision) {
     auto* database = implementation_->database;
     return in_transaction(database, [&]() -> core::Result<bool> {
         auto stored = engine_list_revision(database, id);
@@ -5722,7 +6117,7 @@ core::Result<bool> ListRepository::delete_engine_list(const core::StableId& id,
         if (auto checked = check_revision(*stored, expected_revision); !checked) {
             return std::unexpected(std::move(checked.error()));
         }
-        auto remove = prepare(database, "DELETE FROM engine_lists WHERE id=?1");
+        auto remove = prepare(database, "DELETE FROM engine_lists WHERE id=?1 OR draft_of=?1");
         if (!remove || !bind_text(remove->get(), 1, id.to_string())) {
             return std::unexpected(database_error(database, "Could not delete a list"));
         }
@@ -5733,8 +6128,195 @@ core::Result<bool> ListRepository::delete_engine_list(const core::StableId& id,
     });
 }
 
-core::Result<std::vector<EngineListSummary>>
-ListRepository::relocate_engine_list_paths(
+namespace {
+
+// One statement binding the given texts to ?1, ?2..., run to its end.
+[[nodiscard]] core::Result<void> run_with_texts(sqlite3* database, const char* sql,
+                                                std::initializer_list<std::string> texts,
+                                                const char* failure) {
+    auto statement = prepare(database, sql);
+    if (!statement) {
+        return std::unexpected(database_error(database, failure));
+    }
+    // As many as the statement names: ?1 and ?2 are not always both used.
+    const auto parameters = sqlite3_bind_parameter_count(statement->get());
+    int index = 1;
+    for (const auto& text : texts) {
+        if (index > parameters) {
+            break;
+        }
+        if (!bind_text(statement->get(), index++, text)) {
+            return std::unexpected(database_error(database, failure));
+        }
+    }
+    return step_done(database, statement->get(), failure);
+}
+
+[[nodiscard]] core::Error list_refused(const core::ErrorCode code, std::string message) {
+    return core::Error{.code = code, .message = std::move(message), .context = {}};
+}
+
+} // namespace
+
+core::Result<std::pair<std::uint64_t, std::vector<std::optional<std::string>>>>
+ListRepository::engine_list_entry_paths(const core::StableId& id,
+                                        const std::vector<core::StableId>& entries) const {
+    auto* database = implementation_->database;
+    auto revision = engine_list_revision(database, id);
+    if (!revision) {
+        return std::unexpected(std::move(revision.error()));
+    }
+    if (!*revision) {
+        return std::unexpected(list_refused(core::ErrorCode::not_found, "There is no such list"));
+    }
+    auto statement = prepare(database, "SELECT raw_path FROM engine_list_items "
+                                       "WHERE list_id=?1 AND entry_id=?2");
+    if (!statement || !bind_text(statement->get(), 1, id.to_string())) {
+        return std::unexpected(database_error(database, "Could not read a list"));
+    }
+    std::vector<std::optional<std::string>> paths;
+    paths.reserve(entries.size());
+    for (const auto& entry : entries) {
+        sqlite3_reset(statement->get());
+        if (!bind_text(statement->get(), 2, entry.to_string())) {
+            return std::unexpected(database_error(database, "Could not read a list"));
+        }
+        const auto step = sqlite3_step(statement->get());
+        if (step == SQLITE_ROW) {
+            paths.emplace_back(column_blob(statement->get(), 0));
+        } else if (step == SQLITE_DONE) {
+            paths.emplace_back();
+        } else {
+            return std::unexpected(database_error(database, "Could not read a list"));
+        }
+    }
+    return std::pair{**revision, std::move(paths)};
+}
+
+core::Result<EngineListSummary> ListRepository::draft_engine_list(const core::StableId& of,
+                                                                  const core::StableId& id,
+                                                                  const std::int64_t now_ms) {
+    auto* database = implementation_->database;
+    return in_transaction(database, [&]() -> core::Result<EngineListSummary> {
+        auto all = select_engine_list_summaries(database, std::nullopt);
+        if (!all) {
+            return std::unexpected(std::move(all.error()));
+        }
+        const auto saved = std::ranges::find(*all, of, &EngineListSummary::id);
+        if (saved == all->end()) {
+            return std::unexpected(
+                list_refused(core::ErrorCode::not_found, "There is no such list"));
+        }
+        if (saved->kind != EngineListKind::saved || saved->draft_of) {
+            return std::unexpected(
+                list_refused(core::ErrorCode::invalid_argument, "Only a saved list has a draft"));
+        }
+        if (const auto existing =
+                std::ranges::find(*all, std::optional{of}, &EngineListSummary::draft_of);
+            existing != all->end()) {
+            return *existing;
+        }
+        if (all->size() >= maximum_engine_lists) {
+            return std::unexpected(
+                list_refused(core::ErrorCode::limit_exceeded, "At most 4096 lists can be kept"));
+        }
+        auto insert =
+            prepare(database, "INSERT INTO engine_lists(id, name, kind, revision, created_ms, "
+                              "modified_ms, draft_of, draft_base) "
+                              "SELECT ?1, name, 0, 1, ?3, ?3, id, revision FROM engine_lists "
+                              "WHERE id=?2");
+        if (!insert || !bind_text(insert->get(), 1, id.to_string()) ||
+            !bind_text(insert->get(), 2, of.to_string()) ||
+            sqlite3_bind_int64(insert->get(), 3, now_ms) != SQLITE_OK) {
+            return std::unexpected(database_error(database, "Could not begin a draft"));
+        }
+        if (auto done = step_done(database, insert->get(), "Could not begin a draft"); !done) {
+            return std::unexpected(std::move(done.error()));
+        }
+        if (auto copied = run_with_texts(
+                database,
+                "INSERT INTO engine_list_items SELECT ?1, position, entry_id, raw_path, "
+                "logical_reference, segment_start_sample, segment_end_sample, "
+                "audio_stream_index, subsong_index, duration_ms, title, artist, album, "
+                "album_artist, date, track_gain_db, track_peak, album_gain_db, album_peak "
+                "FROM engine_list_items WHERE list_id=?2",
+                {id.to_string(), of.to_string()}, "Could not begin a draft");
+            !copied) {
+            return std::unexpected(std::move(copied.error()));
+        }
+        auto summary = select_engine_list_summaries(database, id);
+        if (!summary || summary->empty()) {
+            return std::unexpected(database_error(database, "Could not read a draft"));
+        }
+        return std::move(summary->front());
+    });
+}
+
+core::Result<EngineListSummary>
+ListRepository::commit_engine_list_draft(const core::StableId& id, const bool force,
+                                         const std::int64_t now_ms) {
+    auto* database = implementation_->database;
+    return in_transaction(database, [&]() -> core::Result<EngineListSummary> {
+        auto drafts = select_engine_list_summaries(database, id);
+        if (!drafts) {
+            return std::unexpected(std::move(drafts.error()));
+        }
+        if (drafts->empty()) {
+            return std::unexpected(
+                list_refused(core::ErrorCode::not_found, "There is no such list"));
+        }
+        const auto draft = drafts->front();
+        if (!draft.draft_of) {
+            return std::unexpected(
+                list_refused(core::ErrorCode::invalid_argument, "The list is no draft"));
+        }
+        const auto saved = draft.draft_of->to_string();
+        auto stored = engine_list_revision(database, *draft.draft_of);
+        if (!stored) {
+            return std::unexpected(std::move(stored.error()));
+        }
+        if (!*stored) {
+            return std::unexpected(
+                list_refused(core::ErrorCode::not_found, "The list this drafts was deleted"));
+        }
+        if (!force && **stored != draft.draft_base) {
+            return std::unexpected(list_refused(core::ErrorCode::conflict,
+                                                "The list was changed since its draft began"));
+        }
+        const auto draft_id = id.to_string();
+        for (const auto* sql :
+             {"DELETE FROM engine_list_items WHERE list_id=?1",
+              "INSERT INTO engine_list_items SELECT ?1, position, entry_id, raw_path, "
+              "logical_reference, segment_start_sample, segment_end_sample, "
+              "audio_stream_index, subsong_index, duration_ms, title, artist, album, "
+              "album_artist, date, track_gain_db, track_peak, album_gain_db, album_peak "
+              "FROM engine_list_items WHERE list_id=?2",
+              "UPDATE engine_lists SET name=(SELECT name FROM engine_lists WHERE id=?2), "
+              "revision=revision+1 WHERE id=?1",
+              "DELETE FROM engine_lists WHERE id=?2"}) {
+            if (auto done =
+                    run_with_texts(database, sql, {saved, draft_id}, "Could not save a draft");
+                !done) {
+                return std::unexpected(std::move(done.error()));
+            }
+        }
+        auto touch = prepare(database, "UPDATE engine_lists SET modified_ms=?2 WHERE id=?1");
+        if (!touch || !bind_text(touch->get(), 1, saved) ||
+            sqlite3_bind_int64(touch->get(), 2, now_ms) != SQLITE_OK) {
+            return std::unexpected(database_error(database, "Could not save a draft"));
+        }
+        if (auto done = step_done(database, touch->get(), "Could not save a draft"); !done) {
+            return std::unexpected(std::move(done.error()));
+        }
+        auto summary = select_engine_list_summaries(database, *draft.draft_of);
+        if (!summary || summary->empty()) {
+            return std::unexpected(database_error(database, "Could not read a saved list"));
+        }
+        return std::move(summary->front());
+    });
+}
+
+core::Result<std::vector<EngineListSummary>> ListRepository::relocate_engine_list_paths(
     const std::vector<std::pair<std::string, std::string>>& moves, const std::int64_t now_ms) {
     if (moves.size() > maximum_source_relocations) {
         return std::unexpected(core::Error{.code = core::ErrorCode::limit_exceeded,

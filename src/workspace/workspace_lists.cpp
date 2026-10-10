@@ -3,18 +3,24 @@
 #include "workspace/workspace.hpp"
 
 #include "bench/bench_main_window_helpers.hpp"
+#include "trackknife/engine/track_description.hpp"
 #include "trackknife/metadata/flac_mapping.hpp"
+#include "uicommon/debug_log.hpp"
 #include "uicommon/list_persistence_service.hpp"
 #include "uicommon/track_view_layout.hpp"
-#include "uicommon/debug_log.hpp"
+#include "workspace/tab_store.hpp"
 #include "workspace/workspace_view.hpp"
 
 #include <QFile>
 #include <QSettings>
+#include <QThread>
+#include <QThreadPool>
 
 #include <algorithm>
 #include <filesystem>
+#include <iterator>
 #include <ranges>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -25,10 +31,10 @@ namespace {
 
 // A stored list's rows, as a tab shows them: what was cached with each is
 // taken for what the file says until it is read again.
-std::vector<LocalTrackRow> rowsOfDocument(const persistence::ListDocument& document) {
+std::vector<LocalTrackRow> rowsOfItems(const std::span<const persistence::ListItem> items) {
     std::vector<LocalTrackRow> rows;
-    rows.reserve(document.items.size());
-    for (const auto& item : document.items) {
+    rows.reserve(items.size());
+    for (const auto& item : items) {
         if (item.source != persistence::ListSource::local) {
             continue;
         }
@@ -77,18 +83,76 @@ std::vector<LocalTrackRow> rowsOfDocument(const persistence::ListDocument& docum
     return rows;
 }
 
+// A big list in parts, on a pool as wide as the machine: each row's tags are
+// rebuilt and its content identity hashed, and 66,841 rows took 2.8 s on one
+// thread -- on the window's own, at every start.
+std::vector<LocalTrackRow> rowsOfDocument(const persistence::ListDocument& document) {
+    constexpr std::size_t part = 2'048U;
+    const std::span<const persistence::ListItem> items{document.items};
+    if (items.size() <= part) {
+        return rowsOfItems(items);
+    }
+    std::vector<std::vector<LocalTrackRow>> parts((items.size() + part - 1U) / part);
+    {
+        QThreadPool pool;
+        pool.setMaxThreadCount(std::max(1, QThread::idealThreadCount()));
+        for (std::size_t index = 0; index < parts.size(); ++index) {
+            pool.start([&parts, items, index, part] {
+                const auto first = index * part;
+                parts[index] =
+                    rowsOfItems(items.subspan(first, std::min(part, items.size() - first)));
+            });
+        }
+        pool.waitForDone();
+    }
+    std::vector<LocalTrackRow> rows;
+    rows.reserve(items.size());
+    for (auto& rows_of_part : parts) {
+        std::ranges::move(rows_of_part, std::back_inserter(rows));
+    }
+    return rows;
+}
+
 } // namespace
 
+std::vector<Workspace::PreparedList>
+Workspace::prepareLists(std::vector<persistence::ListDocument> documents) {
+    std::vector<PreparedList> prepared;
+    prepared.reserve(documents.size());
+    for (auto& document : documents) {
+        auto rows = rowsOfDocument(document);
+        // The rows are the list now; the stored items would be a second copy.
+        document.items = {};
+        prepared.push_back({.document = std::move(document), .rows = std::move(rows)});
+    }
+    return prepared;
+}
 
 Workspace::ListTab* Workspace::addList(persistence::ListDocument document, const bool select) {
+    auto rows = rowsOfDocument(document);
+    document.items = {};
+    return addList(PreparedList{.document = std::move(document), .rows = std::move(rows)}, select);
+}
+
+Workspace::ListTab* Workspace::addList(PreparedList prepared, const bool select) {
     auto* model = new LocalListModel(view_->modelParent());
-    model->replaceRows(rowsOfDocument(document));
+    model->replaceRows(std::move(prepared.rows));
     model->setListeningHistoryService(persistence_);
     auto tab = std::make_unique<ListTab>();
-    tab->document = std::move(document);
+    // Without its items: nothing reads them once the rows are made, and on a
+    // big list they were the window's second copy of every tag.
+    tab->document = std::move(prepared.document);
+    tab->document.items = {};
     tab->model = model;
     auto* raw_tab = tab.get();
     list_tabs_.push_back(std::move(tab));
+    // ADR-0268: whenever it gains rows, which of their files are gone.
+    const auto document_id = QString::fromStdString(raw_tab->document.id.to_string());
+    connect(model, &QAbstractItemModel::rowsInserted, this,
+            [this, document_id] { scheduleMissingCheck(document_id); });
+    connect(model, &QAbstractItemModel::modelReset, this,
+            [this, document_id] { scheduleMissingCheck(document_id); });
+    scheduleMissingCheck(document_id);
     view_->listAdded(*raw_tab, select);
     enqueueUnprobedRows(*raw_tab);
     syncArtwork(*raw_tab);
@@ -121,13 +185,97 @@ void Workspace::adoptEngineList(const persistence::ListDocument& document) {
     tab->document.dirty = false;
     view_->refreshTabChrome(*tab);
     enqueueUnprobedRows(*tab);
+    describeEngineRows(*tab);
     syncArtwork(*tab);
     schedulePersist();
 }
 
+void Workspace::describeEngineRows(ListTab& tab) {
+    const auto id = QString::fromStdString(tab.document.id.to_string());
+    if (describing_.contains(id)) {
+        describe_again_.insert(id);
+        return;
+    }
+    // A row with a revision was read or described already; a CUE track's
+    // title is its own.
+    std::vector<core::StableId> entries;
+    for (const auto& row : tab.model->rows()) {
+        if (!row.source_revision && !row.segment) {
+            entries.push_back(row.entry_id);
+        }
+    }
+    if (entries.empty() || playbackOf(EngineKey::of(tab.document)) == nullptr) {
+        return;
+    }
+    describing_.insert(id);
+    describeEngineRowsFrom(id, std::move(entries), 0U);
+}
 
-std::vector<std::pair<QString, QString>>
-Workspace::listTargets(const EngineKey& engine) const {
+void Workspace::describeEngineRowsFrom(const QString& document_id,
+                                       std::vector<core::StableId> entries,
+                                       const std::size_t from) {
+    constexpr std::size_t part = 2'000U;
+    auto* tab = tabForDocument(document_id);
+    auto* engine = tab != nullptr ? playbackOf(EngineKey::of(tab->document)) : nullptr;
+    const auto done = [this, document_id] {
+        describing_.remove(document_id);
+        if (describe_again_.remove(document_id)) {
+            if (auto* again = tabForDocument(document_id)) {
+                describeEngineRows(*again);
+            }
+        }
+    };
+    if (engine == nullptr || from >= entries.size()) {
+        done();
+        return;
+    }
+    auto asked = protocol::Json::array();
+    for (auto index = from; index < std::min(entries.size(), from + part); ++index) {
+        asked.push_back(entries[index].to_string());
+    }
+    engine->request(
+        QStringLiteral("list.describe"),
+        protocol::Json{{"id", document_id.toStdString()}, {"entries", std::move(asked)}},
+        [this, document_id, entries = std::move(entries), from,
+         done](const core::Result<protocol::Json>& answer) mutable {
+            auto* target = tabForDocument(document_id);
+            // An engine from before ADR-0259 does not describe: the rows keep
+            // the names they were saved with.
+            if (target == nullptr || !answer) {
+                done();
+                return;
+            }
+            std::unordered_map<std::string, int> row_of;
+            const auto& rows = target->model->rows();
+            for (int row = 0; row < static_cast<int>(rows.size()); ++row) {
+                row_of.emplace(rows[static_cast<std::size_t>(row)].entry_id.to_string(), row);
+            }
+            bool described = false;
+            for (const auto& item : answer->value("items", protocol::Json::array())) {
+                const auto library = item.find("library");
+                const auto at = row_of.find(item.value("entry", std::string{}));
+                if (library == item.end() || library->is_null() || at == row_of.end()) {
+                    continue;
+                }
+                const auto& current = rows[static_cast<std::size_t>(at->second)];
+                auto track = engine::described_track(*library, current.raw_path);
+                if (!track) {
+                    continue;
+                }
+                auto row = cached_library_row(*track);
+                row.source_revision = track->revision;
+                described =
+                    target->model->describeRow(at->second, current.entry_id, std::move(row)) ||
+                    described;
+            }
+            if (described) {
+                syncArtwork(*target);
+            }
+            describeEngineRowsFrom(document_id, std::move(entries), from + part);
+        });
+}
+
+std::vector<std::pair<QString, QString>> Workspace::listTargets(const EngineKey& engine) const {
     std::vector<std::pair<QString, QString>> targets;
     for (auto* tab : view_->listsInOrder()) {
         if (EngineKey::of(tab->document) == engine) {
@@ -138,9 +286,8 @@ Workspace::listTargets(const EngineKey& engine) const {
     return targets;
 }
 
-
 void Workspace::openEngineList(const EngineKey& key, const QString& id,
-                                     std::function<void()> then) {
+                               std::function<void()> then) {
     // Already open here: shown, not opened twice.
     if (auto* tab = tabForDocument(id); tab != nullptr) {
         view_->showList(*tab);
@@ -158,8 +305,8 @@ void Workspace::openEngineList(const EngineKey& key, const QString& id,
         [this, key, then = std::move(then)](const core::Result<protocol::Json>& answer) {
             if (!answer) {
                 view_->showMessage(QStringLiteral("Could not open the list: %1")
-                                             .arg(QString::fromStdString(answer.error().message)),
-                                         5'000);
+                                       .arg(QString::fromStdString(answer.error().message)),
+                                   5'000);
                 return;
             }
             auto document = EngineListSync::documentFromAnswer(*answer, key);
@@ -169,8 +316,10 @@ void Workspace::openEngineList(const EngineKey& key, const QString& id,
             if (auto* open = tabForDocument(document->id); open != nullptr) {
                 view_->showList(*open);
             } else {
-                list_sync_->opened(*document, answer->value("revision", std::uint64_t{0}));
-                static_cast<void>(addList(std::move(*document), true));
+                list_sync_->opened(*answer, key);
+                if (auto* added = addList(std::move(*document), true)) {
+                    describeEngineRows(*added);
+                }
                 schedulePersist();
             }
             if (then) {
@@ -179,85 +328,123 @@ void Workspace::openEngineList(const EngineKey& key, const QString& id,
         });
 }
 
+persistence::ListDocument Workspace::headerOf(const ListTab& tab) {
+    // Field by field: the tab's document can still hold the items it was
+    // opened with, and copying those would be the cost being avoided.
+    return persistence::ListDocument{.id = tab.document.id,
+                                     .kind = tab.document.kind,
+                                     .name = tab.document.name,
+                                     .pinned = tab.document.pinned,
+                                     .dirty = tab.document.dirty,
+                                     .items = {},
+                                     .engine = tab.document.engine};
+}
+
+Workspace::ListTab::Saved Workspace::savedStateOf(const ListTab& tab) {
+    return ListTab::Saved{.revision = tab.model->contentRevision(),
+                          .name = tab.document.name,
+                          .kind = tab.document.kind,
+                          .pinned = tab.document.pinned,
+                          .dirty = tab.document.dirty,
+                          .engine = tab.document.engine};
+}
+
+persistence::ListDocument Workspace::documentOf(const ListTab& tab) const {
+    auto document = headerOf(tab);
+    document.items.reserve(tab.model->rows().size());
+    for (const auto& row : tab.model->rows()) {
+        persistence::ListItem item{
+            // Carry the row's identity rather than letting ListItem mint a
+            // fresh one, which would reassign every entry on every save.
+            .entry_id = row.entry_id,
+            .source = persistence::ListSource::local,
+            .profile_id = std::nullopt,
+            .source_reference = row.raw_path,
+            .logical_reference = row.logical_reference,
+            .segment = row.segment ? std::optional{persistence::ListItemSegment{
+                                         .start_sample = row.segment->start_sample,
+                                         .end_sample = row.segment->end_sample,
+                                     }}
+                                   : std::nullopt,
+            .source_selection = row.selection.stream_index || row.selection.subsong_index
+                                    ? std::optional{persistence::ListItemSourceSelection{
+                                          .audio_stream_index = row.selection.stream_index,
+                                          .subsong_index = row.selection.subsong_index,
+                                      }}
+                                    : std::nullopt,
+            .duration_ms = row.duration_ms,
+            .source_revision = row.source_revision,
+            .fields = {},
+        };
+        if (!row.metadata.fields.empty()) {
+            // This remains a presentation cache, but retaining layers is
+            // necessary so a verified embedded refresh cannot erase CUE,
+            // chapter, or sidecar projections for the same physical file.
+            for (const auto& field : row.metadata.fields) {
+                if (field.canonical_name.empty()) {
+                    continue;
+                }
+                for (const auto& value : field.values) {
+                    item.fields.push_back({
+                        .name = field.canonical_name,
+                        .value = value,
+                        .native_name = field.native_name,
+                        .provenance = field.provenance,
+                        .language = field.qualifier.language,
+                        .description = field.qualifier.description,
+                    });
+                }
+            }
+        } else {
+            if (!row.title.empty()) {
+                item.fields.push_back({.name = "title", .value = row.title});
+            }
+            if (!row.artist.empty()) {
+                item.fields.push_back({.name = "artist", .value = row.artist});
+            }
+            if (!row.album.empty()) {
+                item.fields.push_back({.name = "album", .value = row.album});
+            }
+            if (!row.album_artist.empty()) {
+                item.fields.push_back({.name = "albumartist", .value = row.album_artist});
+            }
+            if (!row.date.empty()) {
+                item.fields.push_back({.name = "date", .value = row.date});
+            }
+            if (!row.track_number.empty()) {
+                item.fields.push_back({.name = "track", .value = row.track_number});
+            }
+        }
+        document.items.push_back(std::move(item));
+    }
+    return document;
+}
 
 std::vector<persistence::ListDocument> Workspace::collectDocuments() {
     std::vector<persistence::ListDocument> documents;
     const auto shown = view_->listsInOrder();
     documents.reserve(shown.size());
     for (auto* tab : shown) {
-        auto document = tab->document;
-        document.items.clear();
-        document.items.reserve(tab->model->rows().size());
-        for (const auto& row : tab->model->rows()) {
-            persistence::ListItem item{
-                // Carry the row's identity rather than letting ListItem mint a
-                // fresh one, which would reassign every entry on every save.
-                .entry_id = row.entry_id,
-                .source = persistence::ListSource::local,
-                .profile_id = std::nullopt,
-                .source_reference = row.raw_path,
-                .logical_reference = row.logical_reference,
-                .segment = row.segment ? std::optional{persistence::ListItemSegment{
-                                             .start_sample = row.segment->start_sample,
-                                             .end_sample = row.segment->end_sample,
-                                         }}
-                                       : std::nullopt,
-                .source_selection = row.selection.stream_index || row.selection.subsong_index
-                                        ? std::optional{persistence::ListItemSourceSelection{
-                                              .audio_stream_index = row.selection.stream_index,
-                                              .subsong_index = row.selection.subsong_index,
-                                          }}
-                                        : std::nullopt,
-                .duration_ms = row.duration_ms,
-                .source_revision = row.source_revision,
-                .fields = {},
-            };
-            if (!row.metadata.fields.empty()) {
-                // This remains a presentation cache, but retaining layers is
-                // necessary so a verified embedded refresh cannot erase CUE,
-                // chapter, or sidecar projections for the same physical file.
-                for (const auto& field : row.metadata.fields) {
-                    if (field.canonical_name.empty()) {
-                        continue;
-                    }
-                    for (const auto& value : field.values) {
-                        item.fields.push_back({
-                            .name = field.canonical_name,
-                            .value = value,
-                            .native_name = field.native_name,
-                            .provenance = field.provenance,
-                            .language = field.qualifier.language,
-                            .description = field.qualifier.description,
-                        });
-                    }
-                }
-            } else {
-                if (!row.title.empty()) {
-                    item.fields.push_back({.name = "title", .value = row.title});
-                }
-                if (!row.artist.empty()) {
-                    item.fields.push_back({.name = "artist", .value = row.artist});
-                }
-                if (!row.album.empty()) {
-                    item.fields.push_back({.name = "album", .value = row.album});
-                }
-                if (!row.album_artist.empty()) {
-                    item.fields.push_back({.name = "albumartist", .value = row.album_artist});
-                }
-                if (!row.date.empty()) {
-                    item.fields.push_back({.name = "date", .value = row.date});
-                }
-                if (!row.track_number.empty()) {
-                    item.fields.push_back({.name = "track", .value = row.track_number});
-                }
-            }
-            document.items.push_back(std::move(item));
-        }
-        documents.push_back(std::move(document));
+        documents.push_back(documentOf(*tab));
     }
     return documents;
 }
 
+std::vector<persistence::ListDocumentWrite> Workspace::collectWrites() {
+    std::vector<persistence::ListDocumentWrite> writes;
+    const auto shown = view_->listsInOrder();
+    writes.reserve(shown.size());
+    for (auto* tab : shown) {
+        // Unchanged since it was last saved: its header only. A save costs
+        // what changed, not the size of every list.
+        if (tab->saved && *tab->saved == savedStateOf(*tab)) {
+            writes.push_back({.document = headerOf(*tab), .items = false});
+        } else {
+            writes.push_back({.document = documentOf(*tab), .items = true});
+        }
+    }
+    return writes;
+}
 
 std::vector<persistence::TrackViewPreset> Workspace::collectTrackViewLayouts() {
     std::vector<persistence::TrackViewPreset> layouts;
@@ -275,46 +462,96 @@ std::vector<persistence::TrackViewPreset> Workspace::collectTrackViewLayouts() {
     return layouts;
 }
 
-
 void Workspace::persistNow(const bool wait) {
-    if (persistence_ == nullptr) {
+    if (tab_store_ == nullptr || !lists_restored_) {
         return;
     }
-    auto documents = collectDocuments();
-    if (list_sync_ != nullptr) {
-        list_sync_->update(documents);
-    }
-    auto view_layouts = collectTrackViewLayouts();
-    if (wait) {
-        const auto error =
-            persistence_->saveWorkspaceAndWait(std::move(documents), std::move(view_layouts));
-        if (!error.isEmpty()) {
-            view_->showMessage(QStringLiteral("List save failed: %1").arg(error), 5'000);
+    auto writes = collectWrites();
+    // What each list is as it is written, recorded as saved once the write
+    // succeeds -- a failed save leaves it to be written again.
+    std::vector<std::pair<core::StableId, ListTab::Saved>> written;
+    written.reserve(writes.size());
+    for (const auto& write : writes) {
+        if (const auto* tab = tabForDocument(write.document.id); tab != nullptr) {
+            written.emplace_back(write.document.id, savedStateOf(*tab));
         }
-        return;
     }
-    persistence_->saveWorkspace(
-        std::move(documents), std::move(view_layouts), [this](QString error) {
-            if (!error.isEmpty()) {
-                view_->showMessage(QStringLiteral("List save failed: %1").arg(error), 5'000);
+    if (list_sync_ != nullptr) {
+        list_sync_->update(writes, engineItems());
+    }
+    const auto settle =
+        [this](const std::vector<std::pair<core::StableId, ListTab::Saved>>& states) {
+            for (const auto& [id, state] : states) {
+                if (auto* tab = tabForDocument(id); tab != nullptr) {
+                    tab->saved = state;
+                }
             }
-        });
+        };
+    // ADR-0259: the window keeps its tabs -- which, in what order, how shown
+    // -- and a cache of the rows of each that changed; the lists are their
+    // engines'.
+    TabStore::State state;
+    const auto layouts = collectTrackViewLayouts();
+    const auto shown = view_->listsInOrder();
+    state.tabs.reserve(shown.size());
+    for (const auto* tab : shown) {
+        TabStore::Tab kept{.id = tab->document.id,
+                           .engine = tab->document.engine,
+                           .name = tab->document.name,
+                           .kind = tab->document.kind,
+                           .pinned = tab->document.pinned,
+                           .dirty = tab->document.dirty,
+                           .layout = {}};
+        const auto binding = utf8Bytes(
+            QStringLiteral("local:%1").arg(QString::fromStdString(tab->document.id.to_string())));
+        for (const auto& layout : layouts) {
+            if (layout.binding == binding) {
+                kept.layout = QByteArray{layout.header_state.data(),
+                                         static_cast<qsizetype>(layout.header_state.size())};
+            }
+        }
+        state.tabs.push_back(std::move(kept));
+    }
+    if (const auto* current = view_->currentList(); current != nullptr) {
+        state.active = current->document.id;
+    }
+    for (auto& write : writes) {
+        if (write.items) {
+            tab_store_->writeRows(std::move(write.document));
+        }
+    }
+    TabStore::saveState(state);
+    if (wait) {
+        tab_store_->flush();
+        std::vector<core::StableId> open;
+        open.reserve(state.tabs.size());
+        for (const auto& tab : state.tabs) {
+            open.push_back(tab.id);
+        }
+        tab_store_->dropAllBut(open);
+    }
+    settle(written);
 }
 
-
-void Workspace::restoreLists(std::vector<persistence::ListDocument> documents) {
+void Workspace::restoreLists(std::vector<PreparedList> documents) {
     lists_restored_ = true;
     qCDebug(tkDebug) << "restoring" << static_cast<int>(documents.size()) << "list documents";
-    for (auto& document : documents) {
+    for (auto& prepared : documents) {
+        const auto& document = prepared.document;
         qCDebug(tkDebug) << "  list" << displayText(document.name) << "kind"
                          << static_cast<int>(document.kind) << "items"
-                         << static_cast<int>(document.items.size());
+                         << static_cast<int>(prepared.rows.size());
         // Documents of the retired MPD backend name server URIs, not files;
         // opened as local lists they would be rows that cannot play.
         if (document.kind == persistence::ListKind::mpd) {
             continue;
         }
-        static_cast<void>(addList(std::move(document), false));
+        // As stored: saving it again writes its header, not its items --
+        // unless it is stored nowhere yet but in the lists this window kept
+        // before.
+        if (auto* tab = addList(std::move(prepared), false); tab != nullptr && !migrating_) {
+            tab->saved = savedStateOf(*tab);
+        }
     }
     if (list_tabs_.empty()) {
         static_cast<void>(addList(
@@ -328,7 +565,8 @@ void Workspace::restoreLists(std::vector<persistence::ListDocument> documents) {
             },
             true));
     } else {
-        view_->showList(*list_tabs_.front());
+        auto* shown = restored_active_ ? tabForDocument(*restored_active_) : nullptr;
+        view_->showList(shown != nullptr ? *shown : *list_tabs_.front());
     }
     if (!pending_open_paths_.empty()) {
         auto pending = std::exchange(pending_open_paths_, std::vector<std::string>{});
@@ -340,7 +578,6 @@ void Workspace::restoreLists(std::vector<persistence::ListDocument> documents) {
     schedulePersist();
     flushEngineRelocations();
 }
-
 
 void Workspace::openLocalPaths(std::vector<std::string> raw_paths) {
     if (raw_paths.empty()) {
@@ -363,18 +600,17 @@ void Workspace::openLocalPaths(std::vector<std::string> raw_paths) {
         tab = local != list_tabs_.end()
                   ? local->get()
                   : addList(persistence::ListDocument{.id = core::StableId::random(),
-                                                         .kind = persistence::ListKind::scratch,
-                                                         .name = untitled_list_name,
-                                                         .pinned = false,
-                                                         .dirty = false,
-                                                         .items = {},
-                                                         .engine = {}},
-                               true);
+                                                      .kind = persistence::ListKind::scratch,
+                                                      .name = untitled_list_name,
+                                                      .pinned = false,
+                                                      .dirty = false,
+                                                      .items = {},
+                                                      .engine = {}},
+                            true);
         view_->showList(*tab);
     }
     startDiscovery(std::move(raw_paths), QString::fromStdString(tab->document.id.to_string()), -1);
 }
-
 
 bool Workspace::transferRows(ListTab* source_tab, LocalListModel* source_model,
                              const EngineKey& from, const bool dynamic, std::vector<int> rows,
@@ -438,7 +674,6 @@ bool Workspace::transferRows(ListTab* source_tab, LocalListModel* source_model,
     return true;
 }
 
-
 bool Workspace::canReplayCrossTabMove(const bool undo) {
     if (!cross_tab_move_edit_ || cross_tab_move_edit_->applied != undo) {
         return false;
@@ -457,7 +692,6 @@ bool Workspace::canReplayCrossTabMove(const bool undo) {
            target->model->rows() ==
                (undo ? cross_tab_move_edit_->target_after : cross_tab_move_edit_->target_before);
 }
-
 
 bool Workspace::replayCrossTabMove(const bool undo) {
     if (!canReplayCrossTabMove(undo)) {
@@ -479,13 +713,11 @@ bool Workspace::replayCrossTabMove(const bool undo) {
     return true;
 }
 
-
 void Workspace::takeEngineChange(ListTab& tab) {
     tab.document.dirty = true;
     view_->refreshTabChrome(tab);
     schedulePersist();
 }
-
 
 void Workspace::markTabDirty(ListTab& tab) {
     takeEngineChange(tab);
@@ -497,7 +729,6 @@ void Workspace::markTabDirty(ListTab& tab) {
     }
 }
 
-
 void Workspace::setActiveLocalList(const QString& id) {
     if (active_local_list_id_ == id)
         return;
@@ -505,7 +736,6 @@ void Workspace::setActiveLocalList(const QString& id) {
     for (const auto& tab : list_tabs_)
         view_->refreshTabChrome(*tab);
 }
-
 
 void Workspace::closeList(ListTab& tab) {
     if (playback_.requests.active() && tab.document.id == playback_.anchors.document) {
@@ -532,7 +762,8 @@ void Workspace::closeList(ListTab& tab) {
     schedulePersist();
 }
 
-ui::TrackViewLayout Workspace::defaultTrackViewLayout(const ui::TrackViewPresentation presentation) {
+ui::TrackViewLayout
+Workspace::defaultTrackViewLayout(const ui::TrackViewPresentation presentation) {
     std::vector<ui::TrackViewColumnLayout> columns;
     columns.reserve(track_column_specs.size());
     for (const auto& spec : track_column_specs) {
@@ -614,10 +845,10 @@ Workspace::HistoryTexts Workspace::historyTexts(const ListTab* tab) {
     HistoryTexts texts;
     texts.can_undo = cross_tab_undo || (model != nullptr && model->canUndo());
     texts.can_redo = cross_tab_redo || (model != nullptr && model->canRedo());
-    texts.undo = cross_tab_undo                        ? tr("Undo Move tracks between tabs")
+    texts.undo = cross_tab_undo                         ? tr("Undo Move tracks between tabs")
                  : model != nullptr && model->canUndo() ? tr("Undo %1").arg(model->undoLabel())
                                                         : tr("Undo list edit");
-    texts.redo = cross_tab_redo                        ? tr("Redo Move tracks between tabs")
+    texts.redo = cross_tab_redo                         ? tr("Redo Move tracks between tabs")
                  : model != nullptr && model->canRedo() ? tr("Redo %1").arg(model->redoLabel())
                                                         : tr("Redo list edit");
     // Sorting, reversing, shuffling and removing duplicates need two rows.
@@ -644,15 +875,9 @@ Workspace::ListTab* Workspace::createList(const QString& name) {
 }
 
 Workspace::ListTab* Workspace::duplicateList(const ListTab& tab) {
-    auto documents = collectDocuments();
-    const auto found =
-        std::ranges::find(documents, tab.document.id, &persistence::ListDocument::id);
-    if (found == documents.end()) {
-        return nullptr;
-    }
-    auto duplicate = *found;
+    auto duplicate = documentOf(tab);
     duplicate.id = core::StableId::random();
-    duplicate.name = utf8Bytes(QStringLiteral("%1 copy").arg(displayText(found->name)));
+    duplicate.name = utf8Bytes(QStringLiteral("%1 copy").arg(displayText(tab.document.name)));
     duplicate.pinned = false;
     duplicate.dirty = true;
     const auto layout = view_->captureTrackViewLayout(tab);
@@ -717,10 +942,10 @@ void Workspace::setTrackViewLayout(ListTab& tab, ui::TrackViewLayout layout) {
 }
 
 Workspace::ListTab* Workspace::transferRowsToNewList(ListTab* source_tab,
-                                                    LocalListModel* source_model,
-                                                    const EngineKey& from, const bool dynamic,
-                                                    std::vector<int> rows, const bool move,
-                                                    const QString& name) {
+                                                     LocalListModel* source_model,
+                                                     const EngineKey& from, const bool dynamic,
+                                                     std::vector<int> rows, const bool move,
+                                                     const QString& name) {
     if (source_model == nullptr || (!dynamic && source_tab == nullptr) || (dynamic && move) ||
         rows.empty() || std::ranges::any_of(rows, [source_model](const int row) {
             return row < 0 || row >= source_model->rowCount();
@@ -744,8 +969,8 @@ Workspace::ListTab* Workspace::transferRowsToNewList(ListTab* source_tab,
 }
 
 Workspace::ListTab* Workspace::openDynamicResult(const QString& name,
-                                                std::vector<LocalTrackRow> rows,
-                                                const EngineKey& engine, const bool show) {
+                                                 std::vector<LocalTrackRow> rows,
+                                                 const EngineKey& engine, const bool show) {
     auto* destination = addList(persistence::ListDocument{.id = core::StableId::random(),
                                                           .kind = persistence::ListKind::scratch,
                                                           .name = utf8Bytes(name),
@@ -803,13 +1028,15 @@ void Workspace::backupWorkspace(const QString& path) {
     const auto settings_path = path + QStringLiteral(".settings.ini");
     if (QFile::exists(settings_path)) {
         view_->showMessage(
-            QStringLiteral("Workspace backup failed: %1 already exists").arg(settings_path), 10'000);
+            QStringLiteral("Workspace backup failed: %1 already exists").arg(settings_path),
+            10'000);
         return;
     }
     const auto temporary_settings = settings_path + QStringLiteral(".partial");
     if (QFile::exists(temporary_settings)) {
         view_->showMessage(
-            QStringLiteral("Workspace backup failed: stale temporary settings file exists"), 10'000);
+            QStringLiteral("Workspace backup failed: stale temporary settings file exists"),
+            10'000);
         return;
     }
     QSettings current;
@@ -829,19 +1056,19 @@ void Workspace::backupWorkspace(const QString& path) {
         std::string{encoded.constData(), static_cast<std::size_t>(encoded.size())}};
     persistNow(false);
     view_->showMessage(QStringLiteral("Backing up workspace database…"), 0);
-    persistence_->backupDatabase(destination, [this, path, settings_path,
-                                               temporary_settings](QString error) {
-        if (error.isEmpty() && !QFile::rename(temporary_settings, settings_path)) {
-            error = QStringLiteral("database saved, but settings could not be published");
-        } else if (!error.isEmpty()) {
-            QFile::remove(temporary_settings);
-        }
-        view_->showMessage(
-            error.isEmpty()
-                ? QStringLiteral("Workspace backed up to %1 and %2").arg(path, settings_path)
-                : QStringLiteral("Workspace backup failed: %1").arg(error),
-            error.isEmpty() ? 7'000 : 10'000);
-    });
+    persistence_->backupDatabase(
+        destination, [this, path, settings_path, temporary_settings](QString error) {
+            if (error.isEmpty() && !QFile::rename(temporary_settings, settings_path)) {
+                error = QStringLiteral("database saved, but settings could not be published");
+            } else if (!error.isEmpty()) {
+                QFile::remove(temporary_settings);
+            }
+            view_->showMessage(
+                error.isEmpty()
+                    ? QStringLiteral("Workspace backed up to %1 and %2").arg(path, settings_path)
+                    : QStringLiteral("Workspace backup failed: %1").arg(error),
+                error.isEmpty() ? 7'000 : 10'000);
+        });
 }
 
 void Workspace::scheduleWorkspaceRestore(const QString& path) {

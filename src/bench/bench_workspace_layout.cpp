@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "bench/bench_main_window.hpp"
+#include "bench/undo_location_widget.hpp"
+#include "workspace/undo_location_session.hpp"
 
-#include "workspace/panel_arrangement.hpp"
 #include "bench/engine_launcher.hpp"
 #include "bench/local_library_panel.hpp"
 #include "bench/local_list_edit_bar.hpp"
 #include "bench/metadata_artwork_section.hpp"
 #include "bench/playback_tab_widget.hpp"
 #include "bench/quick_pick_popup.hpp"
-#include "bench/trackknife_style.hpp"
 #include "bench/settings_dialog.hpp"
 #include "bench/track_list_find_bar.hpp"
+#include "bench/trackknife_style.hpp"
 #include "trackknife/audio/local_audition.hpp"
+#include "workspace/panel_arrangement.hpp"
 #include "workspace/sources.hpp"
 #include <QRandomGenerator>
 #include <QStyle>
@@ -135,9 +137,13 @@ void BenchMainWindow::buildWorkspace() {
     // replaces the dropdown and static heading.
     const auto make_source_tabs = [this](const QString& object_name,
                                          const QString& accessible_name) {
-        // One box split into its sources, the chosen one lifted out of it
-        // (ADR-0250).
-        auto* bar = new SegmentedTabBar(folders_panel_);
+        // The same tabs as the lists', without close buttons: a source is
+        // chosen, not closed.
+        auto* bar = new PlaybackTabBar(folders_panel_, false);
+        bar->setDrawBase(false);
+        bar->setExpanding(false);
+        bar->setUsesScrollButtons(true);
+        bar->setElideMode(Qt::ElideRight);
         bar->setObjectName(object_name);
         bar->setAccessibleName(accessible_name);
         return bar;
@@ -411,6 +417,14 @@ void BenchMainWindow::buildWorkspace() {
     properties_action_->setEnabled(false);
     connect(properties_action_, &QAction::triggered, this,
             &BenchMainWindow::showMetadataProperties);
+    identify_albums_action_ = edit_menu->addAction(QStringLiteral("Identify albums…"));
+    identify_albums_action_->setObjectName(QStringLiteral("action-identify-albums"));
+    identify_albums_action_->setToolTip(
+        QStringLiteral("Look up the selected tracks' albums on MusicBrainz -- the whole list "
+                       "when none are selected -- and write them"));
+    identify_albums_action_->setEnabled(false);
+    connect(identify_albums_action_, &QAction::triggered, this,
+            &BenchMainWindow::showIdentifyAlbums);
     convert_action_ = edit_menu->addAction(QStringLiteral("Convert files…"));
     convert_action_->setObjectName(QStringLiteral("action-convert-files"));
     convert_action_->setEnabled(false);
@@ -940,15 +954,87 @@ trackknife::bench::BenchMainWindow::showSettingsDialog(const SettingsDialog::Pag
             return existing;
         }
     }
+    // Every engine's music folders, one at a time: the same folders its
+    // library's Folders… opens.
     std::function<QWidget*(QWidget*)> library_folders;
-    if (localLibrary()) {
-        library_folders = [this](QWidget* parent) {
-            return localLibrary()->createFoldersWidget(parent);
+    if (std::ranges::any_of(engines_,
+                            [](const auto& engine) { return engine->library != nullptr; })) {
+        library_folders = [this](QWidget* parent) -> QWidget* {
+            auto* widget = new QWidget(parent);
+            auto* layout = new QVBoxLayout(widget);
+            layout->setContentsMargins(0, 0, 0, 0);
+            auto* row = new QHBoxLayout;
+            auto* label = new QLabel(tr("Engine:"), widget);
+            auto* picker = new QComboBox(widget);
+            picker->setObjectName(QStringLiteral("bench-settings-library-engine"));
+            picker->setAccessibleName(tr("Engine whose music folders are shown"));
+            row->addWidget(label);
+            row->addWidget(picker);
+            row->addStretch(1);
+            layout->addLayout(row);
+            auto* folders = new QStackedWidget(widget);
+            for (const auto& engine : engines_) {
+                if (engine->library == nullptr) {
+                    continue;
+                }
+                picker->addItem(engine->key.isLocal() ? tr("This computer")
+                                                      : engineName(engine->key),
+                                engine->key.text());
+                folders->addWidget(engine->library->createFoldersWidget(folders));
+            }
+            // One engine: nothing to choose.
+            label->setVisible(picker->count() > 1);
+            picker->setVisible(picker->count() > 1);
+            connect(picker, &QComboBox::currentIndexChanged, folders,
+                    &QStackedWidget::setCurrentIndex);
+            layout->addWidget(folders, 1);
+            return widget;
+        };
+    }
+    // ADR-0266: where each engine keeps its undo copies, asked of it.
+    std::function<QWidget*(QWidget*)> undo_locations;
+    if (std::ranges::any_of(engines_,
+                            [](const auto& engine) { return engine->file_work != nullptr; })) {
+        undo_locations = [this](QWidget* parent) -> QWidget* {
+            auto* widget = new QWidget(parent);
+            auto* layout = new QVBoxLayout(widget);
+            layout->setContentsMargins(0, 0, 0, 0);
+            auto* row = new QHBoxLayout;
+            auto* label = new QLabel(tr("Engine:"), widget);
+            auto* picker = new QComboBox(widget);
+            picker->setObjectName(QStringLiteral("bench-settings-undo-engine"));
+            picker->setAccessibleName(tr("Engine whose undo copies are shown"));
+            row->addWidget(label);
+            row->addWidget(picker);
+            row->addStretch(1);
+            layout->addLayout(row);
+            auto* places = new QStackedWidget(widget);
+            for (const auto& engine : engines_) {
+                if (engine->file_work == nullptr) {
+                    continue;
+                }
+                const auto name =
+                    engine->key.isLocal() ? tr("This computer") : engineName(engine->key);
+                picker->addItem(name, engine->key.text());
+                auto* session = new UndoLocationSession(
+                    engine->file_work,
+                    engine->key.isLocal() ? EngineFolderLister{}
+                                          : workspace_.engineFolderLister(engine->file_work),
+                    places);
+                places->addWidget(new UndoLocationWidget(*session, name, places));
+            }
+            label->setVisible(picker->count() > 1);
+            picker->setVisible(picker->count() > 1);
+            connect(picker, &QComboBox::currentIndexChanged, places,
+                    &QStackedWidget::setCurrentIndex);
+            layout->addWidget(places);
+            return widget;
         };
     }
     auto* dialog = new SettingsDialog(
         this, buildOutputProfileStore(), std::move(library_folders),
-        [this](QWidget* parent) { return buildLastFmSettings(parent); }, configurable_shortcuts_);
+        [this](QWidget* parent) { return buildLastFmSettings(parent); }, configurable_shortcuts_,
+        std::move(undo_locations));
     // ADR-0185: profile edits in Settings refresh every open tag editor's
     // selectors immediately.
     connect(dialog, &SettingsDialog::outputProfilesChanged, this, [this] {

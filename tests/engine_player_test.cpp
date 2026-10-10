@@ -5,6 +5,7 @@
 // is required to check the queue, the anchors and the advance rules -- what is
 // being tested is who owns the state, not whether PipeWire is present.
 
+#include "recording_audition.hpp"
 #include "trackknife/audio/audition.hpp"
 #include "trackknife/engine/playback_methods.hpp"
 #include "trackknife/engine/playback_store.hpp"
@@ -12,7 +13,6 @@
 #include "trackknife/engine/recorder.hpp"
 #include "trackknife/engine/workspace.hpp"
 #include "trackknife/protocol/message.hpp"
-#include "recording_audition.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -205,7 +205,7 @@ void the_method_surface_speaks_for_the_player(engine::Player& player) {
     engine::register_playback_methods(dispatcher, player);
 
     // Paths cross as base64, because a path is bytes.
-    const std::string raw{"/music/broken-\xff.flac", 22U};
+    const std::string raw{"/music/broken-\xff.flac"};
     protocol::Json entries = protocol::Json::array();
     protocol::Json one = protocol::Json::object();
     one["path"] = protocol::encode_raw_path(raw);
@@ -1100,8 +1100,7 @@ void an_agents_sink_is_not_kept_as_this_machines(const std::filesystem::path& di
                 "and a sink on it");
         require(agent.snapshot().output_target == "the-agents-own-speaker",
                 "which the agent is told");
-        require(!(*player)->local_settings()->target,
-                "and this machine's own audio is not");
+        require(!(*player)->local_settings()->target, "and this machine's own audio is not");
         store.persist();
         static_cast<void>((*player)->set_output((*player)->local_output()));
     }
@@ -1237,6 +1236,14 @@ void clearing_the_queue_ends_what_plays() {
     require(cleared.entry.is_nil(), "and holds no entry");
     require(!player->resume().has_value() || player->state().status != "playing",
             "a toggle brings nothing back");
+
+    // Stopped with a queue, play starts it again from its first entry.
+    player->replace_queue(entries);
+    require(player->play_entry(entries[1].entry_id).has_value(), "the second plays");
+    require(player->stop().has_value() && player->state().status == "stopped", "and stops");
+    require(player->resume().has_value(), "play after stop is taken");
+    require(player->state().status == "playing" && player->state().entry == entries[0].entry_id,
+            "and starts the queue from its first entry");
 
     // Removing the playing row from a list that goes on stops it too.
     player->replace_queue(entries);

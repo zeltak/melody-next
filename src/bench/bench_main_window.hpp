@@ -85,6 +85,7 @@ namespace trackknife::ui {
 class QueueTableView;
 class ListPersistenceService;
 class LocalFolderTreeModel;
+class RatingStrip;
 } // namespace trackknife::ui
 
 namespace trackknife::query {
@@ -378,6 +379,7 @@ class BenchMainWindow final : public QMainWindow, public WorkspaceView {
         return workspace_.canReplayCrossTabMove(undo);
     }
     bool replayCrossTabMove(bool undo) { return workspace_.replayCrossTabMove(undo); }
+    void refreshEmptyMessage(ListTab& tab) override;
     void refreshTabChrome(ListTab& tab) override;
     void setActiveLocalList(const QString& id) { workspace_.setActiveLocalList(id); }
     void refreshPlaybackCursor(bool jump = false) override;
@@ -435,6 +437,9 @@ class BenchMainWindow final : public QMainWindow, public WorkspaceView {
     void showConvertForView(QTableView* view);
     void openConvertItems(std::vector<ConvertDialogItem> items);
     void showMetadataForView(QTableView* view);
+    // ADR-0262: Identify albums… by itself, over the selected tracks or, none
+    // selected, the whole tab.
+    void showIdentifyAlbums();
     void showReplayGainForView(QTableView* view);
     SettingsDialog* showSettingsDialog(SettingsDialog::Page page = SettingsDialog::Page::general);
     // Naming layouts, and the move destinations of `destinations_of`; with
@@ -669,6 +674,7 @@ class BenchMainWindow final : public QMainWindow, public WorkspaceView {
     QAction* play_selected_action_{nullptr};
     QAction* properties_action_{nullptr};
     QAction* convert_action_{nullptr};
+    QAction* identify_albums_action_{nullptr};
     QAction* remove_selected_action_{nullptr};
     QAction* undo_list_action_{nullptr};
     QAction* redo_list_action_{nullptr};
@@ -703,6 +709,11 @@ class BenchMainWindow final : public QMainWindow, public WorkspaceView {
     QLabel* now_playing_{nullptr};
     QLabel* now_playing_context_{nullptr};
     QLabel* now_playing_cover_{nullptr};
+    // What plays, rated from the header: on the engine of the list it plays
+    // from, by its key there.
+    ui::RatingStrip* now_playing_rating_{nullptr};
+    QString header_rating_hash_;
+    EngineKey header_rating_engine_;
     // The group whose cover the header shows, so a tick does not rescale it.
     QString header_cover_key_;
     // The album whose cover the header is waiting for, and the entry playing.

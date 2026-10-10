@@ -4,6 +4,7 @@
 
 #include "trackknife/core/result.hpp"
 #include "trackknife/core/stable_id.hpp"
+#include "trackknife/persistence/list_edits.hpp"
 #include "trackknife/persistence/list_repository.hpp"
 
 #include <cstdint>
@@ -41,6 +42,8 @@ class Workspace final {
     [[nodiscard]] core::Result<std::vector<persistence::ListDocument>> load_all() const;
     [[nodiscard]] core::Result<void>
     replace_all(std::span<const persistence::ListDocument> documents);
+    [[nodiscard]] core::Result<void>
+    save_workspace(std::span<const persistence::ListDocumentWrite> documents);
     [[nodiscard]] core::Result<persistence::LocalMetadataRefreshResult>
     refresh_local_metadata(const persistence::LocalMetadataRefresh& refresh);
     [[nodiscard]] core::Result<persistence::LocalSourceRelocationResult>
@@ -96,19 +99,37 @@ class Workspace final {
     load_engine_state(std::string_view key) const;
 
     // ADR-0233: lists, the engine's own -- working and saved.
-    [[nodiscard]] core::Result<std::vector<persistence::EngineListSummary>> load_engine_lists() const;
+    [[nodiscard]] core::Result<std::vector<persistence::EngineListSummary>>
+    load_engine_lists() const;
     [[nodiscard]] core::Result<std::optional<persistence::EngineList>>
     load_engine_list(const core::StableId& id) const;
     [[nodiscard]] core::Result<persistence::EngineListSummary>
     save_engine_list(const core::StableId& id, std::string_view name,
-                  persistence::EngineListKind kind,
-                  const std::vector<persistence::EngineListItem>& items,
-                  std::optional<std::uint64_t> expected_revision, std::int64_t now_ms);
+                     persistence::EngineListKind kind,
+                     const std::vector<persistence::EngineListItem>& items,
+                     std::optional<std::uint64_t> expected_revision, std::int64_t now_ms);
+    // ADR-0256: see ListRepository::edit_engine_list.
+    [[nodiscard]] core::Result<persistence::EngineList>
+    edit_engine_list(const core::StableId& id, std::uint64_t expected_revision,
+                     const std::vector<persistence::ListEdit>& edits, std::int64_t now_ms,
+                     std::optional<std::string_view> name = std::nullopt,
+                     std::optional<persistence::EngineListKind> kind = std::nullopt,
+                     bool with_items = true);
     [[nodiscard]] core::Result<persistence::EngineListSummary>
     rename_engine_list(const core::StableId& id, std::string_view name,
-                    std::optional<std::uint64_t> expected_revision, std::int64_t now_ms);
-    [[nodiscard]] core::Result<bool> delete_engine_list(const core::StableId& id,
-                                                     std::optional<std::uint64_t> expected_revision);
+                       std::optional<std::uint64_t> expected_revision, std::int64_t now_ms);
+    [[nodiscard]] core::Result<bool>
+    delete_engine_list(const core::StableId& id, std::optional<std::uint64_t> expected_revision);
+    // ADR-0259: see ListRepository::engine_list_entry_paths.
+    [[nodiscard]] core::Result<std::pair<std::uint64_t, std::vector<std::optional<std::string>>>>
+    engine_list_entry_paths(const core::StableId& id,
+                            const std::vector<core::StableId>& entries) const;
+    // ADR-0259: see ListRepository::draft_engine_list and
+    // commit_engine_list_draft.
+    [[nodiscard]] core::Result<persistence::EngineListSummary>
+    draft_engine_list(const core::StableId& of, const core::StableId& id, std::int64_t now_ms);
+    [[nodiscard]] core::Result<persistence::EngineListSummary>
+    commit_engine_list_draft(const core::StableId& id, bool force, std::int64_t now_ms);
     [[nodiscard]] core::Result<std::vector<persistence::EngineListSummary>>
     relocate_engine_list_paths(const std::vector<std::pair<std::string, std::string>>& moves,
                                std::int64_t now_ms);

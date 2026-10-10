@@ -3,6 +3,7 @@
 #include "bench/engine_playback.hpp"
 
 #include "trackknife/protocol/message.hpp"
+#include "trackknife/protocol/version.hpp"
 
 #include <QMetaObject>
 #include <QPointer>
@@ -63,6 +64,34 @@ std::unique_ptr<protocol::Client> EnginePlayback::handshake() {
         return nullptr;
     }
     auto client = std::move(*connected);
+    // ADR-0260: decided once, on connecting. An engine of another protocol
+    // is not used; one that is older is, and said so.
+    if (auto info = client->call("engine.info")) {
+        const auto peer = protocol::peer_version(*info);
+        auto said = protocol::compatibility_message(
+            peer, protocol::displayable_text(info->value("name", std::string{})), "Trackknife");
+        bool tell = false;
+        {
+            const std::lock_guard guard{mutex_};
+            tell = said != version_said_;
+            version_said_ = said;
+        }
+        if (tell && !said.empty()) {
+            const QPointer self{this};
+            QMetaObject::invokeMethod(
+                this,
+                [self, message = QString::fromStdString(said)] {
+                    if (self) {
+                        emit self->versionNotice(message);
+                    }
+                },
+                Qt::QueuedConnection);
+        }
+        if (protocol::compatibility(peer) == protocol::Compatibility::incompatible) {
+            client->close();
+            return nullptr;
+        }
+    }
     {
         const std::lock_guard guard{mutex_};
         sequence_ = 0;
@@ -87,6 +116,33 @@ std::unique_ptr<protocol::Client> EnginePlayback::handshake() {
             }
             return;
         }
+        if (event.name == "catalogue.changed") {
+            const auto decoded = [&event](const char* key) {
+                std::vector<std::string> values;
+                for (const auto& value : event.data.value(key, protocol::Json::array())) {
+                    if (value.is_string()) {
+                        if (auto raw = protocol::decode_raw_path(value.get<std::string>())) {
+                            values.push_back(std::move(*raw));
+                        }
+                    }
+                }
+                return values;
+            };
+            auto paths = decoded("paths");
+            auto albums = decoded("albums");
+            const bool everything = event.data.value("everything", false);
+            if (self) {
+                QMetaObject::invokeMethod(
+                    self,
+                    [self, paths = std::move(paths), albums = std::move(albums), everything] {
+                        if (self) {
+                            emit self->catalogueChanged(paths, albums, everything);
+                        }
+                    },
+                    Qt::QueuedConnection);
+            }
+            return;
+        }
         if (event.name == "list.continuations") {
             auto continuations = continuationsOf(event.data);
             if (self) {
@@ -103,7 +159,8 @@ std::unique_ptr<protocol::Client> EnginePlayback::handshake() {
         }
         if (event.name == "list.changed") {
             const auto id = QString::fromStdString(event.data.value("id", std::string{}));
-            const auto revision = static_cast<quint64>(event.data.value("revision", std::uint64_t{0}));
+            const auto revision =
+                static_cast<quint64>(event.data.value("revision", std::uint64_t{0}));
             const bool deleted = event.data.value("deleted", false);
             if (self && !id.isEmpty()) {
                 QMetaObject::invokeMethod(
@@ -214,29 +271,44 @@ void EnginePlayback::maintain() {
     emit changed();
 }
 
-void EnginePlayback::request(const QString& method, protocol::Json params, Answer answer) {
+void EnginePlayback::request(const QString& method, protocol::Json params, Answer answer,
+                             const bool settles) {
     if (!client_) {
-        answer(std::unexpected(core::Error{.code = core::ErrorCode::io,
-                                           .message = "no engine is connected",
-                                           .context = {}}));
+        answer(std::unexpected(core::Error{
+            .code = core::ErrorCode::io, .message = "no engine is connected", .context = {}}));
         return;
     }
     const QPointer self{this};
-    static_cast<void>(QtConcurrent::run(
-        &pool_, [self, this, method, params = std::move(params), answer = std::move(answer)] {
-            if (!self || client_ == nullptr) {
-                return;
+    if (settles) {
+        ++in_flight_;
+    }
+    static_cast<void>(QtConcurrent::run(&pool_, [self, this, method, params = std::move(params),
+                                                 answer = std::move(answer), settles] {
+        if (!self || client_ == nullptr) {
+            if (settles) {
+                --in_flight_;
             }
-            auto result = client_->call(method.toStdString(), params);
-            QMetaObject::invokeMethod(
-                self,
-                [self, answer, result = std::move(result)] {
-                    if (self) {
-                        answer(result);
-                    }
-                },
-                Qt::QueuedConnection);
-        }));
+            return;
+        }
+        auto result = client_->call(method.toStdString(), params);
+        if (settles) {
+            --in_flight_;
+        }
+        QMetaObject::invokeMethod(
+            self,
+            [self, answer, result = std::move(result), settles] {
+                if (!self) {
+                    return;
+                }
+                answer(result);
+                // A state skipped while this was on its way is looked at
+                // again now.
+                if (settles) {
+                    emit self->changed();
+                }
+            },
+            Qt::QueuedConnection);
+    }));
 }
 
 void EnginePlayback::retire() {
@@ -362,6 +434,7 @@ void EnginePlayback::adopt(const protocol::Json& payload) {
     state_.volume_percent = payload.value("volume_percent", 100);
     state_.instance = payload.value("instance", std::uint64_t{0});
     state_.queue_revision = payload.value("queue_revision", std::uint64_t{0});
+    state_.requests_revision = payload.value("requests_revision", std::uint64_t{0});
     state_.consumed = payload.contains("consumed") && payload.at("consumed").is_string()
                           ? QString::fromStdString(payload.at("consumed").get<std::string>())
                           : QString{};
@@ -541,8 +614,12 @@ void EnginePlayback::send(std::vector<std::pair<QString, protocol::Json>> calls)
                 }
                 continue;
             }
-            adopt(*answer);
-            adopted = true;
+            // Only a state is taken as one: list.play answers what it
+            // started, and the state asked for after it says the rest.
+            if (answer->contains("status")) {
+                adopt(*answer);
+                adopted = true;
+            }
         }
         // Before the change is announced, so whoever looks at it sees the
         // engine as having caught up.
@@ -572,6 +649,54 @@ void EnginePlayback::send(std::vector<std::pair<QString, protocol::Json>> calls)
             },
             Qt::QueuedConnection);
     }));
+}
+
+std::optional<LocalTrackRow> EnginePlayback::rowOfEntry(const protocol::Json& entry) {
+    if (!entry.is_object()) {
+        return std::nullopt;
+    }
+    auto path = protocol::decode_raw_path(entry.value("path", std::string{}));
+    const auto identity = core::StableId::parse(entry.value("entry", std::string{}));
+    if (!path || path->empty() || !identity) {
+        return std::nullopt;
+    }
+    LocalTrackRow row;
+    row.entry_id = *identity;
+    row.raw_path = std::move(*path);
+    row.title = entry.value("title", std::string{});
+    if (const auto duration = entry.value("duration_ms", std::int64_t{-1}); duration >= 0) {
+        row.duration_ms = duration;
+    }
+    if (const auto group = entry.find("group"); group != entry.end() && group->is_object()) {
+        row.album_artist = group->value("album_artist", std::string{});
+        row.artist = group->value("artist", std::string{});
+        row.album = group->value("album", std::string{});
+        row.date = group->value("date", std::string{});
+    }
+    if (const auto selection = entry.find("selection");
+        selection != entry.end() && selection->is_object()) {
+        if (const auto stream = selection->find("stream_index");
+            stream != selection->end() && stream->is_number_integer()) {
+            row.selection.stream_index = stream->get<int>();
+        }
+        if (const auto subsong = selection->find("subsong_index");
+            subsong != selection->end() && subsong->is_number_integer()) {
+            row.selection.subsong_index = subsong->get<int>();
+        }
+    }
+    if (const auto segment = entry.find("segment");
+        segment != entry.end() && segment->is_object()) {
+        formats::SampleRange range;
+        range.start_sample = segment->value("start_sample", std::int64_t{0});
+        if (const auto end = segment->find("end_sample");
+            end != segment->end() && end->is_number_integer()) {
+            range.end_sample = end->get<std::int64_t>();
+        }
+        row.segment = range;
+    }
+    // Shown by what the engine was told; read no further.
+    row.probed = !row.title.empty();
+    return row;
 }
 
 protocol::Json EnginePlayback::entryJson(const LocalTrackRow& row,
@@ -684,10 +809,26 @@ EnginePlayback::continuationsOf(const protocol::Json& data) {
         }
         const auto list = QString::fromStdString(value.value("list", std::string{}));
         if (!list.isEmpty()) {
-            found.insert(list,
-                         Continuation{.rule_id = QString::fromStdString(value.value("rule", std::string{})),
-                                      .name = QString::fromStdString(value.value("name", std::string{})),
-                                      .query = QString::fromStdString(value.value("query", std::string{}))});
+            const auto count = [&value](const char* key, const int fallback) {
+                const auto found_count = value.find(key);
+                return found_count != value.end() && found_count->is_number_integer() &&
+                               found_count->get<std::int64_t>() >= 0
+                           ? static_cast<int>(
+                                 std::min<std::int64_t>(found_count->get<std::int64_t>(), 500))
+                           : fallback;
+            };
+            found.insert(
+                list,
+                Continuation{.rule_id = QString::fromStdString(value.value("rule", std::string{})),
+                             .name = QString::fromStdString(value.value("name", std::string{})),
+                             .query = QString::fromStdString(value.value("query", std::string{})),
+                             .group_by =
+                                 QString::fromStdString(value.value("group_by", std::string{})),
+                             .groups = count("groups", 0),
+                             .per_group = count("per_group", 0),
+                             .limit = count("limit", 100),
+                             .shuffle = value.value("shuffle", false),
+                             .selection_told = value.contains("groups")});
         }
     }
     return found;
@@ -715,7 +856,12 @@ void EnginePlayback::setContinuation(const QString& list, const std::optional<Co
     if (rule) {
         params["rule"] = protocol::Json{{"id", rule->rule_id.toStdString()},
                                         {"name", rule->name.toStdString()},
-                                        {"query", rule->query.toStdString()}};
+                                        {"query", rule->query.toStdString()},
+                                        {"group_by", rule->group_by.toStdString()},
+                                        {"groups", rule->groups},
+                                        {"per_group", rule->per_group},
+                                        {"limit", rule->limit},
+                                        {"shuffle", rule->shuffle}};
     }
     request(QStringLiteral("list.continuation.set"), std::move(params),
             [this](const core::Result<protocol::Json>& answer) {
@@ -741,6 +887,14 @@ void EnginePlayback::play(const std::vector<LocalTrackRow>& rows,
     calls.emplace_back(QStringLiteral("playback.replace_queue"), std::move(queue));
     calls.emplace_back(QStringLiteral("playback.play"),
                        protocol::Json{{"entry", entry.to_string()}});
+    send(std::move(calls));
+}
+
+void EnginePlayback::playList(const QString& list, const core::StableId& entry) {
+    std::vector<std::pair<QString, protocol::Json>> calls;
+    calls.emplace_back(QStringLiteral("list.play"),
+                       protocol::Json{{"id", list.toStdString()}, {"entry", entry.to_string()}});
+    calls.emplace_back(QStringLiteral("playback.state"), protocol::Json::object());
     send(std::move(calls));
 }
 

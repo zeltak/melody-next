@@ -36,15 +36,17 @@ struct MetadataCommitResult {
 using MetadataDependentStateCommitter =
     std::function<core::Result<void>(const MetadataCommitResult&)>;
 
-// Executes one ready native-FLAC source plan. The caller runs this synchronous
+// Executes one ready source plan, of any container a qualified text adapter
+// writes (FLAC, MP3, MP4, Ogg Vorbis, Opus, WavPack): the source is published
+// whole and the file it replaced retained for undo. The caller runs this synchronous
 // operation on a bounded mutation worker. The dependent-state callback must be
 // idempotent and all-or-nothing: recovery may replay it after a crash. Its
 // success is part of commit; failure rolls the source back before returning.
 [[nodiscard]] core::Result<MetadataCommitResult>
-commit_flac_metadata_source(const metadata::MetadataWritePlanSource& source_plan,
-                            MetadataOperationJournal& journal,
-                            const MetadataDependentStateCommitter& dependent_state_committer,
-                            const core::CancellationToken& cancellation = {});
+commit_metadata_source(const metadata::MetadataWritePlanSource& source_plan,
+                       MetadataOperationJournal& journal,
+                       const MetadataDependentStateCommitter& dependent_state_committer,
+                       const core::CancellationToken& cancellation = {});
 
 // Executes one ready native-FLAC embedded-artwork plan through the same
 // unchanged-path publication, undo, and restart-recovery lifecycle as text
@@ -92,13 +94,14 @@ recover_metadata_operations(MetadataOperationJournal& journal,
                             const MetadataDependentStateCommitter& dependent_state_committer,
                             const core::CancellationToken& cancellation = {});
 
-// Restores the exact retained inode for one completed operation. Undo is a
+// Restores the exact retained inode for one completed operation -- the whole
+// file, whatever its container. Undo is a
 // second journaled mutation with its own idempotency identity; a crash either
 // resumes the restore or leaves explicit reconciliation evidence.
 [[nodiscard]] core::Result<MetadataCommitResult>
-undo_flac_metadata_operation(const core::StableId& journal_id, MetadataOperationJournal& journal,
-                             const MetadataDependentStateCommitter& dependent_state_committer,
-                             const core::CancellationToken& cancellation = {});
+undo_metadata_operation(const core::StableId& journal_id, MetadataOperationJournal& journal,
+                        const MetadataDependentStateCommitter& dependent_state_committer,
+                        const core::CancellationToken& cancellation = {});
 
 // Removes one verified retained backup without changing the published source.
 // Missing executor-owned paths are treated as an idempotent completed release;
@@ -112,7 +115,7 @@ struct MetadataBackupRetentionPolicy {
     // startup), so a commit remains undoable for the rest of its first session.
     std::int64_t maximum_age_seconds{7 * 24 * 60 * 60};
     std::size_t maximum_entries{256U};
-    std::uint64_t maximum_total_bytes{10U * 1024U * 1024U * 1024U};
+    std::uint64_t maximum_total_bytes{10ULL * 1024ULL * 1024ULL * 1024ULL};
 };
 
 enum class MetadataBackupMaintenanceOutcome : std::uint8_t {

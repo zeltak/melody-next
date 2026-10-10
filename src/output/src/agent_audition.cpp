@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "trackknife/output/agent_audition.hpp"
-#include <algorithm>
 #include "trackknife/formats/probe.hpp"
+#include <algorithm>
 
 #include "trackknife/formats/decoder.hpp"
 
@@ -76,7 +76,8 @@ file_replay_gain(const std::string& raw_path, const formats::AudioSourceSelectio
 
 StreamWishes StreamWishes::from_json(const Json& params) {
     StreamWishes wishes;
-    if (const auto decodes = params.find("decodes"); decodes != params.end() && decodes->is_array()) {
+    if (const auto decodes = params.find("decodes");
+        decodes != params.end() && decodes->is_array()) {
         for (const auto& codec : *decodes) {
             if (codec.is_string()) {
                 wishes.decodes.push_back(codec.get<std::string>());
@@ -92,8 +93,8 @@ StreamWishes StreamWishes::from_json(const Json& params) {
 AgentAudition::AgentAudition(std::string name, AgentPaths paths)
     : name_(std::move(name)), paths_(std::move(paths)) {}
 
-void AgentAudition::attach(std::unique_ptr<protocol::Client> client, const bool files,
-                           std::string reached, StreamWishes wishes) {
+bool AgentAudition::attach(std::unique_ptr<protocol::Client> client, const bool files,
+                           std::string reached, StreamWishes wishes, Returning returning) {
     std::shared_ptr<protocol::Client> shared{std::move(client)};
     std::weak_ptr<protocol::Client> weak = shared;
     shared->on_event([this, weak](const protocol::Event& event) {
@@ -128,23 +129,40 @@ void AgentAudition::attach(std::unique_ptr<protocol::Client> client, const bool 
         }
     });
     std::shared_ptr<protocol::Client> previous;
+    bool kept = false;
     {
         const std::lock_guard guard{mutex_};
         previous = std::exchange(client_, std::move(shared));
         files_ = files;
         reached_ = std::move(reached);
         wishes_ = std::move(wishes);
-        // A new process knows nothing of what the old one played.
-        reported_ = audio::LocalAuditionSnapshot{};
-        next_armed_ = false;
-        current_raw_.clear();
-        next_raw_.clear();
-        seen_transitions_ = 0U;
+        // ADR-0274: the same process, back with what it was given still
+        // loaded: its handovers counted on from where they were, and what it
+        // says it plays now taken -- a handover it made while away moves on
+        // to what was armed, as any report's does.
+        kept = !returning.instance.empty() && returning.instance == instance_ && returning.report &&
+               !current_raw_.empty() &&
+               snapshot_from_json(*returning.report).state != audio::LocalAuditionState::empty;
+        instance_ = std::move(returning.instance);
+        if (kept) {
+            adopt(*returning.report);
+        } else {
+            // A new process knows nothing of what the old one played, and
+            // counts its handovers from nothing; the engine's count stays
+            // where it was.
+            reported_ = audio::LocalAuditionSnapshot{};
+            reported_.chain_transitions = seen_transitions_;
+            next_armed_ = false;
+            current_raw_.clear();
+            next_raw_.clear();
+            agent_transitions_ = 0U;
+        }
     }
     if (previous) {
         previous->close();
     }
     send_wanted_settings();
+    return kept;
 }
 
 void AgentAudition::send_wanted_settings() {
@@ -163,14 +181,14 @@ void AgentAudition::send_wanted_settings() {
         static_cast<void>(call("audition.replay_gain", Json{{"mode", static_cast<int>(*mode)}}));
     }
     if (preamps) {
-        static_cast<void>(
-            call("audition.replay_gain", Json{{"preamp_with_gain_db", preamps->with_gain_db},
-                                              {"preamp_without_gain_db", preamps->without_gain_db}}));
+        static_cast<void>(call("audition.replay_gain",
+                               Json{{"preamp_with_gain_db", preamps->with_gain_db},
+                                    {"preamp_without_gain_db", preamps->without_gain_db}}));
     }
     if (buffer) {
-        static_cast<void>(call("audition.buffer",
-                               Json{{"capacity_ms", buffer->capacity.count()},
-                                    {"start_threshold_ms", buffer->start_threshold.count()}}));
+        static_cast<void>(
+            call("audition.buffer", Json{{"capacity_ms", buffer->capacity.count()},
+                                         {"start_threshold_ms", buffer->start_threshold.count()}}));
     }
 }
 
@@ -212,12 +230,14 @@ void AgentAudition::on_offline(std::function<void()> callback) {
 void AgentAudition::adopt(const Json& report) {
     auto parsed = snapshot_from_json(report);
     // A gapless handover: what was armed is what plays now.
-    if (parsed.chain_transitions > seen_transitions_) {
+    if (parsed.chain_transitions > agent_transitions_) {
         if (!next_raw_.empty()) {
             current_raw_ = std::exchange(next_raw_, {});
         }
-        seen_transitions_ = parsed.chain_transitions;
+        seen_transitions_ += parsed.chain_transitions - agent_transitions_;
     }
+    agent_transitions_ = parsed.chain_transitions;
+    parsed.chain_transitions = seen_transitions_;
     next_armed_ = report.value("next_armed", false);
     // A change of mind -- off Wi-Fi, say -- for what is sent from now on.
     if (const auto stream = report.find("stream"); stream != report.end()) {
@@ -267,10 +287,10 @@ AgentAudition::stream_url(const std::string& raw_path,
                           const formats::AudioSourceSelection& selection,
                           const std::optional<formats::SampleRange>& segment) const {
     if (paths_.stream_port == 0U) {
-        return std::unexpected(core::Error{
-            .code = core::ErrorCode::unsupported,
-            .message = "the engine serves no streams (start it with --http)",
-            .context = {{.key = "agent", .value = name_}}});
+        return std::unexpected(
+            core::Error{.code = core::ErrorCode::unsupported,
+                        .message = "the engine serves no streams (start it with --http)",
+                        .context = {{.key = "agent", .value = name_}}});
     }
     std::string host = paths_.stream_host;
     StreamWishes wishes;
@@ -284,12 +304,14 @@ AgentAudition::stream_url(const std::string& raw_path,
     if (host.empty()) {
         host = "127.0.0.1";
     }
-    StreamRequest request{.raw_path = raw_path, .format = wishes.format, .selection = {}, .segment = {}};
+    StreamRequest request{
+        .raw_path = raw_path, .format = wishes.format, .selection = {}, .segment = {}};
     // Converted when it asks, and whatever it asks when it could not play
     // the original: a part of a file, or a codec it does not decode.
     const bool part = segment || selection.stream_index || selection.subsong_index;
-    if (!request.format && (part || (!wishes.decodes.empty() &&
-                                     !std::ranges::contains(wishes.decodes, codec_of(raw_path, selection))))) {
+    if (!request.format &&
+        (part || (!wishes.decodes.empty() &&
+                  !std::ranges::contains(wishes.decodes, codec_of(raw_path, selection))))) {
         request.format = StreamFormat{};
     }
     if (request.format) {
@@ -386,7 +408,6 @@ core::Result<void> AgentAudition::load(std::string raw_path, Source source, cons
     current_raw_ = std::move(raw_path);
     next_raw_.clear();
     next_armed_ = false;
-    seen_transitions_ = reported_.chain_transitions;
     return {};
 }
 

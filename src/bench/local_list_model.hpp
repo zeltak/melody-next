@@ -26,6 +26,7 @@ class ListPersistenceService;
 #include <optional>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <vector>
 
 namespace trackknife::bench {
@@ -155,6 +156,13 @@ class LocalListModel final : public QAbstractTableModel {
     // ADR-0179: applies stored ratings by content-identity hash to every row
     // whose track hash appears in the map.
     void applyRatings(const QHash<QString, unsigned>& ratings);
+    // ADR-0268: of the files `checked`, those in `missing` are not there and
+    // their rows show greyed; the rest are there again.
+    void setMissing(const std::vector<std::string>& checked,
+                    const std::vector<std::string>& missing);
+    [[nodiscard]] bool isMissing(const std::string& raw_path) const {
+        return missing_.contains(raw_path);
+    }
     // Distinct track rating hashes across all rows, for a bulk store lookup.
     [[nodiscard]] QStringList ratingHashes() const;
     void removeRowIndexes(std::vector<int> rows, bool remember = true, QString label = {});
@@ -176,6 +184,10 @@ class LocalListModel final : public QAbstractTableModel {
     // several logical chapter rows. The first row keeps the original model
     // position and any following rows are inserted directly after it.
     bool applyProbeRows(const std::string& raw_path, int hint_row, std::vector<LocalTrackRow> rows);
+    // ADR-0259: the row at `row`, when it is still entry `entry`, takes what
+    // its engine's library knows of its file; its place, identity and the
+    // part of the file it plays stay. False when it is not that entry.
+    bool describeRow(int row, const core::StableId& entry, LocalTrackRow described);
     // Refreshes every duplicate/logical occurrence of one verified physical
     // source while retaining annotation, segment, and sidecar layers.
     [[nodiscard]] core::Result<std::size_t>
@@ -224,6 +236,10 @@ class LocalListModel final : public QAbstractTableModel {
     void setArtwork(const QString& key, QImage image);
     [[nodiscard]] QImage artwork(const QString& key) const { return artwork_.value(key); }
     [[nodiscard]] const std::vector<LocalTrackRow>& rows() const noexcept { return rows_; }
+    // Goes up with every change to what the list holds -- rows, their order,
+    // their tags -- so a save writes only lists that changed (and a ratings
+    // or playing-marker refresh, which stores nothing, is not one).
+    [[nodiscard]] std::uint64_t contentRevision() const noexcept { return content_revision_; }
     [[nodiscard]] std::string rawPath(int row) const;
     [[nodiscard]] LocalTrackSource source(int row) const;
     // Finds the row holding raw_path, preferring the hint row so duplicate
@@ -252,6 +268,7 @@ class LocalListModel final : public QAbstractTableModel {
 
   private:
     friend class BenchMainWindowTest;
+    std::unordered_set<std::string> missing_;
     struct ListeningCell {
         bool loaded{false};
         std::optional<persistence::LocalListeningHistory> history;
@@ -281,6 +298,8 @@ class LocalListModel final : public QAbstractTableModel {
     void removePositions(const std::vector<int>& positions, std::vector<LocalTrackRow>* detached);
     void applyOrder(const std::vector<int>& order);
     [[nodiscard]] std::vector<LocalTrackRow*> retainedRows();
+    void touched() noexcept { ++content_revision_; }
+    std::uint64_t content_revision_{0};
     std::vector<Edit> history_;
     std::size_t history_cursor_{0};
     void refreshCurrentRow();

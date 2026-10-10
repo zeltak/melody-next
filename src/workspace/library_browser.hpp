@@ -104,6 +104,8 @@ class LibraryBrowser final : public QObject {
     [[nodiscard]] QString viewId() const { return view_id_; }
     [[nodiscard]] QString search() const { return search_; }
     [[nodiscard]] QVariantList roots() const;
+    // The library folders, as raw paths.
+    [[nodiscard]] std::vector<std::string> rootPaths() const;
     [[nodiscard]] const std::vector<Root>& rootList() const { return roots_; }
     [[nodiscard]] QString rootsError() const { return roots_error_; }
     // Whether it is this computer's library, or that of an engine elsewhere,
@@ -132,6 +134,10 @@ class LibraryBrowser final : public QObject {
     // Everything looked up again, a moment from now; a scan is the Refresh
     // button's.
     Q_INVOKABLE void refreshLibrary();
+    // What the engine said changed (catalogue.changed): the albums whose
+    // covers are asked again, or everything; the tree follows in place --
+    // what is open stays open, the current row and the scroll stay.
+    void applyChanges(const std::vector<std::string>& albums, bool everything);
     Q_INVOKABLE void reload();
     Q_INVOKABLE void toggleScan();
     void startScan();
@@ -205,12 +211,19 @@ class LibraryBrowser final : public QObject {
     void addToListRequested(std::vector<persistence::LibraryEntry> entries, const QString& id);
     void newListRequested(std::vector<persistence::LibraryEntry> entries, const QString& name);
     void searchCommitted(QString query, std::vector<LocalTrackRow> rows);
+    // Enter was pressed on a search: kept, once its results are collected
+    // (searchCommitted), or found nothing or failed (searchFailed). Each
+    // started search ends in one of the two, in the order they started.
+    void searchStarted(QString query);
+    void searchFailed(QString query, QString why);
     void ratingsChanged();
     void libraryContentChanged();
 
   private:
     struct Outcome {
         persistence::LibraryPage page;
+        // A view's way to a file being located, its node at each level.
+        persistence::LibraryPage way;
         std::vector<persistence::LibraryRoot> roots;
         std::vector<std::string> paths;
         std::vector<LocalTrackRow> rows;
@@ -218,6 +231,17 @@ class LibraryBrowser final : public QObject {
         QString error;
         std::size_t unavailable{0};
     };
+    // Where a row lies for what is being located: off the way, on it --
+    // opened -- or the row itself, made current.
+    enum class Step { none, on_way, target };
+    using Locating = std::function<Step(const persistence::LibraryEntry&, std::size_t depth)>;
+    // The rule for the layout shown: the artist tree by artist and album,
+    // Recently added by album, Folders by the file's folders, a view by the
+    // way the engine found. Empty when the file is not in it.
+    [[nodiscard]] Locating locating(const persistence::LibraryEntry& album_entry,
+                                    const std::string& raw_path, bool album,
+                                    const persistence::LibraryPage& way) const;
+
     struct Task {
         // ADR-0220: queued work is handed the core's front door, not the
         // database.
@@ -233,6 +257,15 @@ class LibraryBrowser final : public QObject {
     void enqueue(Task task);
     void pump();
     void loadChildren(const QPersistentModelIndex& parent, persistence::LibraryQuery query);
+    static void prepareEntry(persistence::LibraryEntry& entry,
+                             const persistence::LibraryQuery& query);
+    void describeItem(QStandardItem& item, const persistence::LibraryEntry& entry);
+    // The tree's top level as reload() asks it; none for a search, whose
+    // groups carry their own.
+    [[nodiscard]] std::optional<persistence::LibraryQuery> topQuery() const;
+    // Every loaded level asked again and merged into the rows there are.
+    void refreshInPlace();
+    void mergeChildren(const QPersistentModelIndex& parent, persistence::LibraryQuery query);
     void loadFilterChildren(const QPersistentModelIndex& parent,
                             std::shared_ptr<const query::CompiledTkq> compiled);
     void refreshSourceLabel();
@@ -289,8 +322,9 @@ class LibraryBrowser final : public QObject {
     std::size_t generation_{0};
     QSet<QByteArray> expanded_entries_;
     QByteArray current_entry_;
-    std::optional<persistence::LibraryEntry> locate_target_;
-    std::string locate_artist_;
+    // ADR-0273: what is being located, as the rows loading meet it -- in
+    // whichever layout shows; empty when nothing is.
+    Locating locating_;
     bool querying_{false};
     bool scanning_{false};
     bool stopped_{false};

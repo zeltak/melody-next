@@ -8,11 +8,11 @@
 
 #include "agent/agent.hpp"
 #include "agent/speaker_arbiter.hpp"
+#include "trackknife/engine/media_streams.hpp"
 #include "trackknife/engine/outputs.hpp"
 #include "trackknife/engine/playback_methods.hpp"
 #include "trackknife/engine/player.hpp"
 #include "trackknife/engine/server.hpp"
-#include "trackknife/engine/media_streams.hpp"
 #include "trackknife/engine/stream_server.hpp"
 #include "trackknife/engine/workspace.hpp"
 #include "trackknife/protocol/message.hpp"
@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -156,7 +157,8 @@ void require(const bool condition, const std::string_view message) {
 }
 
 // A fixture, decoded from its base64 text.
-[[nodiscard]] bool write_fixture(const std::string& name, const std::filesystem::path& destination) {
+[[nodiscard]] bool write_fixture(const std::string& name,
+                                 const std::filesystem::path& destination) {
     std::ifstream input{std::filesystem::path{TRACKKNIFE_AUDIO_FIXTURE_DIR} / name};
     const std::string encoded{std::istreambuf_iterator<char>{input}, {}};
     static constexpr std::string_view alphabet{
@@ -228,9 +230,9 @@ int main(int argc, char** argv) {
     // Streams for an agent with no copy: whatever the player holds, nothing
     // else.
     const std::string stream_token{"stream-test-token"};
-    engine::MediaStreams media{stream_token,
-                               [&player](const std::string& raw_path) { return player->holds(raw_path); },
-                               nullptr};
+    engine::MediaStreams media{
+        stream_token, [&player](const std::string& raw_path) { return player->holds(raw_path); },
+        nullptr};
     auto streams = engine::StreamServer::listen(
         "127.0.0.1", 0, [&media](const std::string_view query) { return media.resolve(query); });
     require(streams.has_value(), "the engine must serve streams");
@@ -303,8 +305,9 @@ int main(int argc, char** argv) {
     // must reach an agent that starts afresh, which begins with it off.
     require(player->set_replay_gain_mode(audio::ReplayGainMode::album).has_value(),
             "album gain is set");
-    require(player->set_replay_gain_preamps(audio::ReplayGainPreamps{.with_gain_db = 3.0F,
-                                                                     .without_gain_db = -2.0F})
+    require(player
+                ->set_replay_gain_preamps(
+                    audio::ReplayGainPreamps{.with_gain_db = 3.0F, .without_gain_db = -2.0F})
                 .has_value(),
             "and a preamp");
     // Album gain -8 dB with a +3 dB preamp: the track plays at -5 dB.
@@ -360,6 +363,62 @@ int main(int argc, char** argv) {
             }),
             "which the agent plays from its own copy");
 
+    // An agent that drops after a gapless handover, with the next track
+    // armed, and comes back: a new agent process counts its handovers from
+    // nothing, which once read to the engine as one more handover, so the
+    // track after the one playing was taken up, at the place reached in
+    // the one playing.
+    {
+        const std::vector<engine::QueueEntry> chained{entry(engine_root / "two.wav"),
+                                                      entry(engine_root / "one.wav"),
+                                                      entry(engine_root / "two.wav")};
+        player->replace_queue(chained);
+        require(player->play_entry(chained[0].entry_id).has_value(), "a short track plays");
+        require(eventually(
+                    [&] {
+                        static_cast<void>(player->advance_if_ended());
+                        const auto state = player->state();
+                        return state.entry == chained[1].entry_id &&
+                               state.gapless_entry == chained[2].entry_id;
+                    },
+                    std::chrono::seconds{20}),
+                "the next one follows it, and the one after is armed");
+        require(player->pause().has_value(), "and is paused");
+        require(eventually([&] { return player->state().status == "paused"; }),
+                "the engine hears it paused");
+        const auto reached = player->state().position_ms;
+        returned->stop();
+        returned.reset();
+        require(eventually([&] { return !outputs.list().front().online; }), "the agent goes away");
+        // The engine's watcher samples the player all along, the agent's
+        // return included.
+        std::atomic<bool> watching{true};
+        std::thread watcher{[&] {
+            while (watching.load()) {
+                static_cast<void>(player->advance_if_ended());
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            }
+        }};
+        returned = start_agent(port, agent_root);
+        const bool back = returned != nullptr && eventually([&] { return returned->registered(); });
+        const bool taken_up = back && eventually([&] {
+                                  const auto snapshot = returned->audition().snapshot();
+                                  return snapshot.state == audio::LocalAuditionState::paused &&
+                                         !snapshot.raw_path.empty();
+                              });
+        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        watching.store(false);
+        watcher.join();
+        require(back, "and comes back");
+        require(taken_up, "taking the music up, paused");
+        require(returned->audition().snapshot().raw_path == (agent_root / "one.wav").string(),
+                "the track that was playing, not the one after");
+        require(player->state().entry == chained[1].entry_id,
+                "the engine still names that track, not the one after");
+        require(player->state().position_ms >= reached - 50, "at the place it was");
+        static_cast<void>(player->stop());
+    }
+
     // A file the agent has no copy of is streamed to it instead.
     require(write_silence(engine_root / "three.wav", 5), "the test audio must be written");
     const std::vector<engine::QueueEntry> missing{entry(engine_root / "three.wav")};
@@ -368,8 +427,8 @@ int main(int argc, char** argv) {
             "a file the agent lacks still plays");
     require(eventually([&] {
                 const auto snapshot = returned->audition().snapshot();
-                return snapshot.raw_path.starts_with("http://127.0.0.1:" +
-                                                     std::to_string(stream_port) + "/stream?") &&
+                return snapshot.raw_path.starts_with(
+                           "http://127.0.0.1:" + std::to_string(stream_port) + "/stream?") &&
                        snapshot.state == audio::LocalAuditionState::playing;
             }),
             "streamed from the engine");
@@ -448,13 +507,13 @@ int main(int argc, char** argv) {
             "a nearby engine streams the original files");
     {
         // One that wants Opus even nearby gets it, at its rate.
-        auto porch = start_agent(port, std::nullopt, "agent-test-token", "porch",
-                                 trackknife::agent::StreamChoice{
-                                     .nearby = output::StreamFormat{
-                                         .bitrate_kbps = 96,
-                                         .codec = output::StreamCodec::opus,
-                                         .sample_rate_cap = {}},
-                                     .away = std::nullopt});
+        auto porch =
+            start_agent(port, std::nullopt, "agent-test-token", "porch",
+                        trackknife::agent::StreamChoice{
+                            .nearby = output::StreamFormat{.bitrate_kbps = 96,
+                                                           .codec = output::StreamCodec::opus,
+                                                           .sample_rate_cap = {}},
+                            .away = std::nullopt});
         require(porch != nullptr && eventually([&] { return porch->registered(); }),
                 "an agent wanting Opus registers");
         require(outputs.select("agent:porch").has_value(), "and can be chosen");

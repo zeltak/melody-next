@@ -4,7 +4,7 @@ Plan for [ADR-0220](adr/0220-unified-engine-and-remote-agents.md): one engine
 process owning catalogue, mutation and playback; thin clients that may be
 remote; audio produced by output agents.
 
-## Where it stands (2026-09-27)
+## Where it stands (2026-10-05)
 
 The plan below is kept as written, with notes where later decisions changed
 it. In short:
@@ -14,10 +14,11 @@ it. In short:
   agents. The agent is C++, not Go (ADR-0228), and engines find and play for
   each other without configuration (ADR-0229).
 - **Phase 5, the MPD bridge, hasn't started**, and nothing waits for it.
-- **Phase 6 is done** as far as its own check goes: `grep -rn supportsCommand
-  src` finds nothing. One catalogue, ratings and history in the engine; lists
-  live in the engine too (ADR-0233), with Trackknife's own copy still to go.
-  Trackknife still does the file work itself, over the mount.
+- **Phase 6 is done:** `grep -rn supportsCommand src` finds nothing. One
+  catalogue, ratings and history in the engine; lists live in the engine
+  (ADR-0233) and Trackknife keeps none of its own (ADR-0259). File work --
+  tagging, ReplayGain, conversion, moves, undo -- is done by the engine whose
+  files they are, on its machine (ADRs 0237, 0263, 0266).
 - **Several engines at once** (ADR-0234): Trackknife holds a connection per
   engine, lists name their engine by a stable id, and the speakers of this
   computer and of the phone are offered to every engine listed.
@@ -26,6 +27,10 @@ it. In short:
   for NAS changes (ADR-0232). There is no TUI yet.
 - **Playback states are numbered** (ADR-0236), so a client holding an event
   and a command's answer keeps the later.
+- **Engines and clients check each other's version** (ADR-0260): the protocol
+  and its level, what 1.x keeps compatible.
+- **What changes is told:** lists travel as edits (ADR-0256), and every change
+  to a library reaches each client, which follows it in place (ADR-0268).
 - **Repository layout is settled:** everything lives in this repository.
   The Go tree isn't needed any more.
 
@@ -423,8 +428,8 @@ held-open response, and binary on a separate channel.
   at design time, since it is free to allow for and expensive to retrofit.
 
 **What is built.** The catalogue is on the wire, and so is playback: starting a
-track in a list hands the engine the whole list and asks it to play one entry,
-and the transport buttons, the seek bar and the volume slider drive the engine
+track in a list asks the engine to play one entry of its own copy of that list
+(ADR-0256 -- it was once handed the whole list), and the transport buttons, the seek bar and the volume slider drive the engine
 rather than the window's own player. The window follows the engine's reported
 entry, so the highlighted row moves when the engine advances by itself.
 
@@ -505,8 +510,9 @@ engine's, so the buttons follow a one-shot expiring where playback actually
 happened.
 
 The playing list and the engine's queue are kept in step both ways. An edit
-here is pushed, because the engine keeps playing what it was handed and a
-track removed in the window would otherwise still play. A change the engine
+here is sent at once, as an edit of the list the queue was played from, and
+the engine's queue follows it (ADR-0256): a track removed in the window would
+otherwise still play. A change the engine
 made -- consuming, or another client editing -- is read back and merged into
 the rows rather than replacing them: the engine's entries are paths and the
 tags it was given, while the window's rows carry everything it has read from

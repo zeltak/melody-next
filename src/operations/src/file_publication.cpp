@@ -4,6 +4,7 @@
 #include "trackknife/operations/file_publication.hpp"
 
 #include "trackknife/core/atomic_rename.hpp"
+#include "trackknife/operations/undo_copies.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +13,7 @@
 #include <cstddef>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <span>
@@ -20,9 +22,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #ifndef __APPLE__
-#ifndef __APPLE__
 #include <sys/syscall.h>
-#endif
 #endif
 #include <sys/xattr.h>
 #include <system_error>
@@ -521,6 +521,30 @@ remove_descriptor_entry(const Descriptor& descriptor, const Descriptor& parent,
             publication_error(core::ErrorCode::conflict,
                               std::string{description} + " still exists after its durable removal",
                               record.source_raw_path, record.target_raw_path, record.id));
+    }
+    return {};
+}
+
+// ADR-0263: the source a publication replaces is kept, renamed beside
+// itself, never removed; retention releases it later, or undo restores it.
+[[nodiscard]] core::Result<void>
+retain_source_entry(const Descriptor& descriptor, const Descriptor& parent, const std::string& name,
+                    const core::LocalSourceRevision& expected_revision,
+                    const FilePublicationJournalRecord& record) {
+    if (auto current = require_descriptor_entry(descriptor, parent, name, expected_revision, record,
+                                                "publication source");
+        !current) {
+        return current;
+    }
+    const auto retained =
+        file_publication_retained_path(record.source_raw_path, record.id).filename().native();
+    if (auto renamed = rename_no_replace(parent, name, parent, retained, record); !renamed) {
+        return renamed;
+    }
+    if (::fsync(parent.get()) != 0) {
+        return std::unexpected(system_error("Syncing the retained publication source failed", errno,
+                                            record.source_raw_path, record.target_raw_path,
+                                            record.id));
     }
     return {};
 }
@@ -1279,12 +1303,19 @@ verify_cross_source_removed_topology(const FilePublicationJournalRecord& record,
                                             record.target_raw_path, record.id);
     auto target = observe_direct_revision(record.target_raw_path, record.source_raw_path,
                                           record.target_raw_path, record.id);
-    if (!source || !prepared || !target) {
+    auto retained = observe_direct_revision(
+        file_publication_retained_path(record.source_raw_path, record.id).native(),
+        record.source_raw_path, record.target_raw_path, record.id);
+    if (!source || !prepared || !target || !retained) {
         return std::unexpected(!source     ? std::move(source.error())
                                : !prepared ? std::move(prepared.error())
-                                           : std::move(target.error()));
+                               : !target   ? std::move(target.error())
+                                           : std::move(retained.error()));
     }
-    if (*source || *prepared || !*target || **target != target_revision) {
+    // The source kept beside it as it was -- or, from before sources were
+    // kept, gone.
+    if (*source || *prepared || !*target || **target != target_revision ||
+        (*retained && **retained != record.expected_source_revision)) {
         return std::unexpected(publication_error(
             core::ErrorCode::conflict,
             "Completed cross-filesystem move no longer has its recorded target identity",
@@ -1550,11 +1581,10 @@ commit_result(const FilePublicationJournalRecord& record,
         return std::unexpected(std::move(current_target.error()));
     }
     const auto source_name = std::filesystem::path{record.source_raw_path}.filename().native();
-    if (auto removed =
-            remove_descriptor_entry(source.source, source.parent, source_name,
-                                    record.expected_source_revision, record, "publication source");
-        !removed) {
-        return std::unexpected(std::move(removed.error()));
+    if (auto retained = retain_source_entry(source.source, source.parent, source_name,
+                                            record.expected_source_revision, record);
+        !retained) {
+        return std::unexpected(std::move(retained.error()));
     }
     if (auto verified = verify_cross_source_removed_topology(record, target_revision); !verified) {
         auto terminal =
@@ -2779,12 +2809,12 @@ core::Result<std::vector<FilePublicationRecoveryResult>> recover_cross_filesyste
                         continue;
                     }
                 }
-                if (auto removed = remove_descriptor_entry(
+                if (auto retained = retain_source_entry(
                         locked_source->source, locked_source->parent,
                         std::filesystem::path{record.source_raw_path}.filename().native(),
-                        record.expected_source_revision, record, "cross-filesystem source");
-                    !removed) {
-                    return std::unexpected(std::move(removed.error()));
+                        record.expected_source_revision, record);
+                    !retained) {
+                    return std::unexpected(std::move(retained.error()));
                 }
             }
             if (auto verified =
@@ -2842,6 +2872,412 @@ core::Result<std::vector<FilePublicationRecoveryResult>> recover_cross_filesyste
         if (auto marked = reconcile(record, std::move(issue)); !marked) {
             return std::unexpected(std::move(marked.error()));
         }
+    }
+    return results;
+}
+
+namespace {
+
+using BackupState = MetadataOperationBackupState;
+
+[[nodiscard]] core::Result<void> mark_backup(FilePublicationJournal& journal,
+                                             const core::StableId& id, const BackupState from,
+                                             const BackupState to,
+                                             std::optional<core::StableId> undo_id = std::nullopt,
+                                             std::optional<core::Error> failure = std::nullopt) {
+    return journal.transition_backup(id, FilePublicationBackupTransition{
+                                             .expected_state = from,
+                                             .state = to,
+                                             .undo_id = std::move(undo_id),
+                                             .failure = std::move(failure),
+                                         });
+}
+
+// Removes `raw_path` when it is still `expected`.
+[[nodiscard]] core::Result<void> remove_verified(const std::string& raw_path,
+                                                 const core::LocalSourceRevision& expected,
+                                                 const FilePublicationJournalRecord& record,
+                                                 const core::CancellationToken& cancellation,
+                                                 const std::string_view description) {
+    auto locked =
+        open_locked_source(raw_path, expected, cancellation, record.target_raw_path, record.id);
+    if (!locked) {
+        return std::unexpected(std::move(locked.error()));
+    }
+    return remove_descriptor_entry(locked->source, locked->parent,
+                                   std::filesystem::path{raw_path}.filename().native(), expected,
+                                   record, description);
+}
+
+// ADR-0266: where a retained source is kept -- moved where undo copies are,
+// or beside the source it was -- and its identity there.
+[[nodiscard]] std::filesystem::path kept_path_of(const FilePublicationBackupRecord& backup) {
+    return backup.kept_raw_path.empty()
+               ? file_publication_retained_path(backup.publication.source_raw_path,
+                                                backup.publication.id)
+               : std::filesystem::path{backup.kept_raw_path};
+}
+
+[[nodiscard]] core::LocalSourceRevision
+kept_identity_of(const FilePublicationBackupRecord& backup) {
+    return backup.kept_revision.value_or(backup.publication.expected_source_revision);
+}
+
+// Whether two files hold the same bytes: a source put back by copy, found
+// after a crash beside the copy it was made from.
+[[nodiscard]] bool same_bytes(const std::string& first, const std::string& second) {
+    std::ifstream a{first, std::ios::binary};
+    std::ifstream b{second, std::ios::binary};
+    if (!a || !b) {
+        return false;
+    }
+    std::array<char, 1U << 16U> left{};
+    std::array<char, 1U << 16U> right{};
+    while (true) {
+        a.read(left.data(), left.size());
+        b.read(right.data(), right.size());
+        if (a.gcount() != b.gcount() ||
+            !std::equal(left.begin(), left.begin() + a.gcount(), right.begin())) {
+            return false;
+        }
+        if (a.gcount() == 0) {
+            return a.eof() && b.eof();
+        }
+    }
+}
+
+// The undo of a retained publication from wherever it stands: the source
+// back in place, then the target gone, then the state that follows files.
+[[nodiscard]] core::Result<FilePublicationCommitResult>
+finish_publication_undo(const FilePublicationBackupRecord& backup, FilePublicationJournal& journal,
+                        const FilePublicationDependentStateCommitter& dependent_state_committer,
+                        const core::CancellationToken& cancellation) {
+    const auto& record = backup.publication;
+    const auto retained = kept_path_of(backup);
+    const auto kept_identity = kept_identity_of(backup);
+    const auto reconcile = [&](core::Error issue) -> core::Result<FilePublicationCommitResult> {
+        auto marked = mark_backup(journal, record.id, BackupState::undoing,
+                                  BackupState::needs_reconciliation, backup.undo_id, issue);
+        return std::unexpected(marked ? std::move(issue) : std::move(marked.error()));
+    };
+    auto source = observe_direct_revision(record.source_raw_path, record.source_raw_path,
+                                          record.target_raw_path, record.id);
+    auto kept = observe_direct_revision(retained.native(), record.source_raw_path,
+                                        record.target_raw_path, record.id);
+    if (!source || !kept) {
+        return std::unexpected(!source ? std::move(source.error()) : std::move(kept.error()));
+    }
+    // Put back by a copy, where the source is kept on another filesystem:
+    // the kept one stays until the undo is done.
+    bool copied_back = false;
+    if (!*source) {
+        if (!*kept || !core::same_file_after_rename(retained.native(), kept_identity, **kept)) {
+            return reconcile(publication_error(
+                core::ErrorCode::conflict, "The retained source is gone or changed",
+                record.source_raw_path, record.target_raw_path, record.id));
+        }
+        if (cancellation.is_cancellation_requested()) {
+            return std::unexpected(cancelled(record.source_raw_path, record.target_raw_path));
+        }
+        const std::filesystem::path source_path{record.source_raw_path};
+        auto source_parent =
+            walk_directory(source_path.parent_path().native(), false, record.source_raw_path,
+                           record.target_raw_path, record.id);
+        if (!source_parent) {
+            return std::unexpected(std::move(source_parent.error()));
+        }
+        struct stat kept_status{};
+        struct stat parent_status{};
+        if (::stat(retained.c_str(), &kept_status) != 0 ||
+            ::fstat(source_parent->descriptor.get(), &parent_status) != 0) {
+            return std::unexpected(system_error("Observing the retained source failed", errno,
+                                                record.source_raw_path, record.target_raw_path,
+                                                record.id));
+        }
+        std::string from_name = retained.filename().native();
+        std::optional<Descriptor> from_parent;
+        if (kept_status.st_dev == parent_status.st_dev) {
+            auto parent = walk_directory(retained.parent_path().native(), false,
+                                         record.source_raw_path, record.target_raw_path, record.id);
+            if (!parent) {
+                return std::unexpected(std::move(parent.error()));
+            }
+            from_parent.emplace(std::move(parent->descriptor));
+        } else {
+            // ADR-0266: copied beside the source, then renamed into place.
+            from_name = ".trackknife-" + record.id.to_string() + ".restore";
+            const auto staged = (source_path.parent_path() / from_name).native();
+            struct stat existing{};
+            if (::lstat(staged.c_str(), &existing) == 0 && S_ISREG(existing.st_mode)) {
+                static_cast<void>(::unlink(staged.c_str()));
+            }
+            if (auto made = copy_file_verified(retained.native(), staged); !made) {
+                return std::unexpected(std::move(made.error()));
+            }
+            copied_back = true;
+        }
+        const auto& from = from_parent ? *from_parent : source_parent->descriptor;
+        if (auto restored = rename_no_replace(from, from_name, source_parent->descriptor,
+                                              source_path.filename().native(), record);
+            !restored) {
+            if (copied_back) {
+                static_cast<void>(::unlink((source_path.parent_path() / from_name).c_str()));
+            }
+            return std::unexpected(std::move(restored.error()));
+        }
+        if (::fsync(source_parent->descriptor.get()) != 0 ||
+            (from_parent && ::fsync(from_parent->get()) != 0)) {
+            return std::unexpected(system_error("Syncing the restored source failed", errno,
+                                                record.source_raw_path, record.target_raw_path,
+                                                record.id));
+        }
+    } else if (*kept && same_bytes(record.source_raw_path, retained.native())) {
+        // Copied back before a crash; the kept one goes once the undo is done.
+        copied_back = true;
+    } else if (**source != record.expected_source_revision || *kept) {
+        return reconcile(publication_error(
+            core::ErrorCode::conflict, "The source path holds another file than the original",
+            record.source_raw_path, record.target_raw_path, record.id));
+    }
+    // The source is back: the target goes, if it is still what was written.
+    auto target = observe_direct_revision(record.target_raw_path, record.source_raw_path,
+                                          record.target_raw_path, record.id);
+    if (!target) {
+        return std::unexpected(std::move(target.error()));
+    }
+    if (*target) {
+        if (**target != *record.target_revision) {
+            return reconcile(publication_error(
+                core::ErrorCode::conflict, "The published file changed after it was written",
+                record.source_raw_path, record.target_raw_path, record.id));
+        }
+        if (auto removed = remove_verified(record.target_raw_path, *record.target_revision, record,
+                                           cancellation, "published target");
+            !removed) {
+            return std::unexpected(std::move(removed.error()));
+        }
+    }
+    // The directories it made, deepest first, when nothing else is in them.
+    for (auto made = record.planned_missing_directory_raw_paths.rbegin();
+         made != record.planned_missing_directory_raw_paths.rend(); ++made) {
+        static_cast<void>(::rmdir(made->c_str()));
+    }
+    FilePublicationCommitResult result{
+        .journal_id = *backup.undo_id,
+        .content = record.content,
+        .source_raw_path = record.target_raw_path,
+        .target_raw_path = record.source_raw_path,
+        .source_revision = *record.target_revision,
+        .target_revision = record.expected_source_revision,
+        .occurrence_indexes = record.occurrence_indexes,
+        .notes = {},
+    };
+    if (auto dependent = dependent_state_committer(result); !dependent) {
+        // Still undoing: recovery follows the files again.
+        return std::unexpected(std::move(dependent.error()));
+    }
+    if (copied_back) {
+        if (auto removed = remove_verified(retained.native(), kept_identity, record, cancellation,
+                                           "retained source");
+            !removed) {
+            return reconcile(removed.error());
+        }
+    }
+    if (auto undone = mark_backup(journal, record.id, BackupState::undoing, BackupState::undone,
+                                  backup.undo_id);
+        !undone) {
+        return std::unexpected(std::move(undone.error()));
+    }
+    return result;
+}
+
+} // namespace
+
+core::Result<FilePublicationCommitResult>
+undo_retained_publication(const core::StableId& journal_id, FilePublicationJournal& journal,
+                          const FilePublicationDependentStateCommitter& dependent_state_committer,
+                          const core::CancellationToken& cancellation) {
+    if (journal_id.is_nil() || !dependent_state_committer) {
+        return std::unexpected(publication_error(
+            core::ErrorCode::invalid_argument,
+            "Undoing a publication requires an operation and state committer", {}));
+    }
+    auto loaded = journal.load_backup(journal_id);
+    if (!loaded) {
+        return std::unexpected(std::move(loaded.error()));
+    }
+    if (!*loaded) {
+        return std::unexpected(core::Error{
+            .code = core::ErrorCode::not_found,
+            .message = "The publication kept no source to restore",
+            .context = {{"journal_id", journal_id.to_string()}},
+        });
+    }
+    auto backup = std::move(**loaded);
+    const auto& record = backup.publication;
+    if (backup.state != BackupState::retained || record.state != State::complete ||
+        !record.target_revision) {
+        return std::unexpected(publication_error(
+            core::ErrorCode::conflict, "The retained source is not available for undo",
+            record.source_raw_path, record.target_raw_path, record.id));
+    }
+    if (cancellation.is_cancellation_requested()) {
+        return std::unexpected(cancelled(record.source_raw_path, record.target_raw_path));
+    }
+    // All as it was left, or nothing is touched.
+    auto source = observe_direct_revision(record.source_raw_path, record.source_raw_path,
+                                          record.target_raw_path, record.id);
+    auto kept = observe_direct_revision(kept_path_of(backup).native(), record.source_raw_path,
+                                        record.target_raw_path, record.id);
+    auto target = observe_direct_revision(record.target_raw_path, record.source_raw_path,
+                                          record.target_raw_path, record.id);
+    if (!source || !kept || !target) {
+        return std::unexpected(!source ? std::move(source.error())
+                               : !kept ? std::move(kept.error())
+                                       : std::move(target.error()));
+    }
+    if (*source || !*kept ||
+        !core::same_file_after_rename(kept_path_of(backup).native(), kept_identity_of(backup),
+                                      **kept) ||
+        !*target || **target != *record.target_revision) {
+        auto issue = publication_error(
+            core::ErrorCode::conflict,
+            "The files changed after the publication, so it cannot be undone safely",
+            record.source_raw_path, record.target_raw_path, record.id);
+        auto marked = mark_backup(journal, record.id, BackupState::retained,
+                                  BackupState::needs_reconciliation, std::nullopt, issue);
+        return std::unexpected(marked ? std::move(issue) : std::move(marked.error()));
+    }
+    backup.undo_id = core::StableId::random();
+    if (auto begun = mark_backup(journal, record.id, BackupState::retained, BackupState::undoing,
+                                 backup.undo_id);
+        !begun) {
+        return std::unexpected(std::move(begun.error()));
+    }
+    backup.state = BackupState::undoing;
+    return finish_publication_undo(backup, journal, dependent_state_committer, cancellation);
+}
+
+core::Result<FilePublicationCommitResult>
+undo_file_publication(const core::StableId& journal_id, FilePublicationJournal& journal,
+                      const FilePublicationDependentStateCommitter& dependent_state_committer,
+                      const core::CancellationToken& cancellation) {
+    auto loaded = journal.load(journal_id);
+    if (!loaded) {
+        return std::unexpected(std::move(loaded.error()));
+    }
+    if (*loaded && publication_retains_source(**loaded)) {
+        return undo_retained_publication(journal_id, journal, dependent_state_committer,
+                                         cancellation);
+    }
+    return undo_same_filesystem_publication(journal_id, journal, dependent_state_committer,
+                                            cancellation);
+}
+
+core::Result<void> release_publication_backup(const core::StableId& journal_id,
+                                              FilePublicationJournal& journal,
+                                              const core::CancellationToken& cancellation) {
+    auto loaded = journal.load_backup(journal_id);
+    if (!loaded) {
+        return std::unexpected(std::move(loaded.error()));
+    }
+    if (!*loaded || (**loaded).state != BackupState::retained) {
+        return std::unexpected(core::Error{
+            .code = core::ErrorCode::conflict,
+            .message = "The publication has no retained source to release",
+            .context = {{"journal_id", journal_id.to_string()}},
+        });
+    }
+    const auto& record = (**loaded).publication;
+    const auto retained = kept_path_of(**loaded);
+    const auto kept_identity = kept_identity_of(**loaded);
+    auto kept = observe_direct_revision(retained.native(), record.source_raw_path,
+                                        record.target_raw_path, record.id);
+    if (!kept) {
+        return std::unexpected(std::move(kept.error()));
+    }
+    if (*kept && !core::same_file_after_rename(retained.native(), kept_identity, **kept)) {
+        auto issue = publication_error(core::ErrorCode::conflict,
+                                       "The retained source has an unexpected identity",
+                                       record.source_raw_path, record.target_raw_path, record.id);
+        auto marked = mark_backup(journal, record.id, BackupState::retained,
+                                  BackupState::needs_reconciliation, std::nullopt, issue);
+        return std::unexpected(marked ? std::move(issue) : std::move(marked.error()));
+    }
+    if (*kept) {
+        if (auto removed =
+                remove_verified(retained.native(), **kept, record, cancellation, "retained source");
+            !removed) {
+            return std::unexpected(std::move(removed.error()));
+        }
+    }
+    return mark_backup(journal, record.id, BackupState::retained, BackupState::released);
+}
+
+core::Result<std::vector<MetadataBackupMaintenanceResult>> maintain_publication_backups(
+    FilePublicationJournal& journal, const MetadataBackupRetentionPolicy& policy,
+    const std::int64_t now_unix_seconds, const core::CancellationToken& cancellation) {
+    auto backups = journal.load_backups();
+    if (!backups) {
+        return std::unexpected(std::move(backups.error()));
+    }
+    std::vector<MetadataBackupMaintenanceResult> results;
+    std::size_t kept = 0U;
+    std::uint64_t kept_bytes = 0U;
+    // Newest first: kept while within age, count and bytes.
+    for (const auto& backup : *backups) {
+        if (backup.state != BackupState::retained) {
+            continue;
+        }
+        if (cancellation.is_cancellation_requested()) {
+            return std::unexpected(cancelled({}));
+        }
+        const auto bytes = backup.publication.expected_source_revision.size;
+        const auto young =
+            now_unix_seconds - backup.completed_at_unix_seconds <= policy.maximum_age_seconds;
+        if (young && kept < policy.maximum_entries &&
+            kept_bytes + bytes <= policy.maximum_total_bytes) {
+            ++kept;
+            kept_bytes += bytes;
+            results.push_back({.journal_id = backup.publication.id,
+                               .outcome = MetadataBackupMaintenanceOutcome::retained,
+                               .issue = std::nullopt});
+            continue;
+        }
+        auto released = release_publication_backup(backup.publication.id, journal, cancellation);
+        results.push_back({.journal_id = backup.publication.id,
+                           .outcome = released
+                                          ? MetadataBackupMaintenanceOutcome::released
+                                          : MetadataBackupMaintenanceOutcome::needs_reconciliation,
+                           .issue = released ? std::nullopt : std::optional{released.error()}});
+    }
+    return results;
+}
+
+core::Result<std::vector<FilePublicationRecoveryResult>>
+recover_publication_undos(FilePublicationJournal& journal,
+                          const FilePublicationDependentStateCommitter& dependent_state_committer,
+                          const core::CancellationToken& cancellation) {
+    auto backups = journal.load_backups();
+    if (!backups) {
+        return std::unexpected(std::move(backups.error()));
+    }
+    std::vector<FilePublicationRecoveryResult> results;
+    for (const auto& backup : *backups) {
+        if (backup.state != BackupState::undoing || !backup.undo_id ||
+            !backup.publication.target_revision) {
+            continue;
+        }
+        auto finished =
+            finish_publication_undo(backup, journal, dependent_state_committer, cancellation);
+        if (!finished && finished.error().code == core::ErrorCode::cancelled) {
+            return std::unexpected(std::move(finished.error()));
+        }
+        results.push_back({.journal_id = backup.publication.id,
+                           .outcome = finished
+                                          ? FilePublicationRecoveryOutcome::completed
+                                          : FilePublicationRecoveryOutcome::needs_reconciliation,
+                           .issue = finished ? std::nullopt : std::optional{finished.error()}});
     }
     return results;
 }

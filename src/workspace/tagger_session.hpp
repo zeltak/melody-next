@@ -17,6 +17,7 @@
 #include "trackknife/operations/file_publication_apply.hpp"
 #include "trackknife/operations/metadata_apply.hpp"
 #include "trackknife/operations/preparation_plan.hpp"
+#include "trackknife/operations/undo.hpp"
 #include "trackknife/persistence/list_repository.hpp"
 
 #include <QByteArray>
@@ -52,6 +53,8 @@ struct MetadataPropertiesSource {
     metadata::StagedMetadataSource source;
     QString track_label;
     MetadataPropertiesAudioSource audio{};
+    // The length the list knows, for matching to a release (ADR-0261).
+    std::optional<std::int64_t> duration_ms{};
 };
 
 using MetadataPropertiesSourceReader =
@@ -115,6 +118,13 @@ struct TaggerServices {
     MetadataDialogLayoutStore layout_store;
     MusicBrainzLookupService musicbrainz;
     FileWorkTools tools;
+    // The library folders of the engine holding the files, as raw paths.
+    std::function<std::vector<std::string>()> library_roots;
+    // ADR-0263: writes undone by the engine holding the files, newest first
+    // as given. Run on a worker.
+    std::function<core::Result<std::vector<operations::UndoOutcome>>(
+        std::vector<operations::UndoRequest>, const core::CancellationToken&)>
+        undo;
 };
 
 // The tagger's artwork, as the session needs it: its pending covers, whether
@@ -211,6 +221,10 @@ class TaggerSession final : public QObject {
     // What is shown.
     [[nodiscard]] bool ready() const { return grid_model_ != nullptr; }
     [[nodiscard]] QString loadingText() const { return loading_text_; }
+    // Stops reading the selection's tags, before the grid is shown.
+    void stopReading();
+    // Which files could not be read, and why; empty when all were.
+    [[nodiscard]] QString unreadableDetails() const { return unreadable_details_; }
     [[nodiscard]] QString summary() const { return summary_; }
     [[nodiscard]] QString status() const { return status_; }
     [[nodiscard]] bool statusRich() const { return status_rich_; }
@@ -298,11 +312,24 @@ class TaggerSession final : public QObject {
     void setRenameFiles(bool on);
     void setMoveFiles(bool on);
     [[nodiscard]] std::vector<Choice> layouts() const;
+    // Where Move goes: the engine's saved destinations, then the library
+    // folder each file is in, then the folder chosen last (ADR-0262).
     [[nodiscard]] std::vector<Choice> destinations() const;
     [[nodiscard]] int layoutIndex() const;
     [[nodiscard]] int destinationIndex() const;
     void selectLayout(int index);
     void selectDestination(int index);
+    // A folder of the engine's, moved into without being saved.
+    void chooseMoveFolder(std::string raw_path);
+    // Where a folder is chosen from: the engine's lister, or (empty) this
+    // computer's file dialog; and where to start.
+    [[nodiscard]] EngineFolderLister moveFolderLister() const;
+    [[nodiscard]] std::string moveFolderStart() const;
+    // The destination Move goes to; none for the library folder each is in.
+    [[nodiscard]] std::optional<operations::DestinationProfile> moveDestination() const;
+    [[nodiscard]] bool movesIntoLibraryFolders() const {
+        return move_target_ == MoveTarget::library;
+    }
     [[nodiscard]] QString outputProfileStatus() const { return output_profile_status_; }
     [[nodiscard]] QString destinationsOn() const {
         return services_.output_profile_store.destinations_on;
@@ -318,6 +345,18 @@ class TaggerSession final : public QObject {
     void setReplayGainGrouping(int index);
     void setReplayGainExpression(const QString& expression);
     void startReplayGainScan(std::vector<std::size_t> forced_items = {});
+    // ReplayGain as an Apply action: measured first and staged into the
+    // draft, then written with everything else in one write -- tagging and
+    // moving never change the audio. Albums (or, track gain only, tracks)
+    // that have the gain already are left alone when asked.
+    [[nodiscard]] bool replayGainOnApply() const { return replaygain_on_apply_; }
+    [[nodiscard]] bool skipExistingGain() const { return skip_existing_gain_; }
+    void chooseReplayGain(bool on);
+    void chooseSkipExistingGain(bool on);
+    // Of `items`, those to measure: all, or those whose group lacks the gain.
+    [[nodiscard]] std::vector<std::size_t> itemsNeedingGain(std::vector<std::size_t> items) const;
+    // Measured and staged, then gainsMeasured(); false when it cannot start.
+    bool measureBeforeWrite(std::vector<std::size_t> items);
     void exportReplayGainResults(const QString& path);
     [[nodiscard]] Provenance loudnessProvenance() const;
     [[nodiscard]] bool hasReplayGainExport() const { return !replaygain_export_rows_.isEmpty(); }
@@ -334,6 +373,35 @@ class TaggerSession final : public QObject {
     // What the Identify window starts from; none when it cannot open.
     [[nodiscard]] std::optional<Identify> identifyRequest() const;
     void applyMusicBrainzProposals(metadata::MetadataProposalSet proposals);
+
+    // ADR-0261: what Identify albums… asks of the files open here.
+    [[nodiscard]] std::size_t itemCount() const;
+    // An item's file as it was read (or, until read, cached).
+    [[nodiscard]] const metadata::StagedMetadataSource* itemSource(std::size_t item) const;
+    // Its length: as the list knew it, else as probed here.
+    [[nodiscard]] std::optional<std::int64_t> durationOf(std::size_t item) const;
+    // Whether a proposal set can be staged now: the files are read and
+    // nothing else is being staged. proposalsSettled says when one was.
+    [[nodiscard]] bool canStageProposals() const;
+
+    // ADR-0261: Identify albums… writes some of the files itself. While it
+    // does, nothing here is edited or applied; then the files it wrote are
+    // read again -- at their new paths, when moved -- and the draft of the
+    // rest kept, the files' own drafts having been written.
+    struct Rewritten {
+        std::size_t item{0U};
+        std::string raw_path;
+    };
+    [[nodiscard]] bool canWriteElsewhere() const;
+    [[nodiscard]] bool writingElsewhere() const { return writing_elsewhere_; }
+    // What such a write starts from.
+    [[nodiscard]] std::shared_ptr<const metadata::StagedMetadataSelection> sharedSelection() const;
+    [[nodiscard]] const metadata::StagedMetadataPatchSet* draft() const;
+    [[nodiscard]] std::optional<operations::OutputLayoutProfile> layoutProfile(int index) const;
+    bool beginWriteElsewhere();
+    // `stale`: files found changed since they were read, read again too,
+    // their drafts kept, so the next write can take them.
+    void finishWriteElsewhere(std::vector<Rewritten> written, std::vector<std::size_t> stale = {});
 
     // Apply.
     void startWritePlan();
@@ -384,9 +452,24 @@ class TaggerSession final : public QObject {
     void openDestinationsRequested();
     // Worth a line in the main window's status bar once the editor closes.
     void statusMessage(const QString& message);
+    // ADR-0261: a proposal set has been staged -- or not, saying why in the
+    // status.
+    void proposalsSettled(bool staged);
+    // A write made elsewhere is over, and the files it wrote read again.
+    void writtenElsewhere();
+    // measureBeforeWrite() is over: the gains are in the draft (or there
+    // was nothing to measure), or not, saying why in the status.
+    void gainsMeasured(bool ok);
 
   private:
     using SelectionResult = core::Result<metadata::StagedMetadataSelection>;
+    // Where the worker reading a selection's tags says how far it has got,
+    // and which files it could not read.
+    struct Reading {
+        std::atomic<std::size_t> read{0};
+        std::atomic<std::size_t> total{0};
+        std::vector<std::pair<std::string, core::Error>> unreadable;
+    };
     using WritePlanResult = core::Result<operations::PreparationPlan>;
     struct AutomaticChainPlan {
         metadata::MetadataTransformationChain chain;
@@ -404,6 +487,14 @@ class TaggerSession final : public QObject {
     void persistFieldLayouts();
     void captureSources();
     void startSelection();
+    // ADR-0257: the cached tags, shown while the files are read.
+    void showProvisional(metadata::StagedMetadataSelection selection);
+    // The selection's counts, for the summary line.
+    void describeSelection(const metadata::StagedMetadataSelection& selection);
+    // Every row chosen, as when the grid first opens.
+    void selectAllRows();
+    // Which files could not be read, said in the status line.
+    void reportUnreadable();
     void finishSelection();
     void buildGrid(metadata::StagedMetadataSelection selection);
     void updateSelectionProjection();
@@ -424,6 +515,7 @@ class TaggerSession final : public QObject {
     [[nodiscard]] std::optional<AutomaticChainPlan> combinedAutomaticChain();
     [[nodiscard]] QString replayGainStatusLinks() const;
     void finishReplayGainScan();
+    [[nodiscard]] std::optional<loudness::LoudnessGrouping> replayGainGroupingChoice() const;
     void finishWritePlan();
     void startApply(std::shared_ptr<const operations::PreparationPlan> plan);
     void startMetadataApply(std::shared_ptr<const operations::PreparationPlan> plan);
@@ -465,6 +557,8 @@ class TaggerSession final : public QObject {
     std::vector<metadata::StagedMetadataSource> sources_;
     std::shared_ptr<std::vector<MetadataPropertiesAudioSource>> audio_sources_{
         std::make_shared<std::vector<MetadataPropertiesAudioSource>>()};
+    // Each source's length as its list knew it, by item.
+    std::vector<std::optional<std::int64_t>> durations_;
     std::vector<std::string> preferred_fields_;
     std::vector<std::string> recent_field_names_;
     std::vector<FieldLayout> field_layouts_;
@@ -535,6 +629,27 @@ class TaggerSession final : public QObject {
     std::shared_ptr<std::atomic_size_t> replaygain_completed_;
     std::size_t replaygain_total_{0U};
     QTimer replaygain_progress_timer_;
+    std::shared_ptr<Reading> reading_;
+    // ADR-0257: the grid shows cached tags while the files are read; scripts,
+    // suggestions and Save wait for the files' own.
+    bool provisional_{false};
+    bool writing_elsewhere_{false};
+    // Proposals waiting for the automatic scripts to finish staging, and
+    // the set being staged, previewed again when the draft moved under it.
+    std::optional<metadata::MetadataProposalSet> waiting_proposals_;
+    std::optional<metadata::MetadataProposalSet> staging_proposals_;
+    int proposal_attempts_{0};
+    bool replaygain_on_apply_{false};
+    bool skip_existing_gain_{true};
+    // A scan for a write is under way; Apply waits for it; it has been made.
+    bool measuring_for_write_{false};
+    bool apply_after_gains_{false};
+    bool gains_measured_{false};
+    // Read again after a write elsewhere: their drafts were written.
+    std::vector<std::size_t> rewritten_items_;
+    // The files that could not be read, one a line, for a tooltip.
+    QString unreadable_details_;
+    QTimer reading_progress_timer_;
     int draft_count_{0};
     bool can_undo_{false};
     bool can_redo_{false};
@@ -544,6 +659,9 @@ class TaggerSession final : public QObject {
     bool output_profiles_loading_{false};
     std::optional<core::StableId> editing_output_layout_id_;
     std::optional<core::StableId> editing_destination_id_;
+    enum class MoveTarget : std::uint8_t { saved, library, folder };
+    MoveTarget move_target_{MoveTarget::saved};
+    std::optional<std::string> move_folder_;
     bool write_plan_running_{false};
     bool apply_running_{false};
     bool applying_file_paths_{false};

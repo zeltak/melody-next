@@ -26,6 +26,7 @@ const std::vector<EncoderPreset>& builtin_encoder_presets() {
             .bit_rate = std::nullopt,
             .vbr_quality = std::nullopt,
             .sample_format_hint = "s16",
+            .carries_artwork = false,
         },
         {
             .id = "flac",

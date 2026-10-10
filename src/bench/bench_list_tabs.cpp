@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "bench/bench_main_window.hpp"
-#include "workspace/open_list_session.hpp"
-#include "workspace/sources.hpp"
 #include "bench/local_library_panel.hpp"
 #include "bench/local_list_edit_bar.hpp"
 #include "bench/playback_tab_widget.hpp"
@@ -12,6 +10,8 @@
 #include "bench/track_list_find_bar.hpp"
 #include "uicommon/debug_log.hpp"
 #include "uicommon/local_files_mime_data.hpp"
+#include "workspace/open_list_session.hpp"
+#include "workspace/sources.hpp"
 
 #include "bench/bench_main_window_helpers.hpp"
 #include "bench/dynamic_playlist_dialog.hpp"
@@ -140,7 +140,6 @@ void BenchMainWindow::scheduleWorkspaceRestore() {
     close();
 }
 
-
 int BenchMainWindow::engineRank(const QWidget* view) const {
     const auto engine = engineOfView(view);
     for (std::size_t index = 0; index < engines_.size(); ++index) {
@@ -201,7 +200,8 @@ void BenchMainWindow::showOpenListDialog() {
         if (item == nullptr || item->parent() == nullptr) {
             return;
         }
-        session->open(tree->indexOfTopLevelItem(item->parent()), item->parent()->indexOfChild(item));
+        session->open(tree->indexOfTopLevelItem(item->parent()),
+                      item->parent()->indexOfChild(item));
     };
     connect(buttons, &QDialogButtonBox::accepted, dialog, open);
     connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
@@ -292,6 +292,9 @@ void BenchMainWindow::listAdded(ListTab& added, const bool select) {
     markViewEngine(view, EngineKey::of(document));
     view->setEmptyMessage(emptyListTitle(EngineKey::of(document)),
                           emptyListHint(EngineKey::of(document)));
+    if (!added.notice.isEmpty()) {
+        view->setEmptyMessage(added.notice, {});
+    }
     view->setProperty("bench-document-id", id);
     view->setModel(model);
     connect(
@@ -717,6 +720,19 @@ void BenchMainWindow::quitAndStopEngine() {
     QCoreApplication::quit();
 }
 
+void BenchMainWindow::refreshEmptyMessage(ListTab& tab) {
+    auto* view = dynamic_cast<ui::QueueTableView*>(tab.view);
+    if (view == nullptr) {
+        return;
+    }
+    if (!tab.notice.isEmpty()) {
+        view->setEmptyMessage(tab.notice, {});
+    } else {
+        view->setEmptyMessage(emptyListTitle(EngineKey::of(tab.document)),
+                              emptyListHint(EngineKey::of(tab.document)));
+    }
+}
+
 void BenchMainWindow::refreshTabChrome(ListTab& tab) {
     const auto index = tabs_->indexOf(tab.view);
     if (index < 0) {
@@ -728,8 +744,8 @@ void BenchMainWindow::refreshTabChrome(ListTab& tab) {
     tabs_->tabBar()->setTabTextColor(index, QColor{});
     tabs_->tabBar()->setTabData(index, chrome.playing);
     tabs_->setTabText(index, chrome.text);
-    tabs_->setTabIcon(index, chrome.remote ? QIcon::fromTheme(QStringLiteral("network-server"))
-                                           : QIcon{});
+    tabs_->setTabIcon(index,
+                      chrome.remote ? QIcon::fromTheme(QStringLiteral("network-server")) : QIcon{});
     tabs_->setTabToolTip(index, chrome.tooltip);
     tab.view->setAccessibleName(chrome.accessible_name);
     if (auto* close = tabs_->tabBar()->tabButton(index, QTabBar::RightSide)) {
@@ -949,7 +965,12 @@ void BenchMainWindow::fillContinueMenu() {
         continue_menu_->addSeparator();
     }
     bool listed = !current;
-    for (const auto& choice : choices) {
+    for (std::size_t index = 0U; index < choices.size(); ++index) {
+        const auto& choice = choices[index];
+        // The rules that ship, then those saved here.
+        if (index > 0U && choices[index - 1U].shipped && !choice.shipped) {
+            continue_menu_->addSeparator();
+        }
         auto* action = continue_menu_->addAction(
             choice.name.isEmpty() ? tr("Unnamed dynamic playlist") : choice.name);
         action->setObjectName(QStringLiteral("continue-rule-") + choice.rule_id);
@@ -969,7 +990,8 @@ void BenchMainWindow::fillContinueMenu() {
         group->addAction(other);
     }
     if (choices.empty()) {
-        auto* none = continue_menu_->addAction(tr("No rule-based dynamic playlists yet"));
+        auto* none = continue_menu_->addAction(
+            tr("Save a library rule in File → Dynamic playlists to continue a list with it"));
         none->setEnabled(false);
     }
 }
@@ -1013,6 +1035,7 @@ void BenchMainWindow::showTrackContextMenu(QTableView* view, const QPoint& posit
     track_context_menu_->addSeparator();
     auto* tools = track_context_menu_->addMenu(tr("Tools"));
     tools->addAction(properties_action_);
+    tools->addAction(identify_albums_action_);
     tools->addAction(replaygain_action_);
     tools->addAction(convert_action_);
 
@@ -1119,6 +1142,10 @@ void BenchMainWindow::showTrackContextMenu(QTableView* view, const QPoint& posit
 // rules on ratings look again.
 void BenchMainWindow::engineRatingsChanged(const EngineKey& engine,
                                            const QHash<QString, unsigned>& ratings) {
+    // What plays, rated here or anywhere else.
+    if (engine == header_rating_engine_ && ratings.contains(header_rating_hash_)) {
+        now_playing_rating_->setRating(ratings.value(header_rating_hash_));
+    }
     if (auto* dialog = findChild<DynamicPlaylistDialog*>(); dialog && dialog->engine() == engine) {
         if (auto* results = qobject_cast<LocalListModel*>(dialog->view()->model())) {
             results->applyRatings(ratings);
@@ -1126,7 +1153,6 @@ void BenchMainWindow::engineRatingsChanged(const EngineKey& engine,
         dialog->libraryChanged();
     }
 }
-
 
 void BenchMainWindow::addLocalRateMenus(QTableView* view, ListTab* source_tab) {
     if (source_tab)
@@ -1197,14 +1223,22 @@ void BenchMainWindow::addLocalRateMenus(QMenu* menu, QTableView* view) {
         target_menu->addAction(stars);
         return stars;
     };
+    // One rating, one mark: the values exclude each other, as a radio
+    // group -- none marked when the selection's ratings differ.
+    auto* rate_group = new QActionGroup(rate_menu);
+    rate_group->setExclusionPolicy(QActionGroup::ExclusionPolicy::ExclusiveOptional);
+    auto* album_rate_group = new QActionGroup(album_rate_menu);
+    album_rate_group->setExclusionPolicy(QActionGroup::ExclusionPolicy::ExclusiveOptional);
     for (unsigned rating = 0U; rating <= 10U; rating += 2U) {
         auto* rate = make_rating_action(rate_menu, rating);
+        rate_group->addAction(rate);
         rate->setObjectName(QStringLiteral("action-local-rate-%1").arg(rating));
         rate->setChecked(ratings_match && common_rating == rating);
         connect(rate, &QAction::triggered, this, [this, engine, track_hashes, rating] {
             workspace_.rate(engine, track_hashes, false, rating);
         });
         auto* album_rate = make_rating_action(album_rate_menu, rating);
+        album_rate_group->addAction(album_rate);
         album_rate->setObjectName(QStringLiteral("action-local-album-rate-%1").arg(rating));
         album_rate->setChecked(album_ratings_match && common_album_rating == rating);
         connect(album_rate, &QAction::triggered, this, [this, engine, album_hashes, rating] {

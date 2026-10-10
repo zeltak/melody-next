@@ -2,6 +2,35 @@
 
 find_package(Threads REQUIRED)
 
+# Asked of the Qt at hand, not guessed from its version: whether QTRY_ keeps
+# its types under the project's warnings. Where it does not, the tests are
+# built without the conversion warning (qtry_narrowing.hpp).
+if(TARGET Qt6::Test)
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_LIBRARIES Qt6::Test)
+    set(CMAKE_REQUIRED_FLAGS "-Wconversion -Werror")
+    check_cxx_source_compiles(
+        [=[
+#include <QtTest>
+// As in a test: QTRY_ returns from a void function when it fails.
+void tried() {
+    QTRY_VERIFY(true);
+    QTRY_COMPARE(1, 1);
+}
+int main() {
+    tried();
+    return 0;
+}
+]=]
+        TRACKKNIFE_QTRY_KEEPS_ITS_TYPES
+    )
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(NOT TRACKKNIFE_QTRY_KEEPS_ITS_TYPES)
+        add_compile_options(-include "${CMAKE_CURRENT_SOURCE_DIR}/qtry_narrowing.hpp")
+    endif()
+endif()
+
 add_executable(trackknife_core_tests core_primitives_test.cpp)
 target_link_libraries(
     trackknife_core_tests
@@ -29,6 +58,15 @@ add_test(
     NAME metadata-artwork
     COMMAND trackknife_metadata_artwork_tests "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/audio"
 )
+
+add_executable(trackknife_websocket_tests websocket_test.cpp)
+target_link_libraries(
+    trackknife_websocket_tests
+    PRIVATE Trackknife::Engine Trackknife::Protocol trackknife_project_options
+            trackknife_project_warnings
+)
+add_test(NAME websocket COMMAND trackknife_websocket_tests)
+set_tests_properties(websocket PROPERTIES TIMEOUT 30)
 
 add_executable(trackknife_media_streams_tests media_streams_test.cpp)
 target_link_libraries(
@@ -212,6 +250,27 @@ target_link_libraries(
 )
 add_test(NAME list-repository COMMAND trackknife_list_repository_tests)
 
+add_executable(trackknife_list_edits_tests list_edits_test.cpp)
+target_link_libraries(
+    trackknife_list_edits_tests
+    PRIVATE Trackknife::Persistence trackknife_project_options trackknife_project_warnings
+)
+add_test(NAME list-edits COMMAND trackknife_list_edits_tests)
+
+add_executable(trackknife_dynamic_selection_tests dynamic_selection_test.cpp)
+target_link_libraries(
+    trackknife_dynamic_selection_tests
+    PRIVATE Trackknife::Engine trackknife_project_options trackknife_project_warnings
+)
+add_test(NAME dynamic-selection COMMAND trackknife_dynamic_selection_tests)
+
+add_executable(trackknife_protocol_version_tests protocol_version_test.cpp)
+target_link_libraries(
+    trackknife_protocol_version_tests
+    PRIVATE Trackknife::Protocol trackknife_project_options trackknife_project_warnings
+)
+add_test(NAME protocol-version COMMAND trackknife_protocol_version_tests)
+
 add_executable(trackknife_musicbrainz_cache_tests musicbrainz_cache_test.cpp)
 target_link_libraries(
     trackknife_musicbrainz_cache_tests
@@ -299,6 +358,17 @@ target_link_libraries(
 add_test(
     NAME formats-probe
     COMMAND trackknife_formats_probe_tests "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/audio"
+)
+
+# A file renamed over while it is decoded is decoded on from the next sample.
+add_executable(trackknife_decoder_replaced_file_tests decoder_replaced_file_test.cpp)
+target_link_libraries(
+    trackknife_decoder_replaced_file_tests
+    PRIVATE Trackknife::Formats trackknife_project_options trackknife_project_warnings
+)
+add_test(
+    NAME decoder-replaced-file
+    COMMAND trackknife_decoder_replaced_file_tests
 )
 
 add_executable(trackknife_cue_sheet_tests cue_sheet_test.cpp)
@@ -401,6 +471,19 @@ add_test(
 )
 set_tests_properties(output-agent PROPERTIES TIMEOUT 90)
 
+# ADR-0274: a speaker that drops plays on, and is taken as it is on return.
+add_executable(trackknife_speaker_plays_through_tests speaker_plays_through_test.cpp)
+target_link_libraries(
+    trackknife_speaker_plays_through_tests
+    PRIVATE Trackknife::Engine Trackknife::Protocol Trackknife::Core Threads::Threads
+            trackknife_project_options trackknife_project_warnings
+)
+add_test(
+    NAME speaker-plays-through
+    COMMAND trackknife_speaker_plays_through_tests
+)
+set_tests_properties(speaker-plays-through PROPERTIES TIMEOUT 60)
+
 # ADR-0239: the original nearby, Opus from afar.
 add_executable(trackknife_stream_route_tests stream_route_test.cpp)
 target_link_libraries(
@@ -451,6 +534,15 @@ add_test(
             "$<TARGET_FILE:trackknife_engine_daemon>" "$<TARGET_FILE:melody_cli>"
 )
 set_tests_properties(melody-cli PROPERTIES TIMEOUT 90)
+
+# melody-musiclist, the album page, against a real engine through melody-cli.
+add_test(
+    NAME melody-musiclist
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/musiclist_test.sh"
+            "$<TARGET_FILE:trackknife_engine_daemon>" "$<TARGET_FILE:melody_cli>"
+            "${PROJECT_SOURCE_DIR}/scripts/melody-musiclist"
+)
+set_tests_properties(melody-musiclist PROPERTIES TIMEOUT 60)
 
 # ADR-0232: melody-watch, its parts and against a real engine.
 if(TARGET melody_watch)
@@ -666,6 +758,14 @@ if(TRACKKNIFE_BUILD_UI)
     )
     add_test(NAME panel-layout COMMAND trackknife_panel_layout_tests)
 
+    qt_add_executable(trackknife_album_lookup_queue_tests album_lookup_queue_test.cpp)
+    target_link_libraries(
+        trackknife_album_lookup_queue_tests
+        PRIVATE Trackknife::Workspace Qt6::Test trackknife_project_options
+                trackknife_project_warnings
+    )
+    add_test(NAME album-lookup-queue COMMAND trackknife_album_lookup_queue_tests)
+
     qt_add_executable(trackknife_language_reference_tests language_reference_test.cpp)
     target_link_libraries(
         trackknife_language_reference_tests
@@ -691,6 +791,14 @@ if(TRACKKNIFE_BUILD_UI)
     )
     add_test(NAME queue-table-view COMMAND trackknife_queue_table_view_tests)
     set_tests_properties(queue-table-view PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    qt_add_executable(trackknife_rating_stars_tests rating_stars_test.cpp)
+    target_link_libraries(
+        trackknife_rating_stars_tests
+        PRIVATE Trackknife::UiCommon Qt6::Test trackknife_project_options trackknife_project_warnings
+    )
+    add_test(NAME rating-stars COMMAND trackknife_rating_stars_tests)
+    set_tests_properties(rating-stars PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     qt_add_executable(trackknife_local_artwork_tests local_artwork_test.cpp)
     target_link_libraries(
@@ -811,7 +919,11 @@ if(TRACKKNIFE_BUILD_UI)
     target_link_libraries(trackknife_track_list_find_tests PRIVATE Trackknife::BenchUi Qt6::Test
         trackknife_project_options trackknife_project_warnings)
     add_test(NAME track-list-find COMMAND trackknife_track_list_find_tests)
-    set_tests_properties(m3u8 local-list-edit track-list-find PROPERTIES TIMEOUT 30 ENVIRONMENT
+    qt_add_executable(trackknife_single_instance_tests single_instance_test.cpp)
+    target_link_libraries(trackknife_single_instance_tests PRIVATE Trackknife::BenchUi Qt6::Test
+        Qt6::Concurrent trackknife_project_options trackknife_project_warnings)
+    add_test(NAME single-instance COMMAND trackknife_single_instance_tests)
+    set_tests_properties(m3u8 local-list-edit track-list-find single-instance PROPERTIES TIMEOUT 30 ENVIRONMENT
         "QT_QPA_PLATFORM=offscreen;LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan.supp")
     set_tests_properties(
         bench-main-window
@@ -882,3 +994,22 @@ if(TRACKKNIFE_ENABLE_UPNP)
     target_link_libraries(trackknife_upnp_tests PRIVATE Trackknife::Output trackknife_project_warnings)
     add_test(NAME upnp COMMAND trackknife_upnp_tests)
 endif()
+
+# Every test runs with a runtime directory of its own, not the user's: the
+# engines tests start leave their socket locks there, one per state
+# directory, and a test must not find -- or be found by -- the engine the
+# user is running. Owner-only, as a runtime directory has to be.
+set(trackknife_test_runtime "${CMAKE_BINARY_DIR}/test-runtime")
+file(MAKE_DIRECTORY "${trackknife_test_runtime}")
+file(CHMOD "${trackknife_test_runtime}" DIRECTORY_PERMISSIONS OWNER_READ OWNER_WRITE
+     OWNER_EXECUTE)
+set(trackknife_test_environment "XDG_RUNTIME_DIR=set:${trackknife_test_runtime}")
+# Audio is still the machine's: PipeWire is found where it was.
+if(DEFINED ENV{PIPEWIRE_RUNTIME_DIR})
+    list(APPEND trackknife_test_environment "PIPEWIRE_RUNTIME_DIR=set:$ENV{PIPEWIRE_RUNTIME_DIR}")
+elseif(DEFINED ENV{XDG_RUNTIME_DIR})
+    list(APPEND trackknife_test_environment "PIPEWIRE_RUNTIME_DIR=set:$ENV{XDG_RUNTIME_DIR}")
+endif()
+get_property(trackknife_tests DIRECTORY PROPERTY TESTS)
+set_tests_properties(${trackknife_tests} PROPERTIES ENVIRONMENT_MODIFICATION
+                     "${trackknife_test_environment}")

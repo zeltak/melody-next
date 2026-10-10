@@ -11,8 +11,10 @@
 #include "trackknife/metadata/local_reader.hpp"
 #include "trackknife/operations/artwork_apply.hpp"
 #include "trackknife/operations/metadata_commit.hpp"
+#include "trackknife/operations/undo_copies.hpp"
 #include "trackknife/persistence/file_publication_journal.hpp"
 #include "trackknife/persistence/operation_journal.hpp"
+#include "trackknife/protocol/message.hpp"
 
 #include <fcntl.h>
 #include <openssl/evp.h>
@@ -20,10 +22,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <ctime>
+#include <fstream>
+#include <iostream>
 
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace trackknife::engine {
@@ -94,7 +100,8 @@ published_document(const operations::FilePublicationCommitResult& result) {
 } // namespace
 
 FileWorkRecovery recover_file_work(const std::filesystem::path& database, LocalCatalogue& catalogue,
-                                   const MoveFollower& follow) {
+                                   const MoveFollower& follow,
+                                   const operations::MetadataBackupRetentionPolicy& retention) {
     FileWorkRecovery recovery;
     const auto remember = [&recovery](core::Error error) {
         if (!recovery.error) {
@@ -120,12 +127,11 @@ FileWorkRecovery recover_file_work(const std::filesystem::path& database, LocalC
                 ++recovery.recovered;
             }
         }
-        // No undo is offered, so a finished write keeps no backup (as in
-        // Trackknife, whose policy this is).
-        constexpr operations::MetadataBackupRetentionPolicy release_all{
-            .maximum_age_seconds = 0, .maximum_entries = 0U, .maximum_total_bytes = 0U};
+        // A finished write keeps the file it replaced, for undo (ADR-0263),
+        // within the retention policy: the newest first, by age, count and
+        // size.
         if (auto maintained = operations::maintain_metadata_backups(
-                journal, release_all, static_cast<std::int64_t>(std::time(nullptr)));
+                journal, retention, static_cast<std::int64_t>(std::time(nullptr)));
             !maintained) {
             remember(std::move(maintained.error()));
         }
@@ -160,11 +166,276 @@ FileWorkRecovery recover_file_work(const std::filesystem::path& database, LocalC
         };
     count(operations::recover_same_filesystem_publications(file_journal, moved));
     count(operations::recover_cross_filesystem_publications(file_journal, moved));
+    // ADR-0263: an undo a crash interrupted is finished; the sources
+    // publications kept, retained as metadata backups are.
+    count(operations::recover_publication_undos(file_journal, moved));
+    if (auto maintained = operations::maintain_publication_backups(
+            file_journal, retention, static_cast<std::int64_t>(std::time(nullptr)));
+        !maintained) {
+        remember(std::move(maintained.error()));
+    }
+    // ADR-0266: every undo copy where the engine keeps them -- those kept
+    // beside files before, and any a crash left half moved.
+    if (auto metadata_journal = persistence::SqliteMetadataOperationJournal::open(database);
+        metadata_journal) {
+        if (auto kept = operations::keep_undo_copies_in_place(*metadata_journal, file_journal);
+            !kept) {
+            remember(std::move(kept.error()));
+        }
+    }
     return recovery;
+}
+
+namespace {
+
+constexpr std::string_view retention_key = "backups.retention";
+constexpr std::string_view location_key = "backups.location";
+
+// The place a document names, checked: {place, folder?}.
+[[nodiscard]] core::Result<Json> location_of(const Json& document) {
+    const auto place = document.value("place", std::string{"engine"});
+    if (place == "engine" || place == "beside") {
+        return Json{{"place", place}};
+    }
+    if (place != "folder") {
+        return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                           .message = "place is engine, folder or beside",
+                                           .context = {{.key = "param", .value = "place"}}});
+    }
+    const auto folder = document.find("folder");
+    auto raw = folder != document.end() && folder->is_string()
+                   ? protocol::decode_raw_path(folder->get<std::string>())
+                   : core::Result<std::string>{std::unexpected(core::Error{
+                         .code = core::ErrorCode::invalid_argument, .message = {}, .context = {}})};
+    if (!raw || !std::filesystem::path{*raw}.is_absolute()) {
+        return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                           .message = "a folder is an absolute path",
+                                           .context = {{.key = "param", .value = "folder"}}});
+    }
+    return Json{{"place", "folder"}, {"folder", protocol::encode_raw_path(*raw)}};
+}
+
+[[nodiscard]] Json stored_location(const Workspace& workspace) {
+    auto stored = workspace.load_engine_state(location_key);
+    if (stored && *stored) {
+        auto document = Json::parse(**stored, nullptr, false);
+        if (!document.is_discarded() && document.is_object()) {
+            if (auto checked = location_of(document)) {
+                return *checked;
+            }
+        }
+    }
+    return Json{{"place", "engine"}};
+}
+
+[[nodiscard]] std::filesystem::path folder_of(const Json& location,
+                                              const std::filesystem::path& database) {
+    const auto place = location.value("place", std::string{"engine"});
+    if (place == "beside") {
+        return {};
+    }
+    if (place == "folder") {
+        if (auto raw = protocol::decode_raw_path(location.value("folder", std::string{}))) {
+            return std::filesystem::path{*raw};
+        }
+    }
+    return database.parent_path() / "undo";
+}
+
+// Every undo copy the journals know moved where they are kept now.
+[[nodiscard]] core::Result<std::size_t>
+relocate_undo_copies(const std::filesystem::path& database) {
+    auto metadata_journal = persistence::SqliteMetadataOperationJournal::open(database);
+    if (!metadata_journal) {
+        return std::unexpected(std::move(metadata_journal.error()));
+    }
+    auto file_journal = persistence::SqliteFilePublicationJournal::open(database);
+    if (!file_journal) {
+        return std::unexpected(std::move(file_journal.error()));
+    }
+    return operations::keep_undo_copies_in_place(*metadata_journal, *file_journal);
+}
+constexpr std::int64_t seconds_a_day = 24 * 60 * 60;
+constexpr std::uint64_t bytes_a_gigabyte = 1024ULL * 1024ULL * 1024ULL;
+
+[[nodiscard]] Json retention_document(const operations::MetadataBackupRetentionPolicy& policy) {
+    return Json{{"max_age_days", policy.maximum_age_seconds / seconds_a_day},
+                {"max_writes", policy.maximum_entries},
+                {"max_gigabytes", policy.maximum_total_bytes / bytes_a_gigabyte}};
+}
+
+// The limits a document names over `base`; an out-of-range one refused.
+[[nodiscard]] core::Result<operations::MetadataBackupRetentionPolicy>
+retention_of(const Json& document, operations::MetadataBackupRetentionPolicy base) {
+    const auto limit =
+        [&document](const char* name,
+                    const std::int64_t most) -> core::Result<std::optional<std::int64_t>> {
+        const auto found = document.find(name);
+        if (found == document.end()) {
+            return std::optional<std::int64_t>{};
+        }
+        if (!found->is_number_integer() || found->get<std::int64_t>() < 0 ||
+            found->get<std::int64_t>() > most) {
+            return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                               .message = std::string{name} +
+                                                          " is a whole number from 0 to " +
+                                                          std::to_string(most),
+                                               .context = {{.key = "param", .value = name}}});
+        }
+        return std::optional{found->get<std::int64_t>()};
+    };
+    auto days = limit("max_age_days", 3'650);
+    auto writes = limit("max_writes", 100'000);
+    auto gigabytes = limit("max_gigabytes", 100'000);
+    for (auto* checked : {&days, &writes, &gigabytes}) {
+        if (!*checked) {
+            return std::unexpected(checked->error());
+        }
+    }
+    if (days->has_value()) {
+        base.maximum_age_seconds = **days * seconds_a_day;
+    }
+    if (writes->has_value()) {
+        base.maximum_entries = static_cast<std::size_t>(**writes);
+    }
+    if (gigabytes->has_value()) {
+        base.maximum_total_bytes = static_cast<std::uint64_t>(**gigabytes) * bytes_a_gigabyte;
+    }
+    return base;
+}
+
+// Both kinds of backup brought within the policy, now.
+[[nodiscard]] core::Result<void>
+apply_retention(const std::filesystem::path& database,
+                const operations::MetadataBackupRetentionPolicy& policy) {
+    const auto now = static_cast<std::int64_t>(std::time(nullptr));
+    auto metadata_journal = persistence::SqliteMetadataOperationJournal::open(database);
+    if (!metadata_journal) {
+        return std::unexpected(std::move(metadata_journal.error()));
+    }
+    if (auto kept = operations::maintain_metadata_backups(*metadata_journal, policy, now); !kept) {
+        return std::unexpected(std::move(kept.error()));
+    }
+    auto file_journal = persistence::SqliteFilePublicationJournal::open(database);
+    if (!file_journal) {
+        return std::unexpected(std::move(file_journal.error()));
+    }
+    if (auto kept = operations::maintain_publication_backups(*file_journal, policy, now); !kept) {
+        return std::unexpected(std::move(kept.error()));
+    }
+    return {};
+}
+
+} // namespace
+
+operations::MetadataBackupRetentionPolicy backup_retention(const Workspace& workspace) {
+    const operations::MetadataBackupRetentionPolicy defaults{};
+    auto stored = workspace.load_engine_state(retention_key);
+    if (!stored || !*stored) {
+        return defaults;
+    }
+    auto document = Json::parse(**stored, nullptr, false);
+    if (document.is_discarded() || !document.is_object()) {
+        return defaults;
+    }
+    auto policy = retention_of(document, defaults);
+    return policy ? *policy : defaults;
+}
+
+std::filesystem::path undo_copy_folder(const Workspace& workspace,
+                                       const std::filesystem::path& database) {
+    return folder_of(stored_location(workspace), database);
+}
+
+void register_backup_methods(protocol::Dispatcher& dispatcher, std::filesystem::path database,
+                             Workspace& workspace) {
+    const auto described = [database](Json location) {
+        location["kept_in"] = protocol::encode_raw_path(folder_of(location, database).native());
+        return location;
+    };
+    dispatcher.on("backups.location", [&workspace, described](const Json&) -> core::Result<Json> {
+        return described(stored_location(workspace));
+    });
+    dispatcher.on(
+        "backups.set_location",
+        [&workspace, database, described](const Json& params) -> core::Result<Json> {
+            auto location = location_of(params);
+            if (!location) {
+                return std::unexpected(std::move(location.error()));
+            }
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+            if (auto saved = workspace.save_engine_state(location_key, location->dump(), now_ms);
+                !saved) {
+                return std::unexpected(std::move(saved.error()));
+            }
+            operations::set_undo_copy_folder(folder_of(*location, database));
+            // Moved at once: what the person chose holds for the copies there are.
+            if (auto moved = relocate_undo_copies(database); !moved) {
+                std::cerr << "melodyd: undo copies not all moved: " << moved.error().message
+                          << "\n";
+            }
+            return described(*location);
+        });
+    dispatcher.on("backups.retention", [&workspace](const Json&) -> core::Result<Json> {
+        return retention_document(backup_retention(workspace));
+    });
+    dispatcher.on(
+        "backups.set_retention", [&workspace, database](const Json& params) -> core::Result<Json> {
+            auto policy = retention_of(params, backup_retention(workspace));
+            if (!policy) {
+                return std::unexpected(std::move(policy.error()));
+            }
+            const auto document = retention_document(*policy);
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+            if (auto saved = workspace.save_engine_state(retention_key, document.dump(), now_ms);
+                !saved) {
+                return std::unexpected(std::move(saved.error()));
+            }
+            // Applied at once: a lower limit frees its space now.
+            if (auto applied = apply_retention(database, *policy); !applied) {
+                std::cerr << "melodyd: backups not brought within the new limits: "
+                          << applied.error().message << "\n";
+            }
+            return document;
+        });
 }
 
 void register_file_work_methods(protocol::Dispatcher& dispatcher, std::filesystem::path database,
                                 FileWorkRecovery recovery) {
+    // ADR-0268: which of these files are not there, looked for on this
+    // machine -- a list's rows greyed for what is gone.
+    //   files.missing {paths: [raw path]} -> {missing: [raw path]}
+    dispatcher.on("files.missing", [](const Json& params) -> core::Result<Json> {
+        constexpr std::size_t limit = 5'000U;
+        const auto paths = params.find("paths");
+        if (paths == params.end() || !paths->is_array() || paths->size() > limit) {
+            return std::unexpected(
+                core::Error{.code = core::ErrorCode::invalid_argument,
+                            .message = "up to " + std::to_string(limit) + " paths are required",
+                            .context = {{.key = "param", .value = "paths"}}});
+        }
+        auto missing = Json::array();
+        for (const auto& encoded : *paths) {
+            if (!encoded.is_string()) {
+                continue;
+            }
+            auto raw = protocol::decode_raw_path(encoded.get<std::string>());
+            if (!raw) {
+                continue;
+            }
+            std::error_code error;
+            const auto status = std::filesystem::status(std::filesystem::path{*raw}, error);
+            // Not there; a path that cannot be looked at is not said to be.
+            if (status.type() == std::filesystem::file_type::not_found) {
+                missing.push_back(encoded);
+            }
+        }
+        return Json{{"missing", std::move(missing)}};
+    });
     dispatcher.on("media.probe", [](const Json& params) -> core::Result<Json> {
         const auto paths = params.find("paths");
         if (paths == params.end() || !paths->is_array() || paths->size() > metadata_read_limit) {
@@ -271,7 +542,8 @@ void register_file_work_methods(protocol::Dispatcher& dispatcher, std::filesyste
                 .message = "at most " + std::to_string(metadata_read_limit) + " paths per read",
                 .context = {{.key = "param", .value = "paths"}}});
         }
-        auto files = Json::array();
+        std::vector<std::string> raw_paths;
+        raw_paths.reserve(paths->size());
         for (const auto& encoded : *paths) {
             if (!encoded.is_string()) {
                 return std::unexpected(
@@ -279,29 +551,52 @@ void register_file_work_methods(protocol::Dispatcher& dispatcher, std::filesyste
                                 .message = "a path is not an encoded path",
                                 .context = {{.key = "param", .value = "paths"}}});
             }
-            const auto raw_path = protocol::decode_raw_path(encoded.get<std::string>());
+            auto raw_path = protocol::decode_raw_path(encoded.get<std::string>());
             if (!raw_path) {
                 return std::unexpected(
                     core::Error{.code = core::ErrorCode::invalid_argument,
                                 .message = "a path is not an encoded path",
                                 .context = {{.key = "param", .value = "paths"}}});
             }
-            auto read = metadata::read_local_metadata(*raw_path);
-            if (read) {
-                Json file = Json::object();
-                file["read"] = wire::encode(*read);
-                files.push_back(std::move(file));
-                continue;
-            }
-            Json failed = Json::object();
-            failed["error"] = wire::encode(read.error());
-            failed["revision"] = nullptr;
-            if (read.error().code == core::ErrorCode::unsupported) {
-                if (auto revision = core::observe_local_source_revision(*raw_path)) {
-                    failed["revision"] = wire::encode(*revision);
+            raw_paths.push_back(std::move(*raw_path));
+        }
+        // A batch is read by a few threads at once: a file's tags are a seek
+        // and a small read, and one after another a disk spends most of a
+        // batch waiting. Bounded, as every pool here is.
+        std::vector<Json> read(raw_paths.size());
+        std::atomic<std::size_t> next{0};
+        const auto work = [&] {
+            for (auto index = next++; index < raw_paths.size(); index = next++) {
+                const auto& raw_path = raw_paths[index];
+                auto result = metadata::read_local_metadata(raw_path);
+                if (result) {
+                    read[index] = Json{{"read", wire::encode(*result)}};
+                    continue;
                 }
+                Json failed = Json::object();
+                failed["error"] = wire::encode(result.error());
+                failed["revision"] = nullptr;
+                if (result.error().code == core::ErrorCode::unsupported) {
+                    if (auto revision = core::observe_local_source_revision(raw_path)) {
+                        failed["revision"] = wire::encode(*revision);
+                    }
+                }
+                read[index] = std::move(failed);
             }
-            files.push_back(std::move(failed));
+        };
+        const auto threads =
+            std::min<std::size_t>({metadata_read_threads, raw_paths.size(),
+                                   std::max(1U, std::thread::hardware_concurrency())});
+        {
+            std::vector<std::jthread> pool;
+            for (std::size_t thread = 1; thread < threads; ++thread) {
+                pool.emplace_back(work);
+            }
+            work();
+        }
+        auto files = Json::array();
+        for (auto& file : read) {
+            files.push_back(std::move(file));
         }
         return Json{{"files", std::move(files)}};
     });
@@ -343,6 +638,64 @@ namespace {
     }
     return raw_path;
 }
+
+} // namespace
+
+namespace {
+
+// An image a client handed over, kept in `staging` under its content's name
+// and inspected there. Kept before, it is left as it is: a plan made from the
+// first staging names its revision, and touching it would make that stale.
+[[nodiscard]] core::Result<Json> keep_staged(const std::filesystem::path& staging,
+                                             const std::string& image_bytes) {
+    if (image_bytes.size() > operations::maximum_fittable_artwork_bytes) {
+        return std::unexpected(core::Error{.code = core::ErrorCode::limit_exceeded,
+                                           .message = "the image is too large",
+                                           .context = {}});
+    }
+    const auto* data = reinterpret_cast<const unsigned char*>(image_bytes.data());
+    const auto inspected =
+        metadata::inspect_encoded_image_bytes(std::span{data, image_bytes.size()});
+    if (!inspected) {
+        return std::unexpected(core::Error{.code = core::ErrorCode::unsupported,
+                                           .message = "only PNG and JPEG images are taken",
+                                           .context = {}});
+    }
+    std::error_code ignored;
+    std::filesystem::create_directories(staging, ignored);
+    const auto target = staging / (sha256_hex(image_bytes) +
+                                   (inspected->mime_type == "image/png" ? ".png" : ".jpg"));
+    if (!std::filesystem::exists(target, ignored)) {
+        const auto partial = target.string() + ".partial";
+        const auto descriptor =
+            ::open(partial.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        const auto written = descriptor < 0
+                                 ? ssize_t{-1}
+                                 : ::write(descriptor, image_bytes.data(), image_bytes.size());
+        if (descriptor >= 0) {
+            ::close(descriptor);
+        }
+        std::error_code renamed;
+        std::filesystem::rename(partial, target, renamed);
+        if (written != static_cast<ssize_t>(image_bytes.size()) || renamed) {
+            std::filesystem::remove(partial, ignored);
+            return std::unexpected(core::Error{
+                .code = core::ErrorCode::io, .message = "could not keep the image", .context = {}});
+        }
+    }
+    // Staged before, it is left as it is: a plan made from the first
+    // staging names its revision, and touching it would make that stale.
+    auto image = metadata::read_artwork_image_file(target.string(),
+                                                   operations::maximum_fittable_artwork_bytes);
+    if (!image) {
+        return std::unexpected(std::move(image.error()));
+    }
+    return Json{{"image", wire::encode(*image)}};
+}
+
+// A large image arrives in parts: each appended to its upload's file, in
+// order; the last makes it a staged image like any other.
+constexpr std::string_view upload_prefix = "upload-";
 
 } // namespace
 
@@ -422,58 +775,77 @@ void register_artwork_methods(protocol::Dispatcher& dispatcher, std::filesystem:
         return Json{{"image", *existing ? wire::encode(**existing) : Json()}};
     });
 
-    dispatcher.on(
-        "artwork.stage", [staging = std::move(staging)](const Json& params) -> core::Result<Json> {
-            const auto encoded = params.value("bytes", std::string{});
-            auto bytes = protocol::decode_raw_path(encoded);
-            if (encoded.empty() || !bytes || bytes->empty()) {
-                return std::unexpected(bad_param("encoded image bytes are required", "bytes"));
+    dispatcher.on("artwork.stage", [staging](const Json& params) -> core::Result<Json> {
+        const auto encoded = params.value("bytes", std::string{});
+        auto bytes = protocol::decode_raw_path(encoded);
+        if (encoded.empty() || !bytes || bytes->empty()) {
+            return std::unexpected(bad_param("encoded image bytes are required", "bytes"));
+        }
+        return keep_staged(staging, *bytes);
+    });
+
+    dispatcher.on("artwork.stage_part", [staging](const Json& params) -> core::Result<Json> {
+        const auto upload = params.value("upload", std::string{});
+        if (upload.size() < 16U || upload.size() > 64U ||
+            !std::ranges::all_of(upload, [](const char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            })) {
+            return std::unexpected(bad_param("an upload is named by hex digits", "upload"));
+        }
+        const auto offset = params.value("offset", std::uint64_t{0});
+        auto bytes = protocol::decode_raw_path(params.value("bytes", std::string{}));
+        if (!bytes) {
+            return std::unexpected(bad_param("encoded image bytes are required", "bytes"));
+        }
+        std::error_code ignored;
+        std::filesystem::create_directories(staging, ignored);
+        const auto part = staging / (std::string{upload_prefix} + upload + ".part");
+        const auto held = std::filesystem::exists(part, ignored)
+                              ? std::filesystem::file_size(part, ignored)
+                              : std::uintmax_t{0};
+        // In order, and never past what any image may be: a part out of
+        // place starts nothing over, it is refused.
+        if (offset != held) {
+            return std::unexpected(
+                core::Error{.code = core::ErrorCode::conflict,
+                            .message = "the upload holds " + std::to_string(held) + " bytes",
+                            .context = {}});
+        }
+        if (held + bytes->size() > operations::maximum_fittable_artwork_bytes) {
+            std::filesystem::remove(part, ignored);
+            return std::unexpected(core::Error{.code = core::ErrorCode::limit_exceeded,
+                                               .message = "the image is too large",
+                                               .context = {}});
+        }
+        {
+            const auto descriptor =
+                ::open(part.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+            const auto written =
+                descriptor < 0 ? ssize_t{-1} : ::write(descriptor, bytes->data(), bytes->size());
+            if (descriptor >= 0) {
+                ::close(descriptor);
             }
-            if (bytes->size() > operations::maximum_fittable_artwork_bytes) {
-                return std::unexpected(core::Error{.code = core::ErrorCode::limit_exceeded,
-                                                   .message = "the image is too large",
+            if (written != static_cast<ssize_t>(bytes->size())) {
+                std::filesystem::remove(part, ignored);
+                return std::unexpected(core::Error{.code = core::ErrorCode::io,
+                                                   .message = "could not keep the image",
                                                    .context = {}});
             }
-            const auto* data = reinterpret_cast<const unsigned char*>(bytes->data());
-            const auto inspected =
-                metadata::inspect_encoded_image_bytes(std::span{data, bytes->size()});
-            if (!inspected) {
-                return std::unexpected(core::Error{.code = core::ErrorCode::unsupported,
-                                                   .message = "only PNG and JPEG images are taken",
-                                                   .context = {}});
-            }
-            std::error_code ignored;
-            std::filesystem::create_directories(staging, ignored);
-            const auto target = staging / (sha256_hex(*bytes) +
-                                           (inspected->mime_type == "image/png" ? ".png" : ".jpg"));
-            if (!std::filesystem::exists(target, ignored)) {
-                const auto partial = target.string() + ".partial";
-                const auto descriptor =
-                    ::open(partial.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-                const auto written = descriptor < 0
-                                         ? ssize_t{-1}
-                                         : ::write(descriptor, bytes->data(), bytes->size());
-                if (descriptor >= 0) {
-                    ::close(descriptor);
-                }
-                std::error_code renamed;
-                std::filesystem::rename(partial, target, renamed);
-                if (written != static_cast<ssize_t>(bytes->size()) || renamed) {
-                    std::filesystem::remove(partial, ignored);
-                    return std::unexpected(core::Error{.code = core::ErrorCode::io,
-                                                       .message = "could not keep the image",
-                                                       .context = {}});
-                }
-            }
-            // Staged before, it is left as it is: a plan made from the first
-            // staging names its revision, and touching it would make that stale.
-            auto image = metadata::read_artwork_image_file(
-                target.string(), operations::maximum_fittable_artwork_bytes);
-            if (!image) {
-                return std::unexpected(std::move(image.error()));
-            }
-            return Json{{"image", wire::encode(*image)}};
-        });
+        }
+        if (!params.value("last", false)) {
+            return Json{{"received", held + bytes->size()}};
+        }
+        std::string whole;
+        {
+            std::ifstream input{part, std::ios::binary};
+            whole.assign(std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{});
+        }
+        std::filesystem::remove(part, ignored);
+        if (whole.empty()) {
+            return std::unexpected(bad_param("encoded image bytes are required", "bytes"));
+        }
+        return keep_staged(staging, whole);
+    });
 }
 
 void clean_artwork_staging(const std::filesystem::path& staging) {

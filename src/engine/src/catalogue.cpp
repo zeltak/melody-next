@@ -2,9 +2,53 @@
 
 #include "trackknife/engine/catalogue.hpp"
 
+#include "track_format.hpp"
+
 #include "trackknife/formats/artwork.hpp"
 
+#include <algorithm>
+
 namespace trackknife::engine {
+
+core::Result<std::vector<Catalogue::FoundTrack>>
+Catalogue::find(const query::CompiledTkq& compiled, const std::string& format,
+                const std::size_t limit, const core::CancellationToken& cancellation) const {
+    auto program = compile_client_format(format, titleformat::FormatContextKind::track_display);
+    if (!program) {
+        return std::unexpected(std::move(program.error()));
+    }
+    auto paths = filter_paths(compiled, cancellation);
+    if (!paths) {
+        return std::unexpected(std::move(paths.error()));
+    }
+    if (limit > 0U && paths->size() > limit) {
+        paths->resize(limit);
+    }
+    auto snapshots = cached_tracks(*paths, cancellation);
+    if (!snapshots) {
+        return std::unexpected(std::move(snapshots.error()));
+    }
+    std::vector<FoundTrack> found;
+    found.reserve(snapshots->size());
+    for (auto& snapshot : *snapshots) {
+        name_by_file(snapshot.facts, snapshot.raw_path);
+        auto text =
+            persistence::tkq_format(*program, snapshot.facts,
+                                    track_fields(snapshot.facts, snapshot.raw_path), cancellation);
+        if (!text) {
+            return std::unexpected(std::move(text.error()));
+        }
+        found.push_back({.raw_path = std::move(snapshot.raw_path), .text = std::move(*text)});
+    }
+    return found;
+}
+
+core::Result<DynamicSelected> Catalogue::select(const DynamicSelection& selection,
+                                                const std::set<std::string>& exclude,
+                                                const core::CancellationToken& cancellation) const {
+    std::mt19937 random{std::random_device{}()};
+    return select_dynamic(*this, selection, exclude, random, cancellation);
+}
 
 core::Result<persistence::LocalLibrary> LocalCatalogue::open() const {
     return persistence::LocalLibrary::open(database_);
@@ -49,7 +93,8 @@ LocalCatalogue::inventory(const std::string& folder, const std::string& after,
 }
 
 core::Result<persistence::LibraryFolder>
-LocalCatalogue::folder(const std::string& raw_path, const core::CancellationToken& cancellation) const {
+LocalCatalogue::folder(const std::string& raw_path,
+                       const core::CancellationToken& cancellation) const {
     auto library = open();
     if (!library) {
         return std::unexpected(std::move(library.error()));
@@ -63,7 +108,34 @@ core::Result<std::size_t> LocalCatalogue::refresh(const std::vector<std::string>
     if (!library) {
         return std::unexpected(std::move(library.error()));
     }
-    return library->refresh(raw_paths, cancellation);
+    // The albums before -- one a write moved to another key, or a folder
+    // deleted -- and after.
+    auto before =
+        observer_ ? library->albums_touching(raw_paths) : core::Result<std::vector<std::string>>{};
+    auto refreshed = library->refresh(raw_paths, cancellation);
+    if (refreshed && observer_) {
+        // After, for what is there: a track that moved to another album, a
+        // cover written. What is gone said all it had to before.
+        std::vector<std::string> present;
+        for (const auto& path : raw_paths) {
+            std::error_code ignored;
+            if (std::filesystem::exists(std::filesystem::path{path}, ignored)) {
+                present.push_back(path);
+            }
+        }
+        auto after = library->albums_touching(present);
+        Change change{.paths = raw_paths, .albums = {}, .everything = false};
+        if (before) {
+            change.albums = std::move(*before);
+        }
+        if (after) {
+            change.albums.insert(change.albums.end(), after->begin(), after->end());
+        }
+        std::ranges::sort(change.albums);
+        change.albums.erase(std::ranges::unique(change.albums).begin(), change.albums.end());
+        changed(std::move(change));
+    }
+    return refreshed;
 }
 
 core::Result<std::vector<std::string>>
@@ -117,6 +189,16 @@ LocalCatalogue::cached_tracks(const std::vector<std::string>& raw_paths,
     return library->cached_tracks(raw_paths, cancellation);
 }
 
+core::Result<std::vector<std::optional<persistence::LibraryTrackSnapshot>>>
+LocalCatalogue::described_tracks(const std::vector<std::string>& raw_paths,
+                                 const core::CancellationToken& cancellation) const {
+    auto library = open();
+    if (!library) {
+        return std::unexpected(std::move(library.error()));
+    }
+    return library->described_tracks(raw_paths, cancellation);
+}
+
 core::Result<std::vector<std::array<std::int64_t, 6>>>
 LocalCatalogue::history_facts(const std::vector<persistence::LibraryHistorySource>& sources,
                               const core::CancellationToken& cancellation) const {
@@ -138,7 +220,11 @@ LocalCatalogue::scan(const core::CancellationToken& cancellation,
     if (!library) {
         return std::unexpected(std::move(library.error()));
     }
-    return library->scan(cancellation, progress);
+    auto scanned = library->scan(cancellation, progress);
+    if (scanned) {
+        changed({.paths = {}, .albums = {}, .everything = true});
+    }
+    return scanned;
 }
 
 } // namespace trackknife::engine
@@ -158,7 +244,11 @@ core::Result<void> LocalCatalogue::add_root(const std::string& raw_path) {
     if (!library) {
         return std::unexpected(std::move(library.error()));
     }
-    return library->add_root(raw_path);
+    auto added = library->add_root(raw_path);
+    if (added) {
+        changed({.paths = {raw_path}, .albums = {}, .everything = true});
+    }
+    return added;
 }
 
 core::Result<void> LocalCatalogue::remove_root(const std::string& raw_path) {
@@ -166,7 +256,11 @@ core::Result<void> LocalCatalogue::remove_root(const std::string& raw_path) {
     if (!library) {
         return std::unexpected(std::move(library.error()));
     }
-    return library->remove_root(raw_path);
+    auto removed = library->remove_root(raw_path);
+    if (removed) {
+        changed({.paths = {raw_path}, .albums = {}, .everything = true});
+    }
+    return removed;
 }
 
 core::Result<persistence::LibraryPage>

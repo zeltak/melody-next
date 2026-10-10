@@ -2,6 +2,9 @@ package com.melody.next.speaker
 
 import androidx.media3.common.util.UnstableApi
 import com.melody.next.engine.Endpoint
+import com.melody.next.engine.Lines
+import com.melody.next.engine.Nearby
+import com.melody.next.engine.sameAddress
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -15,15 +18,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.BufferedWriter
 import java.io.IOException
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.util.UUID
 
 /**
@@ -48,6 +46,8 @@ class PhoneAgent(
      */
     val reconnecting: MutableStateFlow<Boolean> = MutableStateFlow(false),
     private val giveUpMs: Long = 10 * 60_000,
+    /** ADR-0272: engines on this network, to reach the engine the nearer way. */
+    private val nearby: Nearby = Nearby(),
 ) {
     /**
      * What this phone wants streamed: the original, or Opus at a bit rate
@@ -57,7 +57,7 @@ class PhoneAgent(
     @Volatile var bitrateKbps: Int = 0
         set(value) {
             field = value
-            changed = true
+            noteChange()
         }
 
     private fun wish(): JSONObject =
@@ -75,13 +75,29 @@ class PhoneAgent(
     /** Per process: the engine tells a restarted agent from a second one by it. */
     private val instance = UUID.randomUUID().toString()
     private var session: Job? = null
-    @Volatile private var writer: BufferedWriter? = null
+    @Volatile private var writer: Lines? = null
     private val writing = Mutex()
     @Volatile private var changed = true
 
-    fun start(endpoint: Endpoint) {
+    // The engine as this phone reached it, for where its streams are.
+    @Volatile private var reached: Endpoint? = null
+    @Volatile private var saved: Endpoint? = null
+
+    /** Plays for the engine at `endpoint` -- or nearer, found here by the id `id` gives. */
+    fun start(endpoint: Endpoint, id: () -> String? = { null }) {
         session?.cancel()
-        session = scope.launch(Dispatchers.IO) { run(endpoint) }
+        saved = endpoint
+        session = scope.launch(Dispatchers.IO) { run(endpoint, id) }
+    }
+
+    /**
+     * The phone changed networks: a connection made the nearer way is made
+     * again -- left home, the engine is not there any more (ADR-0272).
+     */
+    fun networkChanged() {
+        val wanted = saved ?: return
+        val via = reached ?: return
+        if (!via.sameAddress(wanted)) writer?.let { runCatching { it.close() } }
     }
 
     fun stop() {
@@ -95,7 +111,13 @@ class PhoneAgent(
     /** Something changed in playback: reported at the next chance. */
     fun noteChange() {
         changed = true
+        nudge.trySend(Unit)
     }
+
+    // Wakes the reports: idle, they wait for a change rather than looking
+    // ten times a second -- which in the background is CPU enough for
+    // Android to end the app.
+    private val nudge = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
 
     private var giveUp: Job? = null
 
@@ -115,26 +137,36 @@ class PhoneAgent(
         }
     }
 
-    private suspend fun run(endpoint: Endpoint) {
+    private suspend fun run(endpoint: Endpoint, id: () -> String?) {
         var problem = ""
         while (scope.isActive) {
             var registered = false
+            var switching = false
+            var nearer: Job? = null
             _status.value = Status.Connecting(endpoint, problem)
-            val socket = Socket()
+            var lines: Lines? = null
             try {
-                socket.tcpNoDelay = true
-                socket.keepAlive = true
-                socket.connect(InetSocketAddress(endpoint.host, endpoint.port), 5_000)
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-                val out = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-                writer = out
-                if (endpoint.password.isNotEmpty()) {
-                    ask(reader, 1, "session.authenticate", JSONObject().put("password", endpoint.password))
+                val (via, opened) = nearby.reach(endpoint, id(), 5_000) { at, timeoutMs ->
+                    withContext(Dispatchers.IO) { at.openLines(timeoutMs) }
+                }
+                lines = opened
+                reached = via
+                val reader = opened
+                writer = opened
+                if (via.password.isNotEmpty()) {
+                    ask(reader, 1, "session.authenticate", JSONObject().put("password", via.password))
+                }
+                // ADR-0274: what this phone plays now, so an engine it comes
+                // back to after a drop takes it up as it is -- having played
+                // on from what it had -- rather than from where it was.
+                val holding = withContext(playerThread) {
+                    if (audition.loaded) audition.snapshot().put("stream", wish()) else null
                 }
                 ask(
                     reader, 2, "agent.register",
                     JSONObject().put("name", name).put("instance", instance).put("files", false).put("protocol", 1)
-                        .put("decodes", JSONArray(DECODES)).put("stream", wish()),
+                        .put("decodes", JSONArray(DECODES)).put("stream", wish())
+                        .apply { if (holding != null) put("report", holding) },
                 )
                 _status.value = Status.Registered(endpoint)
                 registered = true
@@ -142,6 +174,16 @@ class PhoneAgent(
                 stopWaiting()
                 problem = ""
                 changed = true
+                // Reached the long way, and the engine turns up here: come
+                // home -- once nothing plays here, not cutting a track off.
+                if (via === endpoint) {
+                    nearer = scope.launch {
+                        nearby.awaitNearer(endpoint, id)
+                        while (withContext(playerThread) { audition.playing }) delay(retryMs)
+                        switching = true
+                        runCatching { opened.close() }
+                    }
+                }
                 val reporting = scope.launch(playerThread) { report() }
                 try {
                     serve(reader)
@@ -154,27 +196,26 @@ class PhoneAgent(
             } catch (failure: Throwable) {
                 problem = failure.message ?: failure.javaClass.simpleName
             } finally {
+                nearer?.cancel()
                 writer = null
-                runCatching { socket.close() }
+                runCatching { lines?.close() }
             }
+            if (switching) continue
             // Gone, cleanly or not -- a network switch usually breaks the
-            // connection rather than closing it. What played belonged to it;
-            // if something was, the engine is waited for.
-            if (registered) {
-                val wasPlaying = withContext(playerThread) {
-                    audition.playing.also { if (audition.loaded) audition.pause() }
-                }
-                if (wasPlaying) waitForReturn()
-            }
+            // connection rather than closing it; on mobile data the phone
+            // locking does. What plays goes on from what is buffered --
+            // minutes of it (ADR-0274) -- while the engine is made again,
+            // and is waited for, which keeps the app running to do it.
+            if (registered && withContext(playerThread) { audition.playing }) waitForReturn()
             delay(retryMs)
         }
     }
 
     /** A request of our own, before the connection turns round. */
-    private suspend fun ask(reader: BufferedReader, id: Int, method: String, params: JSONObject) {
+    private suspend fun ask(reader: Lines, id: Int, method: String, params: JSONObject) {
         send(JSONObject().put("id", id).put("method", method).put("params", params))
         while (true) {
-            val line = withContext(Dispatchers.IO) { reader.readLine() } ?: throw IOException("the engine closed the connection")
+            val line = withContext(Dispatchers.IO) { reader.read() } ?: throw IOException("the engine closed the connection")
             val message = JSONObject(line)
             if (message.optInt("id", -1) != id) continue
             message.optJSONObject("error")?.let { throw IOException(it.optString("message", "refused")) }
@@ -183,9 +224,9 @@ class PhoneAgent(
     }
 
     /** From here the engine asks; every request is answered, in order. */
-    private suspend fun serve(reader: BufferedReader) {
+    private suspend fun serve(reader: Lines) {
         while (true) {
-            val line = withContext(Dispatchers.IO) { reader.readLine() } ?: return
+            val line = withContext(Dispatchers.IO) { reader.read() } ?: return
             if (line.isBlank()) continue
             val request = JSONObject(line)
             if (!request.has("method")) continue
@@ -208,15 +249,28 @@ class PhoneAgent(
         }
     }
 
+    /**
+     * ADR-0270: a stream as this phone reaches the engine -- the engine names
+     * its own address, which behind a proxy is not one this phone can reach,
+     * and says http where the proxy speaks TLS.
+     */
+    private fun reachable(source: JSONObject?): JSONObject {
+        source ?: throw AgentError("invalid_argument", "a source is required")
+        val url = source.optString("url", "")
+        val via = reached
+        if (url.isNotEmpty() && via != null) source.put("url", via.streamUrl(url))
+        return source
+    }
+
     private fun handle(method: String, params: JSONObject): JSONObject {
         when (method) {
             "audition.load" -> audition.load(
-                params.optJSONObject("source") ?: throw AgentError("invalid_argument", "a source is required"),
+                reachable(params.optJSONObject("source")),
                 params.optBoolean("play", true),
                 params.optLong("position_ms", 0),
             )
             "audition.queue_next" -> audition.queueNext(
-                params.optJSONObject("source") ?: throw AgentError("invalid_argument", "a source is required"),
+                reachable(params.optJSONObject("source")),
                 params.optLong("token", 0),
             )
             "audition.clear_next" -> audition.clearNext()
@@ -250,20 +304,21 @@ class PhoneAgent(
                 changed = false
                 last = text
                 lastSent = now
+                // Not sent: the connection is gone, whatever reading says --
+                // closed, so it is made again rather than waited on.
                 runCatching { send(JSONObject().put("event", "audition.changed").put("data", snapshot)) }
+                    .onFailure { writer?.let { gone -> scope.launch(Dispatchers.IO) { runCatching { gone.close() } } } }
             }
-            delay(100)
+            // Playing: looked at often, for the position. Not: woken by a
+            // change, or once a second for what nothing said had changed.
+            withTimeoutOrNull(if (playing) 100L else 1_000L) { nudge.receive() }
         }
     }
 
     private suspend fun send(message: JSONObject) {
         val out = writer ?: throw IOException("not connected")
         withContext(Dispatchers.IO) {
-            writing.withLock {
-                out.write(message.toString())
-                out.write("\n")
-                out.flush()
-            }
+            writing.withLock { out.write(message.toString()) }
         }
     }
 

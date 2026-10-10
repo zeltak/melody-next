@@ -37,10 +37,12 @@
 #include <QLabel>
 #include <QMenu>
 #include <QPushButton>
-#include <QTabBar>
 #include <QSettings>
+#include <QSignalSpy>
 #include <QSlider>
 #include <QStandardPaths>
+#include <QStatusBar>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTableView>
 #include <QTemporaryDir>
@@ -162,7 +164,7 @@ class EnginePlaybackTest final : public QObject {
     void jumpToPlayingFindsTheEnginesTrack();
     void modesAndReplayGainReachTheEngine();
     void upNextDecidesWhatTheEnginePlaysNext();
-    void anEmptyUpNextTakesBackTheEnginesSavedAsks();
+    void aNewWindowShowsTheEnginesSavedAsks();
     void editingThePlayingListReachesTheEngine();
     void aQueueChangedElsewhereReachesTheList();
     void aSameSizeReplacementElsewhereReachesTheList();
@@ -174,6 +176,7 @@ class EnginePlaybackTest final : public QObject {
     void withoutAnEngineNothingChanges();
     void anOlderStateIsNotTakenOverANewerOne();
     void aListContinuesWithADynamicPlaylist();
+    void anEngineOfAnotherProtocolIsNotUsedAndAnOlderOneIsSaidToBe();
 
   private:
     QTemporaryDir settings_directory_;
@@ -469,14 +472,13 @@ void EnginePlaybackTest::modesAndReplayGainReachTheEngine() {
 
     // Changed on the engine by another client: the window takes it, rather
     // than showing -- and one day sending back -- its own old setting.
-    auto other = protocol::Client::connect(protocol::Endpoint{
-        .socket = socket.string(), .host = {}, .port = 0, .token = {}});
+    auto other = protocol::Client::connect(
+        protocol::Endpoint{.socket = socket.string(), .host = {}, .port = 0, .token = {}});
     QVERIFY(other.has_value());
     QVERIFY((*other)
-                ->call("playback.set_replay_gain",
-                       protocol::Json{{"mode", "track"},
-                                      {"preamp_with_gain_db", 0.0},
-                                      {"preamp_without_gain_db", 0.0}})
+                ->call("playback.set_replay_gain", protocol::Json{{"mode", "track"},
+                                                                  {"preamp_with_gain_db", 0.0},
+                                                                  {"preamp_without_gain_db", 0.0}})
                 .has_value());
     auto* track_gain = window.findChild<QAction*>(QStringLiteral("action-local-replaygain-track"));
     QVERIFY(track_gain != nullptr);
@@ -730,8 +732,7 @@ void EnginePlaybackTest::aSameSizeReplacementElsewhereReachesTheList() {
 
     QTRY_VERIFY2_WITH_TIMEOUT(model->rowOfEntry(third.entry_id, -1) >= 0 &&
                                   model->rowOfEntry(fourth.entry_id, -1) >= 0,
-                              "the window still shows the list another client replaced",
-                              10'000);
+                              "the window still shows the list another client replaced", 10'000);
     QCOMPARE(model->rowCount(), 2);
     // What plays of it is marked at once -- not only when the next track
     // starts -- though the entry the window knew as playing is gone.
@@ -869,7 +870,9 @@ void EnginePlaybackTest::listeningIsCreditedWhileTheEnginePlays() {
     // The tags travel with the sample, not just the path: a scrobble without
     // an artist and a title is not a scrobble.
     const auto credited = [&window, &title] {
-        const auto sample = window.findChild<trackknife::bench::Workspace*>()->property("trackknife-lastfm-sample").toString();
+        const auto sample = window.findChild<trackknife::bench::Workspace*>()
+                                ->property("trackknife-lastfm-sample")
+                                .toString();
         return sample.contains(title) && !sample.startsWith(QLatin1Char('|'));
     };
     QTRY_VERIFY2_WITH_TIMEOUT(credited(), "nothing was credited while the engine played", 5'000);
@@ -996,10 +999,11 @@ void EnginePlaybackTest::upNextDecidesWhatTheEnginePlaysNext() {
     (*server)->stop();
 }
 
-// The engine keeps its asks -- across its own restarts, too -- until told
-// otherwise, so a window whose Up Next is empty has to say so: once it
-// stayed quiet, and the engine played a track the panel no longer showed.
-void EnginePlaybackTest::anEmptyUpNextTakesBackTheEnginesSavedAsks() {
+// The engine keeps its asks -- across its own restarts, too. Once a window
+// stayed quiet about its empty Up Next, and the engine played a track the
+// panel did not show. ADR-0269: the panel shows what the engine holds -- an
+// ask another client made while this window was away is taken, not erased.
+void EnginePlaybackTest::aNewWindowShowsTheEnginesSavedAsks() {
     QTemporaryDir directory;
     QVERIFY(directory.isValid());
     std::vector<std::string> raw_paths;
@@ -1035,8 +1039,8 @@ void EnginePlaybackTest::anEmptyUpNextTakesBackTheEnginesSavedAsks() {
         QTRY_COMPARE_WITH_TIMEOUT(model->rowCount(), 2, 5'000);
         emit view->doubleClicked(model->index(0, 0));
         QTRY_VERIFY_WITH_TIMEOUT((*player)->queue().size() == 2U, 5'000);
-        view->selectionModel()->select(
-            model->index(1, 0), QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        view->selectionModel()->select(model->index(1, 0), QItemSelectionModel::ClearAndSelect |
+                                                               QItemSelectionModel::Rows);
         auto* queue_next = window.findChild<QAction*>(QStringLiteral("action-queue-next"));
         QVERIFY(queue_next != nullptr);
         queue_next->trigger();
@@ -1050,8 +1054,12 @@ void EnginePlaybackTest::anEmptyUpNextTakesBackTheEnginesSavedAsks() {
 
     BenchMainWindow reopened;
     reopened.show();
-    QTRY_VERIFY2_WITH_TIMEOUT((*player)->requests().empty(),
-                              "the engine kept an ask the window no longer has", 10'000);
+    // Shown: the count beside the transport says one waits.
+    auto* badge = reopened.findChild<QLabel*>(QStringLiteral("bench-up-next-count"));
+    QVERIFY(badge != nullptr);
+    QTRY_COMPARE_WITH_TIMEOUT(badge->text(), QStringLiteral("1"), 10'000);
+    QTest::qWait(500);
+    QCOMPARE((*player)->requests().size(), 1U);
 
     (*server)->stop();
 }
@@ -1326,8 +1334,30 @@ void EnginePlaybackTest::aListContinuesWithADynamicPlaylist() {
 
     QTRY_VERIFY_WITH_TIMEOUT(continuation.all().contains(list), 5'000);
     QCOMPARE(continuation.all().at(list).query, std::string{"codec PRESENT"});
+    QCOMPARE(continuation.all().at(list).groups, 0U);
+
+    // ADR-0258: the rules that ship are offered too, and a grouped one
+    // reaches the engine with its grouping.
+    const auto choose = [&window, &tabs](const QString& name) {
+        emit tabs->tabBar()->customContextMenuRequested(tabs->tabBar()->tabRect(0).center());
+        auto* continue_menu = window.findChild<QMenu*>(QStringLiteral("bench-tab-continue-menu"));
+        QVERIFY(continue_menu != nullptr);
+        auto* action = continue_menu->findChild<QAction*>(QStringLiteral("continue-rule-") + name);
+        QVERIFY(action != nullptr);
+        action->trigger();
+        window.findChild<QMenu*>(QStringLiteral("bench-tab-context-menu"))->hide();
+    };
+    choose(QStringLiteral("shipped:random-album"));
+    QTRY_VERIFY_WITH_TIMEOUT(continuation.all().at(list).rule_id == "shipped:random-album", 5'000);
+    QCOMPARE(continuation.all().at(list).groups, 1U);
+    QCOMPARE(continuation.all().at(list).per_group, 0U);
+    QVERIFY(!continuation.all().at(list).group_by.empty());
+    choose(QStringLiteral("rule-everything"));
+    QTRY_VERIFY_WITH_TIMEOUT(continuation.all().at(list).rule_id == "rule-everything", 5'000);
     QTRY_VERIFY_WITH_TIMEOUT(tabs->tabText(0).endsWith(QStringLiteral(" ∞")), 5'000);
-    QVERIFY(tabs->tabToolTip(0).contains(QStringLiteral("Continues with Everything")));
+    // Waited for, as the rule chosen last replaced another the tab named.
+    QTRY_VERIFY_WITH_TIMEOUT(
+        tabs->tabToolTip(0).contains(QStringLiteral("Continues with Everything")), 5'000);
 
     // Deleting the rule ends what continued with it.
     auto* dynamic = window.findChild<QAction*>(QStringLiteral("action-dynamic-playlists"));
@@ -1345,15 +1375,59 @@ void EnginePlaybackTest::aListContinuesWithADynamicPlaylist() {
     remove->click();
     QTRY_VERIFY_WITH_TIMEOUT(continuation.all().empty(), 5'000);
     QTRY_VERIFY2_WITH_TIMEOUT(!tabs->tabText(0).endsWith(QStringLiteral(" ∞")),
-                              qPrintable(tabs->tabText(0) + QLatin1Char('|') +
-                                         tabs->tabToolTip(0)),
+                              qPrintable(tabs->tabText(0) + QLatin1Char('|') + tabs->tabToolTip(0)),
                               5'000);
 
     (*server)->stop();
+}
+
+// ADR-0260: decided once, on connecting, from engine.info.
+void EnginePlaybackTest::anEngineOfAnotherProtocolIsNotUsedAndAnOlderOneIsSaidToBe() {
+    for (const int protocol : {2, 1}) {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const std::filesystem::path socket{
+            (directory.path() + QStringLiteral("/engine.sock")).toStdString()};
+        auto player = engine::Player::create_without_audio();
+        RecordingEngine recorder{*player};
+        // Protocol 2, or protocol 1 from before levels were said.
+        recorder.dispatcher().on("engine.info", [protocol](const protocol::Json&) {
+            return core::Result<protocol::Json>{
+                protocol::Json{{"name", "elsewhere"}, {"protocol", protocol}}};
+        });
+        auto server = engine::Server::listen(socket, recorder.dispatcher());
+        QVERIFY(server.has_value());
+        (*server)->start();
+        QSettings{}.setValue(QLatin1String(SettingsDialog::library_local_engine_socket_key),
+                             QString::fromStdString(socket.string()));
+
+        BenchMainWindow window;
+        window.show();
+        EnginePlayback* playback = nullptr;
+        QTRY_VERIFY((playback = window.findChild<EnginePlayback*>()) != nullptr);
+        QSignalSpy said{playback, &EnginePlayback::versionNotice};
+        if (protocol == 2) {
+            QTRY_VERIFY(window.statusBar()->currentMessage().contains(
+                QStringLiteral("elsewhere speaks protocol 2; this Trackknife speaks protocol 1. "
+                               "Update Trackknife.")));
+            QVERIFY(!playback->active());
+            // Tried again as any lost connection is, and not said again.
+            QTest::qWait(300);
+            const auto once = said.count();
+            QVERIFY(once <= 1);
+            QTest::qWait(1'500);
+            QVERIFY(!playback->active());
+            QCOMPARE(said.count(), once);
+        } else {
+            QTRY_VERIFY(playback->active());
+            QTRY_VERIFY(window.statusBar()->currentMessage().contains(
+                QStringLiteral("elsewhere's melodyd is older than this Trackknife")));
+        }
+        (*server)->stop();
+    }
 }
 
 } // namespace trackknife::bench
 
 QTEST_MAIN(trackknife::bench::EnginePlaybackTest)
 #include "engine_playback_test.moc"
-

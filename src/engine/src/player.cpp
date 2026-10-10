@@ -5,6 +5,7 @@
 #include "trackknife/core/local_sources.hpp"
 
 #include <algorithm>
+#include <set>
 #include <utility>
 
 namespace trackknife::engine {
@@ -171,6 +172,21 @@ core::Result<void> Player::resume_output(std::optional<std::int64_t> position_ms
                           playing.value_or(pending && pending->playing), std::nullopt);
 }
 
+bool Player::keep_output(const std::string& raw_path) {
+    const std::lock_guard guard{mutex_};
+    if (raw_path.empty() || audition_ == silent_.get()) {
+        return false;
+    }
+    const auto* current = anchors_.current.is_nil() ? nullptr : find_locked(anchors_.current);
+    const auto* armed = gapless_entry_ ? find_locked(*gapless_entry_) : nullptr;
+    const bool held = (current != nullptr && current->source.raw_path == raw_path) ||
+                      (armed != nullptr && armed->source.raw_path == raw_path);
+    if (held) {
+        pending_resume_.reset();
+    }
+    return held;
+}
+
 core::Result<void> Player::take_up_locked(const std::int64_t position_ms, const bool playing,
                                           std::optional<core::LocalSourceRevision> revision) {
     const auto* entry = anchors_.current.is_nil() ? nullptr : find_locked(anchors_.current);
@@ -183,6 +199,10 @@ core::Result<void> Player::take_up_locked(const std::int64_t position_ms, const 
             revision = *observed;
         }
     }
+    // Taken up afresh: whatever was armed to follow went with the output's
+    // old session, and its count of handovers is where it now stands.
+    gapless_entry_.reset();
+    advanced_from_.reset();
     auto restored = audition_->restore_paused(
         entry->source.raw_path, revision.value_or(core::LocalSourceRevision{}),
         entry->source.selection, entry->source.segment, position_ms, entry->replay_gain);
@@ -278,6 +298,7 @@ std::optional<core::Result<void>> Player::start_next_request_locked() {
     while (!requests_.empty()) {
         const auto wanted = requests_.front();
         requests_.erase(requests_.begin());
+        ++requests_revision_;
         // A request whose entry has gone is dropped rather than stopping
         // playback: the user asked for something that is no longer there.
         if (const auto* entry = find_locked(wanted); entry != nullptr) {
@@ -471,6 +492,27 @@ void Player::follow_gapless_locked(const audio::LocalAuditionSnapshot& snapshot)
 
 void Player::replace_queue(std::vector<QueueEntry> entries, std::string list) {
     const std::lock_guard guard{mutex_};
+    replace_queue_locked(std::move(entries), std::move(list));
+}
+
+bool Player::follow_list(const std::string& list, std::vector<QueueEntry> entries,
+                         const std::vector<core::StableId>& fresh) {
+    const std::lock_guard guard{mutex_};
+    if (list.empty() || queue_list_ != list) {
+        return false;
+    }
+    std::set<core::StableId> held;
+    for (const auto& entry : queue_) {
+        held.insert(entry.entry_id);
+    }
+    held.insert(fresh.begin(), fresh.end());
+    std::erase_if(entries,
+                  [&held](const QueueEntry& entry) { return !held.contains(entry.entry_id); });
+    replace_queue_locked(std::move(entries), list);
+    return true;
+}
+
+void Player::replace_queue_locked(std::vector<QueueEntry> entries, std::string list) {
     queue_ = std::move(entries);
     queue_list_ = std::move(list);
     ++revision_;
@@ -497,6 +539,16 @@ void Player::replace_queue(std::vector<QueueEntry> entries, std::string list) {
 std::string Player::queue_list() const {
     const std::lock_guard guard{mutex_};
     return queue_list_;
+}
+
+bool Player::adopt_queue_list(const std::string& from, const std::string& to) {
+    const std::lock_guard guard{mutex_};
+    if (from.empty() || queue_list_ != from) {
+        return false;
+    }
+    queue_list_ = to;
+    ++revision_;
+    return true;
 }
 
 bool Player::ends_after_current() const {
@@ -566,6 +618,7 @@ core::Result<void> Player::request(const core::StableId& entry_id) {
                         .context = {{.key = "entry", .value = entry_id.to_string()}}});
     }
     requests_.push_back(entry_id);
+    ++requests_revision_;
     ++revision_;
     return {};
 }
@@ -573,6 +626,17 @@ core::Result<void> Player::request(const core::StableId& entry_id) {
 std::vector<core::StableId> Player::requests() const {
     const std::lock_guard guard{mutex_};
     return requests_;
+}
+
+std::vector<QueueEntry> Player::request_entries() const {
+    const std::lock_guard guard{mutex_};
+    std::vector<QueueEntry> entries;
+    for (const auto& wanted : requests_) {
+        if (const auto* entry = find_locked(wanted); entry != nullptr) {
+            entries.push_back(*entry);
+        }
+    }
+    return entries;
 }
 
 core::Result<void> Player::set_requests(const std::vector<core::StableId>& entries) {
@@ -586,6 +650,7 @@ core::Result<void> Player::set_requests(const std::vector<core::StableId>& entri
         }
     }
     requests_ = entries;
+    ++requests_revision_;
     ++revision_;
     prune_asks_locked();
     refresh_gapless_locked();
@@ -607,6 +672,7 @@ void Player::enqueue(std::vector<QueueEntry> entries) {
 void Player::clear_requests() {
     const std::lock_guard guard{mutex_};
     requests_.clear();
+    ++requests_revision_;
     ++revision_;
     prune_asks_locked();
     refresh_gapless_locked();
@@ -698,9 +764,13 @@ core::Result<void> Player::resume() {
     // have a track loaded after its entry left the queue, and that is not
     // something to bring back.
     if (anchors_.current.is_nil()) {
-        return std::unexpected(core::Error{.code = core::ErrorCode::not_found,
-                                           .message = "nothing to resume",
-                                           .context = {}});
+        // Stopped: play starts the queue again, from its first entry, as a
+        // player's Play does.
+        if (queue_.empty()) {
+            return std::unexpected(core::Error{
+                .code = core::ErrorCode::not_found, .message = "nothing to play", .context = {}});
+        }
+        return start_locked(0U);
     }
     return audition_->play();
 }
@@ -892,6 +962,7 @@ bool Player::restore(Persisted state) {
     static_cast<void>(audition_->set_replay_gain_mode(replay_gain_mode_));
     static_cast<void>(audition_->set_replay_gain_preamps(replay_gain_preamps_));
     requests_ = std::move(state.requests);
+    ++requests_revision_;
     anchors_.request_return = state.request_return;
     playing_request_ = state.playing_request;
     anchors_.current = state.entry;
@@ -969,6 +1040,7 @@ Player::State Player::state() const {
     }
     current.queue_size = queue_.size();
     current.requests = requests_.size();
+    current.requests_revision = requests_revision_;
     current.modes = modes_;
     current.volume_percent = snapshot.volume_percent;
     // Told but not yet shown by the output: what it was told.
@@ -990,8 +1062,8 @@ Player::State Player::state() const {
         const bool arrived = current.position_ms >= asked_place_->position_ms - 250 &&
                              current.position_ms <= asked_place_->position_ms + since + 500;
         if (asked_place_->output != audition_ ||
-            asked_place_->instance != snapshot.playback_instance || now - asked_place_->at > patience ||
-            arrived) {
+            asked_place_->instance != snapshot.playback_instance ||
+            now - asked_place_->at > patience || arrived) {
             asked_place_.reset();
         } else {
             current.position_ms = asked_place_->position_ms;

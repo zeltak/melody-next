@@ -5,6 +5,7 @@
 // come and go, and let go of. Nothing here reads the remote files: what they
 // are comes from the engine that has them.
 
+#include "workspace/library_browser.hpp"
 #include "workspace/workspace.hpp"
 
 #include "bench/bench_main_window_helpers.hpp"
@@ -29,6 +30,12 @@
 
 namespace trackknife::bench {
 
+void Workspace::sayVersion(EnginePlayback& playback) {
+    // ADR-0260: an engine too old, or of another protocol, said plainly.
+    connect(&playback, &EnginePlayback::versionNotice, this,
+            [this](const QString& message) { view_->showMessage(message, 15'000); });
+}
+
 void Workspace::connectLocalEngine() {
     // Built once, before anything that needs a catalogue: the panel, the
     // search dialog and dynamic playlists all take this rather than a path.
@@ -37,6 +44,7 @@ void Workspace::connectLocalEngine() {
     // Its own connection: the engine serves one connection in order, so a
     // transport command behind a library query would wait for it.
     localEngine().playback = new EnginePlayback(*localEngine().catalogue, this);
+    sayVersion(*localEngine().playback);
     watchFileWork(localEngine());
     followContinuations(localEngine());
     transport_ = localPlayback();
@@ -55,6 +63,11 @@ void Workspace::connectLocalEngine() {
     connect(localPlayback(), &EnginePlayback::ratingChanged, this,
             [this](const QString& hash, const unsigned rating) {
                 adoptEngineRating(EngineKey::local(), hash, rating);
+            });
+    connect(localPlayback(), &EnginePlayback::catalogueChanged, this,
+            [this](const std::vector<std::string>& paths, const std::vector<std::string>& albums,
+                   const bool everything) {
+                adoptLibraryChange(EngineKey::local(), paths, albums, everything);
             });
     connect(localPlayback(), &EnginePlayback::failed, this, [this](const QString& message) {
         view_->showMessage(QStringLiteral("Engine: %1").arg(message), 8'000);
@@ -225,7 +238,7 @@ void Workspace::connectRemoteEngine(const RemoteEngineSetting& setting, const bo
     // placeholder: "remote" for the one remote of an older release, whose
     // lists say so, or its address for one added since.
     added->key = !setting.id.isEmpty() ? EngineKey::fromText(setting.id)
-                 : first ? EngineKey::remote()
+                 : first               ? EngineKey::remote()
                          : EngineKey::fromText(QStringLiteral("address:") + setting.address);
     added->setting = setting;
     added->password = setting.effectivePassword();
@@ -235,6 +248,7 @@ void Workspace::connectRemoteEngine(const RemoteEngineSetting& setting, const bo
         return;
     }
     added->playback = new EnginePlayback(*added->catalogue, this);
+    sayVersion(*added->playback);
     auto* link = added.get();
     engines_.push_back(std::move(added));
     watchFileWork(*link);
@@ -262,6 +276,11 @@ void Workspace::connectRemoteEngine(const RemoteEngineSetting& setting, const bo
             [this, link](const QString& hash, const unsigned rating) {
                 adoptEngineRating(link->key, hash, rating);
             });
+    connect(link->playback, &EnginePlayback::catalogueChanged, this,
+            [this, link](const std::vector<std::string>& paths,
+                         const std::vector<std::string>& albums, const bool everything) {
+                adoptLibraryChange(link->key, paths, albums, everything);
+            });
     connect(link->playback, &EnginePlayback::failed, this, [this](const QString& message) {
         view_->showMessage(QStringLiteral("Engine: %1").arg(message), 8'000);
     });
@@ -284,10 +303,12 @@ void Workspace::connectRemoteEngine(const RemoteEngineSetting& setting, const bo
             }
         }
         refreshRatings();
-        // A remote that restarted holds the Up Next it saved; this window's
-        // is the one the user sees, so it is stated again.
-        engine_requests_.reset();
-        syncEngineRequests();
+        // ADR-0269: its Up Next is its own -- what was added while this
+        // window was away, or before it restarted, is taken, not overwritten.
+        if (link->playback == transport_) {
+            engine_requests_revision_.reset();
+            engine_requests_known_ = false;
+        }
         // Its tab, named after it -- by address if it was made while the
         // remote was away, which is renamed now that it has said its name.
         // A name someone chose is theirs, and kept.
@@ -322,6 +343,89 @@ void Workspace::connectRemoteEngine(const RemoteEngineSetting& setting, const bo
         static_cast<void>(engineTab(*link));
     }
     view_->engineConnected(*link, first);
+}
+
+void Workspace::adoptLibraryChange(const EngineKey& engine, const std::vector<std::string>& paths,
+                                   const std::vector<std::string>& albums, const bool everything) {
+    if (auto* found = link(engine); found != nullptr && found->browser) {
+        found->browser->applyChanges(albums, everything);
+    }
+    // ADR-0268: its lists' rows at those paths -- or under them, a folder --
+    // looked at again: gone, or back.
+    for (const auto& tab : list_tabs_) {
+        if (EngineKey::of(tab->document) != engine) {
+            continue;
+        }
+        const auto id = QString::fromStdString(tab->document.id.to_string());
+        if (everything) {
+            scheduleMissingCheck(id);
+            continue;
+        }
+        std::vector<std::string> touched;
+        for (const auto& row : tab->model->rows()) {
+            if (std::ranges::any_of(paths, [&row](const std::string& path) {
+                    return row.raw_path == path ||
+                           (row.raw_path.size() > path.size() && row.raw_path.starts_with(path) &&
+                            row.raw_path[path.size()] == '/');
+                })) {
+                touched.push_back(row.raw_path);
+            }
+        }
+        if (!touched.empty()) {
+            checkMissing(id, std::move(touched));
+        }
+    }
+}
+
+void Workspace::scheduleMissingCheck(const QString& document_id) {
+    missing_pending_.insert(document_id);
+    if (missing_scheduled_) {
+        return;
+    }
+    missing_scheduled_ = true;
+    // Rows come in bursts -- a list filled, an album dropped -- asked once.
+    QTimer::singleShot(300, this, [this] {
+        missing_scheduled_ = false;
+        const auto pending = std::exchange(missing_pending_, {});
+        for (const auto& id : pending) {
+            auto* tab = tabForDocument(id);
+            if (tab == nullptr) {
+                continue;
+            }
+            std::vector<std::string> paths;
+            for (const auto& row : tab->model->rows()) {
+                paths.push_back(row.raw_path);
+            }
+            checkMissing(id, std::move(paths));
+        }
+    });
+}
+
+void Workspace::checkMissing(const QString& document_id, std::vector<std::string> paths) {
+    auto* tab = tabForDocument(document_id);
+    if (tab == nullptr || paths.empty()) {
+        return;
+    }
+    std::ranges::sort(paths);
+    paths.erase(std::ranges::unique(paths).begin(), paths.end());
+    std::erase_if(paths, [](const std::string& path) { return path.empty(); });
+    // Its engine looks, where the files are; one that cannot is not asked.
+    const auto work = fileWorkOf(EngineKey::of(tab->document));
+    if (!work || paths.empty()) {
+        return;
+    }
+    const QPointer self{this};
+    static_cast<void>(QtConcurrent::run([self, work, document_id, paths = std::move(paths)] {
+        auto missing = work->missing(paths);
+        postBack(self, [self, document_id, paths, missing = std::move(missing)] {
+            if (!missing) {
+                return;
+            }
+            if (auto* found = self->tabForDocument(document_id)) {
+                found->model->setMissing(paths, *missing);
+            }
+        });
+    }));
 }
 
 void Workspace::adoptEngineRating(const EngineKey& engine, const QString& hash,
@@ -377,8 +481,25 @@ void Workspace::watchFileWork(EngineLink& link) {
                             .toStdString()));
                 }
                 if (chosen.contains(QLatin1String(SettingsKeys::rating_backup_key))) {
-                    static_cast<void>(
-                        work->set_rating_backup_tag(SettingsKeys::ratingBackupTag()));
+                    static_cast<void>(work->set_rating_backup_tag(SettingsKeys::ratingBackupTag()));
+                }
+                // ADR-0263: once chosen, how long it keeps what writes replace.
+                if (chosen.contains(QLatin1String(SettingsKeys::undo_keep_days_key)) ||
+                    chosen.contains(QLatin1String(SettingsKeys::undo_keep_writes_key)) ||
+                    chosen.contains(QLatin1String(SettingsKeys::undo_keep_gigabytes_key))) {
+                    static_cast<void>(work->set_backup_retention(
+                        chosen
+                            .value(QLatin1String(SettingsKeys::undo_keep_days_key),
+                                   SettingsKeys::undo_keep_days_default)
+                            .toInt(),
+                        chosen
+                            .value(QLatin1String(SettingsKeys::undo_keep_writes_key),
+                                   SettingsKeys::undo_keep_writes_default)
+                            .toInt(),
+                        chosen
+                            .value(QLatin1String(SettingsKeys::undo_keep_gigabytes_key),
+                                   SettingsKeys::undo_keep_gigabytes_default)
+                            .toInt()));
                 }
                 if (auto answer = work->interrupted()) {
                     // What it finished or rolled back at its start, itself.
@@ -424,38 +545,39 @@ void Workspace::watchFileWork(EngineLink& link) {
                     }
                 }
             }
-            postBack(workspace, [workspace, work, does, recovered,
-                                 interrupted = std::move(interrupted)] {
-                if (!workspace) {
-                    return;
-                }
-                if (recovered > 0U) {
-                    workspace->view_->showMessage(
-                        QStringLiteral("Recovered %1 interrupted file operation%2")
-                            .arg(recovered)
-                            .arg(recovered == 1U ? QString{} : QStringLiteral("s")),
-                        5'000);
-                }
-                for (const auto& reported : interrupted) {
-                    if (std::ranges::none_of(
-                            workspace->engine_interruptions_,
-                            [&reported](const auto& known) { return known.id == reported.id; })) {
-                        workspace->engine_interruptions_.push_back(reported);
-                    }
-                }
-                workspace->view_->engineInterruptionsChanged(!interrupted.empty());
-                // By the connection, not the key: an engine's key changes
-                // when it first says its id.
-                for (const auto& candidate : workspace->engines_) {
-                    if (candidate->file_work == work) {
-                        candidate->does_file_work = does;
-                    }
-                }
-                if (does) {
-                    // ADR-0237: it names files with this window's layouts.
-                    workspace->pushLayouts();
-                }
-            });
+            postBack(workspace,
+                     [workspace, work, does, recovered, interrupted = std::move(interrupted)] {
+                         if (!workspace) {
+                             return;
+                         }
+                         if (recovered > 0U) {
+                             workspace->view_->showMessage(
+                                 QStringLiteral("Recovered %1 interrupted file operation%2")
+                                     .arg(recovered)
+                                     .arg(recovered == 1U ? QString{} : QStringLiteral("s")),
+                                 5'000);
+                         }
+                         for (const auto& reported : interrupted) {
+                             if (std::ranges::none_of(workspace->engine_interruptions_,
+                                                      [&reported](const auto& known) {
+                                                          return known.id == reported.id;
+                                                      })) {
+                                 workspace->engine_interruptions_.push_back(reported);
+                             }
+                         }
+                         workspace->view_->engineInterruptionsChanged(!interrupted.empty());
+                         // By the connection, not the key: an engine's key changes
+                         // when it first says its id.
+                         for (const auto& candidate : workspace->engines_) {
+                             if (candidate->file_work == work) {
+                                 candidate->does_file_work = does;
+                             }
+                         }
+                         if (does) {
+                             // ADR-0237: it names files with this window's layouts.
+                             workspace->pushLayouts();
+                         }
+                     });
         }));
     };
     connect(link.playback, &EnginePlayback::connected, this, probe);

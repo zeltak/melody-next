@@ -5,11 +5,11 @@
 #include "bench/metadata_dialog_helpers.hpp"
 #include "trackknife/metadata/flac_mapping.hpp"
 
-#include <QGuiApplication>
 #include <QBrush>
 #include <QColor>
 #include <QFont>
 #include <QFutureWatcher>
+#include <QGuiApplication>
 #include <QPalette>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
@@ -457,6 +457,33 @@ bool MetadataGridModel::revertFields(const std::span<const std::size_t> item_ind
     return applyFieldRequests(item_indexes, std::move(requests));
 }
 
+bool MetadataGridModel::previewStillApplies(
+    const metadata::MetadataTransformationPreview& preview) const {
+    for (const auto& cell : preview.cells) {
+        if (cell.item_index >= selection_->item_count()) {
+            return false;
+        }
+        const auto field = cell.match_mode == metadata::MetadataFieldMatchMode::exact_native
+                               ? selection_->exact_native_field_index(cell.display_field)
+                               : selection_->field_index(cell.canonical_field);
+        // A field none of the files has yet: absent, as the preview saw it?
+        if (!field) {
+            if (cell.before) {
+                return false;
+            }
+            continue;
+        }
+        const auto current = project_cell(*selection_, patches_, cell.item_index, *field);
+        const auto values = current.present
+                                ? std::optional<std::vector<std::string>>{*current.values}
+                                : std::nullopt;
+        if (values != cell.before) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool MetadataGridModel::stageTransformation(const metadata::MetadataTransformationPreview& preview,
                                             const QStringList& step_sources) {
     if (preview.cells.empty() || preview.cells.size() > maximum_field_transaction_cells) {
@@ -775,6 +802,39 @@ void MetadataGridModel::pushHistory(DraftTransaction transaction) {
     }
 }
 
+core::Result<std::pair<std::size_t, std::size_t>>
+MetadataGridModel::adoptReadSelection(metadata::StagedMetadataSelection read,
+                                      const std::span<const std::size_t> written) {
+    // ADR-0261: the drafts of files written are in them now.
+    auto kept = patches_;
+    for (const auto& patch : patches_.patches()) {
+        if (std::ranges::find(written, patch.item_index) == written.end()) {
+            continue;
+        }
+        auto reverted = kept.revert(*selection_, patch.item_index, patch.field_index);
+        if (!reverted) {
+            return std::unexpected(std::move(reverted.error()));
+        }
+    }
+    auto carried = metadata::carry_staged_patches(*selection_, kept, read);
+    if (!carried) {
+        return std::unexpected(std::move(carried.error()));
+    }
+    beginResetModel();
+    selection_ = std::make_shared<const metadata::StagedMetadataSelection>(std::move(read));
+    patches_ = std::move(carried->patches);
+    staged_sources_.clear();
+    history_.clear();
+    history_cursor_ = 0U;
+    history_text_bytes_ = 0U;
+    endResetModel();
+    emit draftStateChanged(
+        static_cast<int>(std::min(patches_.patch_count(),
+                                  static_cast<std::size_t>(std::numeric_limits<int>::max()))),
+        false, false);
+    return std::pair{carried->carried, carried->dropped};
+}
+
 MetadataAggregateModel::MetadataAggregateModel(MetadataGridModel* grid_model, QObject* parent)
     : QAbstractTableModel(parent), grid_model_(grid_model) {
     Q_ASSERT(grid_model_ != nullptr);
@@ -802,9 +862,28 @@ MetadataAggregateModel::MetadataAggregateModel(MetadataGridModel* grid_model, QO
             [this](const QModelIndex& top_left, const QModelIndex& bottom_right,
                    const QList<int>&) { gridDataChanged(top_left, bottom_right); });
     connect(grid_model_, &QAbstractItemModel::modelReset, this, [this] {
+        // A selection read anew (ADR-0257): its fields are not the old ones,
+        // so what is known of them starts again, for the same rows chosen.
         beginResetModel();
         uniform_drafts_.clear();
+        const auto& read = grid_model_->selection();
+        subset_fields_.clear();
+        subset_fields_.reserve(read.field_count());
+        for (std::size_t field_index = 0U; field_index < read.field_count(); ++field_index) {
+            const auto& field = read.field(field_index);
+            subset_fields_.push_back(metadata::StagedMetadataSubsetField{
+                .state = field.state,
+                .present_item_count = field.present_item_count,
+                .representative_item_index = field.representative_item_index,
+            });
+        }
+        draft_fields_.assign(read.field_count(), metadata::StagedMetadataFieldProjection{});
+        staged_counts_.assign(read.field_count(), 0U);
         endResetModel();
+        auto chosen = item_indexes_;
+        summary_ready_ = false;
+        setSelectedItems(std::move(chosen));
+        refreshDraftCounts();
     });
     connect(grid_model_, &QAbstractItemModel::columnsAboutToBeInserted, this,
             [this](const QModelIndex& insertion_parent, const int first, const int last) {

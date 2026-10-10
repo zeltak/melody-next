@@ -2,6 +2,8 @@
 
 #include "workspace/tagger_session.hpp"
 
+#include "workspace/preparation_planning.hpp"
+
 #include "bench/artwork_fitting.hpp"
 #include "bench/metadata_dialog_helpers.hpp"
 #include "bench/metadata_grid_model.hpp"
@@ -27,7 +29,9 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <numeric>
 #include <ranges>
+#include <set>
 #include <unordered_map>
 #include <utility>
 
@@ -41,6 +45,10 @@ constexpr auto remembered_rename_key = "properties/actions/rename-files";
 constexpr auto remembered_move_key = "properties/actions/move-files";
 constexpr auto remembered_layout_key = "properties/actions/naming-layout";
 constexpr auto remembered_destination_prefix = "properties/actions/move-destination/";
+constexpr auto remembered_move_target_prefix = "properties/actions/move-target/";
+constexpr auto remembered_move_folder_prefix = "properties/actions/move-folder/";
+constexpr auto remembered_replaygain_key = "properties/actions/replaygain";
+constexpr auto remembered_skip_existing_gain_key = "properties/actions/replaygain-skip-existing";
 
 constexpr auto properties_geometry_key = "workspace/metadata-properties-geometry-v1";
 constexpr auto properties_window_key = "workspace/metadata-properties-window-v1";
@@ -86,6 +94,10 @@ TaggerSession::TaggerSession(const std::size_t requested_item_count,
         save_tags_ = remembered.value(QLatin1String(remembered_save_tags_key), true).toBool();
         wants_rename_ = remembered.value(QLatin1String(remembered_rename_key), false).toBool();
         wants_move_ = remembered.value(QLatin1String(remembered_move_key), false).toBool();
+        replaygain_on_apply_ =
+            remembered.value(QLatin1String(remembered_replaygain_key), false).toBool();
+        skip_existing_gain_ =
+            remembered.value(QLatin1String(remembered_skip_existing_gain_key), true).toBool();
         const auto id_of = [&remembered](const QString& key) -> std::optional<core::StableId> {
             auto id = core::StableId::parse(remembered.value(key).toString().toStdString());
             return id ? std::optional{*id} : std::nullopt;
@@ -93,6 +105,18 @@ TaggerSession::TaggerSession(const std::size_t requested_item_count,
         editing_output_layout_id_ = id_of(QLatin1String(remembered_layout_key));
         editing_destination_id_ = id_of(QLatin1String(remembered_destination_prefix) +
                                         services_.output_profile_store.destinations_key);
+        const auto& engine = services_.output_profile_store.destinations_key;
+        const auto folder =
+            remembered.value(QLatin1String(remembered_move_folder_prefix) + engine).toByteArray();
+        if (!folder.isEmpty()) {
+            move_folder_ = std::string{folder.constData(), static_cast<std::size_t>(folder.size())};
+        }
+        const auto target =
+            remembered.value(QLatin1String(remembered_move_target_prefix) + engine).toString();
+        move_target_ = target == QLatin1String("library") && services_.library_roots
+                           ? MoveTarget::library
+                       : target == QLatin1String("folder") && move_folder_ ? MoveTarget::folder
+                                                                           : MoveTarget::saved;
     }
     preferred_fields_.reserve(preferred_fields.size());
     for (const auto field : preferred_fields) {
@@ -113,12 +137,45 @@ TaggerSession::TaggerSession(const std::size_t requested_item_count,
                       .arg(replaygain_total_),
                   true);
     });
+    reading_progress_timer_.setInterval(100);
+    connect(&reading_progress_timer_, &QTimer::timeout, this, [this] {
+        if (reading_ == nullptr || reading_->total.load() == 0U) {
+            return;
+        }
+        if (provisional_) {
+            // The grid is open on cached tags: the status line carries it.
+            setStatus(QStringLiteral("Reading tags · %L1 of %L2 files · scripts and Save wait "
+                                     "for them · <a href=\"stop-reading\">Stop</a>")
+                          .arg(reading_->read.load())
+                          .arg(reading_->total.load()),
+                      true);
+        } else {
+            loading_text_ =
+                QStringLiteral("Reading tags · %L1 of %L2 files · <a href=\"stop\">Stop</a>")
+                    .arg(reading_->read.load())
+                    .arg(reading_->total.load());
+        }
+        emit changed();
+    });
     connect(&selection_watcher_, &QFutureWatcherBase::finished, this,
             &TaggerSession::finishSelection);
     connect(&automatic_watcher_, &QFutureWatcherBase::finished, this,
             &TaggerSession::finishAutomaticStage);
     connect(&replaygain_watcher_, &QFutureWatcherBase::finished, this,
             &TaggerSession::finishReplayGainScan);
+    // The gains measured for a write staged: the write goes on.
+    connect(this, &TaggerSession::proposalsSettled, this, [this](const bool staged) {
+        if (measuring_for_write_) {
+            measuring_for_write_ = false;
+            emit gainsMeasured(staged);
+        }
+    });
+    connect(this, &TaggerSession::gainsMeasured, this, [this](const bool ok) {
+        if (std::exchange(apply_after_gains_, false) && ok) {
+            gains_measured_ = true;
+            startWritePlan();
+        }
+    });
     connect(&proposal_watcher_, &QFutureWatcherBase::finished, this,
             &TaggerSession::finishProposals);
     connect(&write_plan_watcher_, &QFutureWatcherBase::finished, this,
@@ -433,6 +490,7 @@ void TaggerSession::captureSources() {
                 snapshot->audio.selection.stream_index || snapshot->audio.selection.subsong_index;
             sources_.push_back(std::move(snapshot->source));
             audio_sources_->push_back(snapshot->audio);
+            durations_.push_back(snapshot->duration_ms);
             track_labels_.push_back(std::move(snapshot->track_label));
         }
         ++capture_index_;
@@ -458,39 +516,73 @@ void TaggerSession::captureSources() {
 }
 
 void TaggerSession::startSelection() {
-    selection_watcher_.setFuture(QtConcurrent::run(
-        [sources = std::move(sources_), preferred = std::move(preferred_fields_),
-         access = services_.tools.access, token = technical_cancellation_.token()]() mutable {
-            auto prepared =
-                metadata::capture_uncached_metadata_sources(std::move(sources), access, token);
-            if (!prepared) {
-                return std::make_shared<SelectionResult>(std::unexpected(prepared.error()));
+    // Every file's own tags are the baseline a write starts from, so each is
+    // read -- in batches, the engine reading a batch at once -- and how far
+    // it has got is shown, with a way to stop.
+    reading_ = std::make_shared<Reading>();
+    reading_progress_timer_.start();
+    // ADR-0257: rows a list holds cached tags for are shown on those at once,
+    // while the files are read behind them.
+    const bool unread = std::ranges::any_of(sources_, [](const auto& source) {
+        return source.needs_metadata_capture && !source.source_revision && !source.logical_track;
+    });
+    const QPointer<TaggerSession> self{this};
+    selection_watcher_.setFuture(
+        QtConcurrent::run([sources = std::move(sources_), preferred = preferred_fields_,
+                           access = services_.tools.access, token = technical_cancellation_.token(),
+                           reading = reading_, unread, self]() mutable {
+            std::vector<std::string_view> cached_views;
+            for (const auto& field : preferred) {
+                cached_views.emplace_back(field);
             }
+            if (unread) {
+                auto cached = metadata::StagedMetadataSelection::create(sources, cached_views);
+                if (cached) {
+                    auto shared =
+                        std::make_shared<metadata::StagedMetadataSelection>(std::move(*cached));
+                    QMetaObject::invokeMethod(
+                        self,
+                        [self, shared] {
+                            if (self) {
+                                self->showProvisional(std::move(*shared));
+                            }
+                        },
+                        Qt::QueuedConnection);
+                }
+            }
+            auto captured = metadata::capture_metadata_sources(
+                std::move(sources), access, token,
+                [&reading](const std::size_t read, const std::size_t total) {
+                    reading->total.store(total);
+                    reading->read.store(read);
+                });
+            if (!captured) {
+                return std::make_shared<SelectionResult>(std::unexpected(captured.error()));
+            }
+            reading->unreadable = std::move(captured->unreadable);
             std::vector<std::string_view> preferred_views;
             preferred_views.reserve(preferred.size());
             for (const auto& field : preferred) {
                 preferred_views.emplace_back(field);
             }
-            return std::make_shared<SelectionResult>(
-                metadata::StagedMetadataSelection::create(std::move(*prepared), preferred_views));
+            return std::make_shared<SelectionResult>(metadata::StagedMetadataSelection::create(
+                std::move(captured->sources), preferred_views));
         }));
 }
 
-void TaggerSession::finishSelection() {
-    const auto result = selection_watcher_.result();
-    if (!result || !*result) {
-        const auto message = result ? display_utf8(result->error().message)
-                                    : QStringLiteral("The selection task returned no result");
-        summary_ = QStringLiteral("Properties unavailable");
-        setStatus(QStringLiteral("Read-only metadata preview"));
-        loading_text_ = message;
-        emit changed();
+void TaggerSession::stopReading() { technical_cancellation_.request_cancellation(); }
+
+void TaggerSession::showProvisional(metadata::StagedMetadataSelection selection) {
+    // Already over: the files' own tags came first after all.
+    if (grid_model_ != nullptr || selection_watcher_.isFinished()) {
         return;
     }
-    buildGrid(std::move(**result));
+    provisional_ = true;
+    buildGrid(std::move(selection));
+    emit changed();
 }
 
-void TaggerSession::buildGrid(metadata::StagedMetadataSelection selection) {
+void TaggerSession::describeSelection(const metadata::StagedMetadataSelection& selection) {
     const auto item_count = selection.item_count();
     const auto source_count = selection.distinct_source_count();
     const auto field_count = selection.field_count();
@@ -510,6 +602,136 @@ void TaggerSession::buildGrid(metadata::StagedMetadataSelection selection) {
                             ? QStringLiteral("source revisions captured")
                             : QStringLiteral("%1 rows have no captured source revision")
                                   .arg(item_count - revision_count);
+}
+
+void TaggerSession::selectAllRows() {
+    if (grid_model_ == nullptr || grid_model_->rowCount() == 0) {
+        return;
+    }
+    file_selection_->setCurrentIndex(grid_model_->index(0, 0), QItemSelectionModel::NoUpdate);
+    const QItemSelection all{
+        grid_model_->index(0, 0),
+        grid_model_->index(grid_model_->rowCount() - 1, grid_model_->columnCount() - 1)};
+    file_selection_->select(all, QItemSelectionModel::ClearAndSelect);
+    updateSelectionProjection();
+}
+
+void TaggerSession::finishSelection() {
+    reading_progress_timer_.stop();
+    const auto result = selection_watcher_.result();
+    if (provisional_ && grid_model_ != nullptr) {
+        // ADR-0257: the grid is open on cached tags. Read, the files' own
+        // take their place, drafts and all; not read, the cached ones stay
+        // to be looked at, and nothing is saved from them.
+        if (!result || !*result) {
+            const auto why = !result ? QStringLiteral("The selection task returned no result")
+                             : (*result).error().code == core::ErrorCode::cancelled
+                                 ? QStringLiteral("Reading stopped")
+                                 : display_utf8((*result).error().message);
+            sticky_status_ = QStringLiteral("%1 · the tags shown are cached; scripts and Save need "
+                                            "them read -- open the editor again to read them")
+                                 .arg(why);
+            setStatus(sticky_status_);
+            rewritten_items_.clear();
+            const auto after_write = std::exchange(writing_elsewhere_, false);
+            emit changed();
+            if (after_write) {
+                emit writtenElsewhere();
+            }
+            return;
+        }
+        const auto rewritten = std::exchange(rewritten_items_, {});
+        const auto after_write = std::exchange(writing_elsewhere_, false);
+        auto adopted = grid_model_->adoptReadSelection(std::move(**result), rewritten);
+        if (!adopted) {
+            sticky_status_ = QStringLiteral("The tags read could not replace the cached ones · %1")
+                                 .arg(display_utf8(adopted.error().message));
+            setStatus(sticky_status_);
+            emit changed();
+            if (after_write) {
+                emit writtenElsewhere();
+            }
+            return;
+        }
+        provisional_ = false;
+        if (after_write) {
+            // The files' scripts already ran when they were opened.
+            describeSelection(grid_model_->selection());
+            selectAllRows();
+            sticky_status_.clear();
+            setStatus(QStringLiteral("Written files read again"));
+            reportUnreadable();
+            updateTechnicalSummary();
+            emit changed();
+            emit writtenElsewhere();
+            return;
+        }
+        describeSelection(grid_model_->selection());
+        selectAllRows();
+        const auto [kept, unchanged] = *adopted;
+        sticky_status_ =
+            kept + unchanged == 0U
+                ? QStringLiteral("Tags read")
+                : QStringLiteral("Tags read · %L1 %2 kept%3")
+                      .arg(kept)
+                      .arg(kept == 1U ? QStringLiteral("draft") : QStringLiteral("drafts"))
+                      .arg(unchanged == 0U
+                               ? QString{}
+                               : QStringLiteral(", %L1 already so in the files").arg(unchanged));
+        setStatus(sticky_status_);
+        reportUnreadable();
+        stageAutomaticTransformations();
+        updateTechnicalSummary();
+        emit changed();
+        return;
+    }
+    if (result && !*result && (*result).error().code == core::ErrorCode::cancelled) {
+        summary_ = QStringLiteral("Properties unavailable");
+        setStatus(QStringLiteral("Read-only metadata preview"));
+        loading_text_ = QStringLiteral("Reading stopped. Close this window, or open it again to "
+                                       "read the tags anew.");
+        emit changed();
+        return;
+    }
+    if (!result || !*result) {
+        const auto message = result ? display_utf8(result->error().message)
+                                    : QStringLiteral("The selection task returned no result");
+        summary_ = QStringLiteral("Properties unavailable");
+        setStatus(QStringLiteral("Read-only metadata preview"));
+        loading_text_ = message;
+        emit changed();
+        return;
+    }
+    buildGrid(std::move(**result));
+    reportUnreadable();
+}
+
+void TaggerSession::reportUnreadable() {
+    // Shown, but as cached and never written: said, with which and why.
+    if (reading_ != nullptr && !reading_->unreadable.empty()) {
+        const auto& unreadable = reading_->unreadable;
+        QStringList named;
+        for (std::size_t index = 0; index < unreadable.size() && index < 20U; ++index) {
+            named << QStringLiteral("%1: %2").arg(
+                display_utf8(core::display_raw_path(unreadable[index].first)),
+                display_utf8(unreadable[index].second.message));
+        }
+        if (unreadable.size() > 20U) {
+            named << QStringLiteral("… and %L1 more").arg(unreadable.size() - 20U);
+        }
+        sticky_status_ =
+            QStringLiteral("%L1 %2 could not be read; shown as cached, and not "
+                           "written")
+                .arg(unreadable.size())
+                .arg(unreadable.size() == 1U ? QStringLiteral("file") : QStringLiteral("files"));
+        unreadable_details_ = named.join(QLatin1Char('\n'));
+        setStatus(sticky_status_);
+        emit changed();
+    }
+}
+
+void TaggerSession::buildGrid(metadata::StagedMetadataSelection selection) {
+    describeSelection(selection);
 
     grid_model_ = new MetadataGridModel(std::move(selection), std::move(track_labels_), this);
     aggregate_model_ = new MetadataAggregateModel(grid_model_, this);
@@ -548,14 +770,7 @@ void TaggerSession::buildGrid(metadata::StagedMetadataSelection selection) {
                 emit changed();
             });
     emit gridReady();
-    if (grid_model_->rowCount() > 0) {
-        file_selection_->setCurrentIndex(grid_model_->index(0, 0), QItemSelectionModel::NoUpdate);
-        const QItemSelection all{
-            grid_model_->index(0, 0),
-            grid_model_->index(grid_model_->rowCount() - 1, grid_model_->columnCount() - 1)};
-        file_selection_->select(all, QItemSelectionModel::ClearAndSelect);
-        updateSelectionProjection();
-    }
+    selectAllRows();
     stageAutomaticTransformations();
     updateTechnicalSummary();
     emit gridFilled();
@@ -798,7 +1013,7 @@ void TaggerSession::updateApplySummary() {
 // Enablement.
 
 bool TaggerSession::selectionReady() const {
-    return aggregate_model_ != nullptr && aggregate_model_->summaryReady() &&
+    return !writing_elsewhere_ && aggregate_model_ != nullptr && aggregate_model_->summaryReady() &&
            aggregate_model_->selectedItemCount() > 0U;
 }
 
@@ -811,9 +1026,10 @@ bool TaggerSession::canEditValues() const {
 }
 
 bool TaggerSession::canTransform() const {
-    return !transformation_dialog_open_ && grid_model_ != nullptr && selectionReady() &&
-           !exact_values_dialog_open_ && !field_name_dialog_open_ && !write_plan_running_ &&
-           !apply_running_ && !artwork_operation_running_;
+    return !provisional_ && !writing_elsewhere_ && !transformation_dialog_open_ &&
+           grid_model_ != nullptr && selectionReady() && !exact_values_dialog_open_ &&
+           !field_name_dialog_open_ && !write_plan_running_ && !apply_running_ &&
+           !artwork_operation_running_;
 }
 
 bool TaggerSession::canIdentify() const {
@@ -825,15 +1041,16 @@ bool TaggerSession::canScanReplayGain() const { return canSuggest() && !replayga
 bool TaggerSession::canApply() const {
     const auto has_metadata_effect = save_tags_ && draft_count_ > 0;
     const auto has_path_effect = rename_files_ || move_files_;
-    return grid_model_ != nullptr &&
-           (has_metadata_effect || has_path_effect ||
+    return grid_model_ != nullptr && !provisional_ && !replaygain_running_ &&
+           (has_metadata_effect || has_path_effect || replaygain_on_apply_ ||
             (artwork_ != nullptr && artwork_->hasPendingChanges())) &&
            !transformation_catalog_loading_ && !write_plan_running_ && !apply_running_ &&
-           !artwork_operation_running_;
+           !artwork_operation_running_ && !writing_elsewhere_;
 }
 
 bool TaggerSession::fileListEnabled() const {
-    return !artwork_operation_running_ && (artwork_ == nullptr || !artwork_->hasPendingChanges());
+    return !writing_elsewhere_ && !artwork_operation_running_ &&
+           (artwork_ == nullptr || !artwork_->hasPendingChanges());
 }
 
 void TaggerSession::setFieldSelection(const bool has_selected_fields,
@@ -892,6 +1109,9 @@ void TaggerSession::statusLinkActivated(const QString& link) {
     }
     if (link == QStringLiteral("cancel-replaygain")) {
         replaygain_cancellation_.request_cancellation();
+    }
+    if (link == QStringLiteral("stop-reading")) {
+        stopReading();
     }
     if (link == QStringLiteral("retry-replaygain") && !replaygain_retry_items_.empty()) {
         startReplayGainScan(replaygain_retry_items_);
@@ -1181,7 +1401,9 @@ void TaggerSession::toggleAutomaticScript(const QString& script_id, const bool e
 // user's model: automatic scripts also stage over plain local baselines,
 // so every write is what the grid shows — never a hidden apply-time pass.
 void TaggerSession::stageAutomaticTransformations() {
-    if (grid_model_ == nullptr || automatic_stage_running_ || proposal_running_ ||
+    // ADR-0257: scripts read the files' own tags; with cached ones shown they
+    // run once those are in.
+    if (grid_model_ == nullptr || provisional_ || automatic_stage_running_ || proposal_running_ ||
         write_plan_running_ || apply_running_) {
         return;
     }
@@ -1213,6 +1435,18 @@ void TaggerSession::stageAutomaticTransformations() {
 
 void TaggerSession::finishAutomaticStage() {
     automatic_stage_running_ = false;
+    // Proposals that waited for the scripts: staged now, whatever they did.
+    struct Then {
+        TaggerSession* session;
+        ~Then() {
+            if (session->waiting_proposals_ && !session->proposal_running_) {
+                auto waiting = std::move(*session->waiting_proposals_);
+                session->waiting_proposals_.reset();
+                session->applyMusicBrainzProposals(std::move(waiting));
+            }
+            emit session->changed();
+        }
+    } then{this};
     const auto result = automatic_watcher_.result();
     if (!result || !*result) {
         const auto message = result ? display_utf8(result->error().message)
@@ -1286,7 +1520,8 @@ std::optional<TaggerSession::AutomaticChainPlan> TaggerSession::combinedAutomati
 // Suggestions and MusicBrainz.
 
 void TaggerSession::startProposals() {
-    if (grid_model_ == nullptr || proposal_running_ || write_plan_running_ || apply_running_) {
+    if (grid_model_ == nullptr || provisional_ || proposal_running_ || write_plan_running_ ||
+        apply_running_) {
         return;
     }
     auto items = itemsOrAll();
@@ -1321,17 +1556,35 @@ void TaggerSession::finishProposals() {
                                     : QStringLiteral("The suggestion task returned no result");
         setStatus(QStringLiteral("No suggestions · %1").arg(message));
         emit changed();
+        emit proposalsSettled(false);
         return;
     }
     const auto& preview = **result;
     if (preview.cells.empty()) {
         setStatus(QStringLiteral("No suggestions · the selected files already agree"));
         emit changed();
+        // Nothing to change is as good as staged.
+        emit proposalsSettled(true);
         return;
     }
-    if (grid_model_ == nullptr ||
-        !stageTransformation(preview, QStringList{display_utf8(preview.chain.name)})) {
+    if (grid_model_ == nullptr) {
+        emit proposalsSettled(false);
+        return;
+    }
+    // A draft that moved under the preview -- an edit, a script -- is no
+    // reason to give up: previewed again against it, twice at most.
+    if (!grid_model_->previewStillApplies(preview) && staging_proposals_ &&
+        proposal_attempts_ < 3) {
+        auto again = std::move(*staging_proposals_);
+        staging_proposals_.reset();
+        applyMusicBrainzProposals(std::move(again));
+        return;
+    }
+    staging_proposals_.reset();
+    proposal_attempts_ = 0;
+    if (!stageTransformation(preview, QStringList{display_utf8(preview.chain.name)})) {
         emit changed();
+        emit proposalsSettled(false);
         return;
     }
     auto staged_status =
@@ -1347,6 +1600,108 @@ void TaggerSession::finishProposals() {
     staged_status += replayGainStatusLinks();
     showStickyStatus(staged_status);
     stageAutomaticTransformations();
+    emit proposalsSettled(true);
+}
+
+std::size_t TaggerSession::itemCount() const {
+    return grid_model_ != nullptr ? grid_model_->selection().item_count() : 0U;
+}
+
+const metadata::StagedMetadataSource* TaggerSession::itemSource(const std::size_t item) const {
+    if (grid_model_ == nullptr || item >= grid_model_->selection().item_count()) {
+        return nullptr;
+    }
+    return &grid_model_->selection().source(item);
+}
+
+std::optional<std::int64_t> TaggerSession::durationOf(const std::size_t item) const {
+    if (item < durations_.size() && durations_[item]) {
+        return durations_[item];
+    }
+    if (const auto* source = itemSource(item)) {
+        if (const auto known = technical_cache_.find(source->raw_path);
+            known != technical_cache_.end() && known->second && known->second->duration_ms >= 0) {
+            return known->second->duration_ms;
+        }
+    }
+    return std::nullopt;
+}
+
+bool TaggerSession::canStageProposals() const {
+    return grid_model_ != nullptr && !proposal_running_ && !provisional_ && !writing_elsewhere_ &&
+           !automatic_stage_running_ && !waiting_proposals_;
+}
+
+bool TaggerSession::canWriteElsewhere() const {
+    return grid_model_ != nullptr && !provisional_ && !writing_elsewhere_ && !proposal_running_ &&
+           !write_plan_running_ && !apply_running_ && !artwork_operation_running_ &&
+           !transformation_catalog_loading_;
+}
+
+std::shared_ptr<const metadata::StagedMetadataSelection> TaggerSession::sharedSelection() const {
+    return grid_model_ != nullptr ? grid_model_->sharedSelection() : nullptr;
+}
+
+const metadata::StagedMetadataPatchSet* TaggerSession::draft() const {
+    return grid_model_ != nullptr ? &grid_model_->patches() : nullptr;
+}
+
+std::optional<operations::OutputLayoutProfile> TaggerSession::layoutProfile(const int index) const {
+    if (index < 0 || static_cast<std::size_t>(index) >= output_layout_catalog_.size()) {
+        return std::nullopt;
+    }
+    return output_layout_catalog_[static_cast<std::size_t>(index)].profile;
+}
+
+bool TaggerSession::beginWriteElsewhere() {
+    if (!canWriteElsewhere()) {
+        return false;
+    }
+    writing_elsewhere_ = true;
+    invalidateWritePlan();
+    return true;
+}
+
+void TaggerSession::finishWriteElsewhere(std::vector<Rewritten> written,
+                                         std::vector<std::size_t> stale) {
+    if (!writing_elsewhere_) {
+        return;
+    }
+    if ((written.empty() && stale.empty()) || grid_model_ == nullptr) {
+        writing_elsewhere_ = false;
+        emit changed();
+        emit writtenElsewhere();
+        return;
+    }
+    // Read again as when opened over cached tags (ADR-0257): nothing saved
+    // until read, and the draft carried onto what the files now hold.
+    const auto& selection = grid_model_->selection();
+    sources_.clear();
+    sources_.reserve(selection.item_count());
+    for (std::size_t item = 0U; item < selection.item_count(); ++item) {
+        sources_.push_back(selection.source(item));
+    }
+    rewritten_items_.clear();
+    for (auto& rewritten : written) {
+        if (rewritten.item >= sources_.size()) {
+            continue;
+        }
+        auto& source = sources_[rewritten.item];
+        source.raw_path = std::move(rewritten.raw_path);
+        source.source_revision.reset();
+        source.needs_metadata_capture = true;
+        rewritten_items_.push_back(rewritten.item);
+    }
+    for (const auto item : stale) {
+        if (item < sources_.size()) {
+            sources_[item].source_revision.reset();
+            sources_[item].needs_metadata_capture = true;
+        }
+    }
+    provisional_ = true;
+    setStatus(QStringLiteral("Reading the files written…"));
+    emit changed();
+    startSelection();
 }
 
 std::optional<TaggerSession::Identify> TaggerSession::identifyRequest() const {
@@ -1375,6 +1730,7 @@ std::optional<TaggerSession::Identify> TaggerSession::identifyRequest() const {
             .disc_number = {},
             .duration_ms = {},
         };
+        descriptor.duration_ms = durationOf(item_index);
         if (const auto number = baseline.first_effective_value("tracknumber")) {
             descriptor.track_number = parse_position_number(*number);
         }
@@ -1399,6 +1755,17 @@ void TaggerSession::applyMusicBrainzProposals(metadata::MetadataProposalSet prop
     if (grid_model_ == nullptr || proposal_running_) {
         return;
     }
+    // The automatic scripts are staging: a preview now would be of a draft
+    // about to change. Staged once they are done.
+    if (automatic_stage_running_) {
+        waiting_proposals_ = std::move(proposals);
+        return;
+    }
+    if (!staging_proposals_ || proposal_attempts_ == 0) {
+        proposal_attempts_ = 0;
+    }
+    staging_proposals_ = proposals;
+    ++proposal_attempts_;
     proposal_running_ = true;
     setStatus(QStringLiteral("Matching the MusicBrainz release to the draft…"));
     emit changed();
@@ -1438,30 +1805,13 @@ void TaggerSession::startReplayGainScan(std::vector<std::size_t> forced_items) {
     if (items.empty()) {
         return;
     }
-    loudness::LoudnessGrouping grouping;
-    switch (replaygain_grouping_) {
-    case 0:
-        grouping.mode = loudness::LoudnessGroupingMode::release;
-        break;
-    case 1:
-        grouping.mode = loudness::LoudnessGroupingMode::release_merged_discs;
-        break;
-    case 2:
-        grouping.mode = loudness::LoudnessGroupingMode::selection_album;
-        break;
-    case 3:
-        grouping.mode = loudness::LoudnessGroupingMode::track;
-        break;
-    default:
-        grouping.mode = loudness::LoudnessGroupingMode::format_expression;
-        grouping.expression = replaygain_expression_.trimmed().toStdString();
-        if (grouping.expression.empty()) {
-            setStatus(QStringLiteral("Enter a tkfmt-1 grouping expression, e.g. %album%"));
-            emit changed();
-            return;
-        }
-        break;
+    auto choice = replayGainGroupingChoice();
+    if (!choice) {
+        setStatus(QStringLiteral("Enter a tkfmt-1 grouping expression, e.g. %album%"));
+        emit changed();
+        return;
     }
+    auto grouping = std::move(*choice);
     replaygain_retry_items_.clear();
 
     replaygain_running_ = true;
@@ -1497,15 +1847,110 @@ void TaggerSession::startReplayGainScan(std::vector<std::size_t> forced_items) {
         }));
 }
 
+std::optional<loudness::LoudnessGrouping> TaggerSession::replayGainGroupingChoice() const {
+    loudness::LoudnessGrouping grouping;
+    switch (replaygain_grouping_) {
+    case 0:
+        grouping.mode = loudness::LoudnessGroupingMode::release;
+        break;
+    case 1:
+        grouping.mode = loudness::LoudnessGroupingMode::release_merged_discs;
+        break;
+    case 2:
+        grouping.mode = loudness::LoudnessGroupingMode::selection_album;
+        break;
+    case 3:
+        grouping.mode = loudness::LoudnessGroupingMode::track;
+        break;
+    default:
+        grouping.mode = loudness::LoudnessGroupingMode::format_expression;
+        grouping.expression = replaygain_expression_.trimmed().toStdString();
+        if (grouping.expression.empty()) {
+            return std::nullopt;
+        }
+        break;
+    }
+    return grouping;
+}
+
+void TaggerSession::chooseReplayGain(const bool on) {
+    replaygain_on_apply_ = on;
+    rememberActionChoices();
+    invalidateWritePlan();
+}
+
+void TaggerSession::chooseSkipExistingGain(const bool on) {
+    skip_existing_gain_ = on;
+    rememberActionChoices();
+    emit changed();
+}
+
+std::vector<std::size_t> TaggerSession::itemsNeedingGain(std::vector<std::size_t> items) const {
+    const auto grouping = replayGainGroupingChoice();
+    if (!skip_existing_gain_ || grid_model_ == nullptr || !grouping) {
+        return items;
+    }
+    const auto& selection = grid_model_->selection();
+    const auto* field = grouping->mode == loudness::LoudnessGroupingMode::track
+                            ? "replaygaintrackgain"
+                            : "replaygainalbumgain";
+    const auto has_gain = [&](const std::size_t item) {
+        const auto gain = selection.source(item).baseline.first_effective_value(field);
+        return gain.has_value() && !gain->empty();
+    };
+    std::vector<const metadata::MetadataDocument*> documents;
+    documents.reserve(items.size());
+    for (const auto item : items) {
+        documents.push_back(&selection.source(item).baseline);
+    }
+    const auto keys = loudness::assign_loudness_groups(*grouping, documents);
+    if (!keys) {
+        return items;
+    }
+    // A group lacks the gain when any of its files does.
+    std::set<std::string> lacking;
+    for (std::size_t position = 0U; position < items.size(); ++position) {
+        if ((*keys)[position] && !has_gain(items[position])) {
+            lacking.insert(*(*keys)[position]);
+        }
+    }
+    std::vector<std::size_t> needing;
+    for (std::size_t position = 0U; position < items.size(); ++position) {
+        const auto& key = (*keys)[position];
+        if (key ? lacking.contains(*key) : !has_gain(items[position])) {
+            needing.push_back(items[position]);
+        }
+    }
+    return needing;
+}
+
+bool TaggerSession::measureBeforeWrite(std::vector<std::size_t> items) {
+    if (items.empty() || measuring_for_write_) {
+        return false;
+    }
+    measuring_for_write_ = true;
+    startReplayGainScan(std::move(items));
+    if (!replaygain_running_) {
+        measuring_for_write_ = false;
+        return false;
+    }
+    return true;
+}
+
 void TaggerSession::finishReplayGainScan() {
     replaygain_running_ = false;
     replaygain_progress_timer_.stop();
     const auto outcome = replaygain_watcher_.result();
+    const auto for_write = measuring_for_write_;
     if (!outcome || !outcome->proposals) {
         const auto message = outcome ? display_utf8(outcome->proposals.error().message)
                                      : QStringLiteral("The loudness scan returned no result");
         setStatus(QStringLiteral("No ReplayGain values staged · %1").arg(message));
         emit changed();
+        if (for_write) {
+            measuring_for_write_ = false;
+            emit gainsMeasured(false);
+        }
         return;
     }
     replaygain_retry_items_ = outcome->retry_items;
@@ -1523,6 +1968,10 @@ void TaggerSession::finishReplayGainScan() {
         showStickyStatus(QStringLiteral("No ReplayGain values staged · nothing measurable in "
                                         "the selection%1")
                              .arg(replayGainStatusLinks()));
+        if (for_write) {
+            measuring_for_write_ = false;
+            emit gainsMeasured(true);
+        }
         return;
     }
     setStatus(status_);
@@ -1626,7 +2075,8 @@ bool TaggerSession::layoutsAvailable() const {
 }
 
 bool TaggerSession::destinationsAvailable() const {
-    return !output_profiles_loading_ && !destination_catalog_.empty();
+    // A folder can always be chosen.
+    return !output_profiles_loading_;
 }
 
 bool TaggerSession::layoutReady() const {
@@ -1637,6 +2087,12 @@ bool TaggerSession::layoutReady() const {
 }
 
 bool TaggerSession::destinationReady() const {
+    if (move_target_ == MoveTarget::library) {
+        return static_cast<bool>(services_.library_roots);
+    }
+    if (move_target_ == MoveTarget::folder) {
+        return move_folder_.has_value();
+    }
     return editing_destination_id_.has_value() &&
            std::ranges::any_of(destination_catalog_, [this](const auto& entry) {
                return entry.id == *editing_destination_id_;
@@ -1716,10 +2172,19 @@ std::vector<TaggerSession::Choice> TaggerSession::layouts() const {
 
 std::vector<TaggerSession::Choice> TaggerSession::destinations() const {
     std::vector<Choice> choices;
-    choices.reserve(destination_catalog_.size());
+    choices.reserve(destination_catalog_.size() + 2U);
     for (const auto& saved : destination_catalog_) {
         choices.push_back(Choice{.id = QString::fromStdString(saved.id.to_string()),
                                  .name = display_utf8(saved.profile.name)});
+    }
+    if (services_.library_roots) {
+        choices.push_back(Choice{.id = QStringLiteral("library"),
+                                 .name = QStringLiteral("The library folder each is in")});
+    }
+    if (move_folder_) {
+        choices.push_back(
+            Choice{.id = QStringLiteral("folder"),
+                   .name = QString::fromStdString(core::display_raw_path(*move_folder_))});
     }
     return choices;
 }
@@ -1736,6 +2201,13 @@ int TaggerSession::layoutIndex() const {
 }
 
 int TaggerSession::destinationIndex() const {
+    const auto saved = static_cast<int>(destination_catalog_.size());
+    if (move_target_ == MoveTarget::library) {
+        return saved;
+    }
+    if (move_target_ == MoveTarget::folder) {
+        return saved + (services_.library_roots ? 1 : 0);
+    }
     if (!editing_destination_id_) {
         return -1;
     }
@@ -1757,13 +2229,65 @@ void TaggerSession::selectLayout(const int index) {
 }
 
 void TaggerSession::selectDestination(const int index) {
-    if (index < 0 || static_cast<std::size_t>(index) >= destination_catalog_.size()) {
+    const auto saved = static_cast<int>(destination_catalog_.size());
+    const auto library = services_.library_roots ? saved : -1;
+    const auto folder = move_folder_ ? saved + (services_.library_roots ? 1 : 0) : -1;
+    if (index >= 0 && index == library) {
+        move_target_ = MoveTarget::library;
+    } else if (index >= 0 && index == folder) {
+        move_target_ = MoveTarget::folder;
+    } else if (index < 0 || index >= saved) {
+        move_target_ = MoveTarget::saved;
         editing_destination_id_.reset();
     } else {
+        move_target_ = MoveTarget::saved;
         editing_destination_id_ = destination_catalog_[static_cast<std::size_t>(index)].id;
     }
     reconcileOutputProfileChoices();
     invalidateWritePlan();
+}
+
+void TaggerSession::chooseMoveFolder(std::string raw_path) {
+    if (raw_path.empty()) {
+        return;
+    }
+    move_folder_ = std::move(raw_path);
+    move_target_ = MoveTarget::folder;
+    rememberActionChoices();
+    reconcileOutputProfileChoices();
+    invalidateWritePlan();
+    emit outputProfilesChanged();
+}
+
+EngineFolderLister TaggerSession::moveFolderLister() const {
+    const auto& store = services_.output_profile_store;
+    const auto place =
+        std::ranges::find(store.places, store.destinations_key, &DestinationPlace::key);
+    return place == store.places.end() ? EngineFolderLister{} : place->folders;
+}
+
+std::string TaggerSession::moveFolderStart() const {
+    if (move_folder_) {
+        return *move_folder_;
+    }
+    const auto index = destinationIndex();
+    return index >= 0 && static_cast<std::size_t>(index) < destination_catalog_.size()
+               ? destination_catalog_[static_cast<std::size_t>(index)].profile.root_raw_path
+               : std::string{};
+}
+
+std::optional<operations::DestinationProfile> TaggerSession::moveDestination() const {
+    if (move_target_ == MoveTarget::folder && move_folder_) {
+        return folderDestination(*move_folder_);
+    }
+    if (move_target_ == MoveTarget::saved && editing_destination_id_) {
+        const auto found = std::ranges::find(destination_catalog_, *editing_destination_id_,
+                                             &persistence::SavedDestinationProfile::id);
+        if (found != destination_catalog_.end()) {
+            return found->profile;
+        }
+    }
+    return std::nullopt;
 }
 
 void TaggerSession::reloadOutputProfiles() { loadOutputProfiles(); }
@@ -1848,11 +2372,23 @@ void TaggerSession::rememberActionChoices() const {
     settings.setValue(QLatin1String(remembered_save_tags_key), save_tags_);
     settings.setValue(QLatin1String(remembered_rename_key), wants_rename_);
     settings.setValue(QLatin1String(remembered_move_key), wants_move_);
+    settings.setValue(QLatin1String(remembered_replaygain_key), replaygain_on_apply_);
+    settings.setValue(QLatin1String(remembered_skip_existing_gain_key), skip_existing_gain_);
     if (editing_output_layout_id_) {
         settings.setValue(QLatin1String(remembered_layout_key),
                           QString::fromStdString(editing_output_layout_id_->to_string()));
     }
     // Destinations are the engine's: one remembered for each.
+    const auto& engine = services_.output_profile_store.destinations_key;
+    settings.setValue(QLatin1String(remembered_move_target_prefix) + engine,
+                      move_target_ == MoveTarget::library  ? QStringLiteral("library")
+                      : move_target_ == MoveTarget::folder ? QStringLiteral("folder")
+                                                           : QStringLiteral("saved"));
+    if (move_folder_) {
+        settings.setValue(
+            QLatin1String(remembered_move_folder_prefix) + engine,
+            QByteArray{move_folder_->data(), static_cast<qsizetype>(move_folder_->size())});
+    }
     if (editing_destination_id_) {
         settings.setValue(QLatin1String(remembered_destination_prefix) +
                               services_.output_profile_store.destinations_key,
@@ -1871,6 +2407,23 @@ void TaggerSession::invalidateWritePlan() {
 }
 
 void TaggerSession::startWritePlan() {
+    // ADR-0257: never a plan from cached tags.
+    if (provisional_) {
+        setStatus(QStringLiteral("Save waits for the tags to be read"));
+        emit changed();
+        return;
+    }
+    // ReplayGain first, into the draft; then this again, writing it all.
+    if (replaygain_on_apply_ && !std::exchange(gains_measured_, false) && grid_model_ != nullptr) {
+        std::vector<std::size_t> all(grid_model_->selection().item_count());
+        std::iota(all.begin(), all.end(), std::size_t{0U});
+        if (auto items = itemsNeedingGain(std::move(all)); !items.empty()) {
+            apply_after_gains_ = measureBeforeWrite(std::move(items));
+            if (apply_after_gains_) {
+                return;
+            }
+        }
+    }
     const auto artwork_intents = artwork_ != nullptr
                                      ? artwork_->pendingIntents()
                                      : std::vector<metadata::ArtworkWritePlanIntent>{};
@@ -1909,19 +2462,33 @@ void TaggerSession::startWritePlan() {
             return;
         }
         output_layout = layout->profile;
-        if (operation_selection.move_files) {
-            if (!editing_destination_id_) {
-                refuse(QStringLiteral("Select a saved move destination before applying"));
+        if (operation_selection.move_files && move_target_ == MoveTarget::library) {
+            // One plan has one destination: the files' one library folder.
+            const auto roots =
+                services_.library_roots ? services_.library_roots() : std::vector<std::string>{};
+            std::optional<std::string> root;
+            const auto& selection = grid_model_->selection();
+            for (std::size_t item = 0U; item < selection.item_count(); ++item) {
+                const auto here = libraryFolderOf(selection.source(item).raw_path, roots);
+                if (!here) {
+                    refuse(QStringLiteral("A file is in no library folder; choose where to move "
+                                          "to"));
+                    return;
+                }
+                if (root && *root != *here) {
+                    refuse(QStringLiteral("These files are in more than one library folder; "
+                                          "choose where to move to"));
+                    return;
+                }
+                root = here;
+            }
+            destination = root ? std::optional{folderDestination(*root)} : std::nullopt;
+        } else if (operation_selection.move_files) {
+            destination = moveDestination();
+            if (!destination) {
+                refuse(QStringLiteral("Choose where to move to before applying"));
                 return;
             }
-            const auto selected_destination =
-                std::ranges::find(destination_catalog_, *editing_destination_id_,
-                                  &persistence::SavedDestinationProfile::id);
-            if (selected_destination == destination_catalog_.end()) {
-                refuse(QStringLiteral("The selected move destination is unavailable"));
-                return;
-            }
-            destination = selected_destination->profile;
         }
     }
     auto draft = save_tags_ ? grid_model_->patches() : metadata::StagedMetadataPatchSet{};
@@ -1939,120 +2506,30 @@ void TaggerSession::startWritePlan() {
     write_plan_job_generation_ = write_plan_generation_;
     write_plan_cancellation_.request_cancellation();
     write_plan_cancellation_ = core::CancellationSource{};
-    const auto selection = grid_model_->sharedSelection();
+    PreparationRequest request{
+        .selection = grid_model_->sharedSelection(),
+        .draft = std::move(draft),
+        .items = std::move(items),
+        .operations = operation_selection,
+        .layout = std::move(output_layout),
+        .destination = std::move(destination),
+        .options = writePlanOptions(),
+        .artwork = artwork_intents,
+        .cover_policy = cover_policy,
+        .tools = services_.tools,
+    };
     const auto cancellation = write_plan_cancellation_.token();
-    const QSettings stored;
-    const metadata::MetadataWritePlanOptions plan_options{
-        .sidecar_loudness =
-            stored.value(QLatin1String(SettingsKeys::replaygain_sidecar_only_key), false).toBool(),
-        .true_peak_loudness =
-            stored.value(QLatin1String(SettingsKeys::replaygain_true_peak_key), false).toBool()};
     write_plan_running_ = true;
     if (artwork_ != nullptr) {
         artwork_->setWorking(true);
     }
     setStatus(QStringLiteral("Checking files…"));
     emit changed();
-    write_plan_watcher_.setFuture(
-        QtConcurrent::run([selection, draft = std::move(draft), items = std::move(items),
-                           operation_selection, output_layout = std::move(output_layout),
-                           destination = std::move(destination), cancellation, plan_options,
-                           artwork_intents, cover_policy, tools = services_.tools]() mutable {
-            // WYSIWYG apply: the plan writes exactly the staged draft.
-            // Automatic scripts already staged their edits into the grid.
-            const auto metadata_context_change_count =
-                (operation_selection.save_tags ? draft.patch_count() : 0U) + artwork_intents.size();
-            std::optional<metadata::MetadataWritePlan> metadata_plan;
-            if (operation_selection.save_tags && !draft.empty()) {
-                auto revalidated = metadata::build_metadata_write_plan(
-                    *selection, draft, tools.access, cancellation, plan_options);
-                if (!revalidated) {
-                    return std::make_shared<WritePlanResult>(
-                        std::unexpected(std::move(revalidated.error())));
-                }
-                metadata_plan = std::move(*revalidated);
-            }
-
-            if (!artwork_intents.empty()) {
-                // ADR-0237: images of this computer handed over first when the
-                // engine writes; planned against the files where they are.
-                auto staged = stageReplacements(artwork_intents, tools, cancellation);
-                if (!staged) {
-                    return std::make_shared<WritePlanResult>(std::unexpected(staged.error()));
-                }
-                auto art = operations::plan_artwork_storage(*staged, cover_policy, cancellation,
-                                                            artworkFitterFor(tools), tools.artwork);
-                if (!art) {
-                    return std::make_shared<WritePlanResult>(std::unexpected(art.error()));
-                }
-                auto merged = metadata::merge_artwork_write_plan(
-                    metadata_plan.value_or(metadata::MetadataWritePlan{}), std::move(*art));
-                if (!merged) {
-                    return std::make_shared<WritePlanResult>(std::unexpected(merged.error()));
-                }
-                metadata_plan = std::move(*merged);
-            }
-            std::optional<operations::OutputPathPlan> path_plan;
-            std::optional<operations::OutputPathPreflight> path_preflight;
-            if (operation_selection.rename_files || operation_selection.move_files) {
-                const metadata::StagedMetadataPatchSet actual_source_tags;
-                const auto& naming_selection = *selection;
-                const auto& naming_context =
-                    operation_selection.save_tags ? draft : actual_source_tags;
-                auto documents = metadata::materialize_metadata_draft(
-                    naming_selection, naming_context, items, cancellation);
-                if (!documents) {
-                    return std::make_shared<WritePlanResult>(
-                        std::unexpected(std::move(documents.error())));
-                }
-                std::vector<operations::OutputPathPlanningItem> planning_items;
-                planning_items.reserve(items.size());
-                for (std::size_t position = 0U; position < items.size(); ++position) {
-                    const auto item_index = items[position];
-                    const auto& source = naming_selection.source(item_index);
-                    if (!source.source_revision) {
-                        return std::make_shared<WritePlanResult>(std::unexpected(core::Error{
-                            .code = core::ErrorCode::conflict,
-                            .message = "File path planning requires a fresh source revision "
-                                       "for every selected track",
-                            .context = {{.key = "item", .value = std::to_string(item_index)}},
-                        }));
-                    }
-                    planning_items.push_back(operations::OutputPathPlanningItem{
-                        .item_index = item_index,
-                        .source_raw_path = source.raw_path,
-                        .source_revision = *source.source_revision,
-                        .final_metadata = std::move((*documents)[position]),
-                    });
-                }
-                auto planned = operations::plan_output_paths(
-                    planning_items,
-                    operations::OutputPathOperationSelection{
-                        .rename_files = operation_selection.rename_files,
-                        .move_files = operation_selection.move_files,
-                    },
-                    std::move(*output_layout), std::move(destination), {}, cancellation);
-                if (!planned) {
-                    return std::make_shared<WritePlanResult>(
-                        std::unexpected(std::move(planned.error())));
-                }
-                path_plan = std::move(*planned);
-                if (path_plan->ready()) {
-                    auto checked =
-                        tools.preflight
-                            ? tools.preflight(*path_plan, cancellation)
-                            : operations::preflight_output_paths(*path_plan, cancellation);
-                    if (!checked) {
-                        return std::make_shared<WritePlanResult>(
-                            std::unexpected(std::move(checked.error())));
-                    }
-                    path_preflight = std::move(*checked);
-                }
-            }
-            return std::make_shared<WritePlanResult>(operations::assemble_preparation_plan(
-                operation_selection, metadata_context_change_count, std::move(metadata_plan),
-                std::move(path_plan), std::move(path_preflight)));
-        }));
+    write_plan_watcher_.setFuture(QtConcurrent::run([request = std::move(request),
+                                                     cancellation]() mutable {
+        // WYSIWYG apply: the plan writes exactly the staged draft.
+        return std::make_shared<WritePlanResult>(planPreparation(std::move(request), cancellation));
+    }));
 }
 
 void TaggerSession::finishWritePlan() {

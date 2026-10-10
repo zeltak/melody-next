@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "trackknife/discovery/upnp.hpp"
 #include "trackknife/output/upnp_audition.hpp"
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <thread>
 
 using namespace trackknife;
 namespace {
@@ -22,9 +26,15 @@ class Renderer final : public discovery::UpnpControl {
     int volume{100};
     std::vector<std::string> actions;
     discovery::UpnpValues report;
+    // A slow speaker: each action takes this long, as a real one on a busy
+    // network does.
+    std::chrono::milliseconds delay{0};
+    std::mutex mutex;
     core::Result<discovery::UpnpValues> action(const discovery::UpnpService&,
                                                const std::string& name,
                                                const discovery::UpnpValues& args) override {
+        std::this_thread::sleep_for(delay);
+        const std::lock_guard guard{mutex};
         actions.push_back(name);
         if (fail) {
             return std::unexpected(
@@ -77,6 +87,7 @@ class Renderer final : public discovery::UpnpControl {
         return discovery::UpnpValues{};
     }
     discovery::UpnpValues take_events(const std::string&) override {
+        const std::lock_guard guard{mutex};
         auto event = std::move(report);
         report.clear();
         return event;
@@ -96,6 +107,30 @@ int main() {
         discovery::parse_upnp_renderer(description, "http://192.0.2.2/device.xml", "192.0.2.1");
     require(parsed && parsed->udn == "uuid:speaker" && parsed->name == "Kitchen & dining",
             "description preserves UDN and decodes XML");
+    {
+        // A container bridge listed before the LAN, as on a NAS running
+        // Docker: discovery takes the interface the default route leaves by.
+        const std::vector<discovery::NetworkInterface> interfaces{
+            {.name = "lo", .address = 0x7f000001U, .usable = false},
+            {.name = "br-449dc1b8745a", .address = 0xac120001U, .usable = true},
+            {.name = "docker0", .address = 0xac110001U, .usable = false},
+            {.name = "enp0s13f0u1", .address = 0xc0a800c8U, .usable = true},
+        };
+        require(discovery::choose_upnp_interface(interfaces, 0xc0a800c8U) == "enp0s13f0u1",
+                "the default route's interface is chosen over a bridge listed first");
+        require(discovery::choose_upnp_interface(interfaces, std::nullopt) == "br-449dc1b8745a",
+                "without a route, the first usable interface");
+        require(discovery::choose_upnp_interface(
+                    {{.name = "en0", .address = 0xa9fe0102U, .usable = true},
+                     {.name = "en1", .address = 0xc0a80105U, .usable = true}},
+                    std::nullopt) == "en1",
+                "a link-local address is not a network");
+        require(discovery::choose_upnp_interface({}, 0xc0a800c8U).empty(),
+                "no interface, none chosen");
+    }
+    require(discovery::upnp_xml_escape("A\x01"
+                                       "B\tC<") == "AB\tC&lt;",
+            "control characters XML cannot carry are left out");
     require(parsed->manufacturer == "Sonos, Inc." && parsed->model == "Era 100",
             "description keeps renderer identity needed for compatibility limits");
     require(parsed->transport.control_url == "http://192.0.2.2/av/control" &&
@@ -164,7 +199,8 @@ int main() {
                                          .url = "http://engine/stream?ticket=one&occurrence=" +
                                                 std::to_string(++occurrence),
                                          .metadata = "didl",
-                                         .duration_ms = 180000};
+                                         .duration_ms = 180000,
+                                         .expires = {}};
         },
         false};
     require(!audition.online(), "restored output starts offline");
@@ -218,8 +254,8 @@ int main() {
     audition.poll();
     require(audition.snapshot().state == audio::LocalAuditionState::ended,
             "renderer end drives normal progression");
-    require(!audition.set_replay_gain_mode(audio::ReplayGainMode::track),
-            "ReplayGain explicitly unsupported");
+    require(audition.set_replay_gain_mode(audio::ReplayGainMode::track).has_value(),
+            "the engine's ReplayGain setting is taken, not refused");
     require(renderer->volume == 100 && audition.snapshot().effective_replay_gain_multiplier == 1.0F,
             "ReplayGain never changes device volume");
     require(audition.set_volume_percent(38).has_value() && renderer->volume == 38,
@@ -260,5 +296,90 @@ int main() {
     parsed->online = false;
     audition.update(*parsed);
     require(!audition.online(), "byebye marks output offline");
+    parsed->online = true;
+
+    // A track restored while paused is not sent: the speaker may be playing
+    // for someone else until it is played here.
+    {
+        auto busy = std::make_shared<Renderer>();
+        busy->uri = "http://elsewhere/other";
+        busy->state = "PLAYING";
+        output::UpnpAudition restored{
+            "uuid:speaker", busy,
+            [](const output::StreamRequest& source,
+               const discovery::UpnpRenderer&) -> core::Result<output::RendererTrack> {
+                return output::RendererTrack{.source = source,
+                                             .url = "http://engine/stream?ticket=restored",
+                                             .metadata = "didl",
+                                             .duration_ms = 180000,
+                                             .expires = {}};
+            },
+            false};
+        restored.update(*parsed);
+        require(restored.restore_paused("/track.flac", {}, {}, {}, 5000, {}).has_value() &&
+                    busy->actions.empty() && busy->state == "PLAYING",
+                "restoring sends the speaker nothing");
+        require(restored.snapshot().state == audio::LocalAuditionState::paused &&
+                    restored.snapshot().position_sample == 5000,
+                "a restored track waits paused where it was");
+        require(restored.play().has_value() &&
+                    busy->uri == "http://engine/stream?ticket=restored" &&
+                    busy->position == "0:00:05",
+                "played, it goes to the speaker where it was left");
+    }
+
+    // The engine never waits on the network: commands return at once and
+    // the worker talks to the speaker. A ticket about to expire is prepared
+    // again when playing resumes, since the speaker fetches again.
+    {
+        auto slow = std::make_shared<Renderer>();
+        slow->delay = std::chrono::milliseconds{300};
+        std::atomic<int> prepared{0};
+        output::UpnpAudition background{
+            "uuid:speaker", slow,
+            [&prepared](const output::StreamRequest& source,
+                        const discovery::UpnpRenderer&) -> core::Result<output::RendererTrack> {
+                const auto count = ++prepared;
+                return output::RendererTrack{
+                    .source = source,
+                    .url = "http://engine/stream?ticket=" + std::to_string(count),
+                    .metadata = "didl",
+                    .duration_ms = 180000,
+                    // The first goes stale a moment after it starts; the
+                    // renewed one lasts.
+                    .expires = count == 1 ? std::optional{std::chrono::system_clock::now() +
+                                                          std::chrono::minutes{10} +
+                                                          std::chrono::seconds{2}}
+                                          : std::nullopt};
+            },
+            true};
+        background.update(*parsed);
+        const auto started = std::chrono::steady_clock::now();
+        require(background.load_selected_and_play("/track.flac", {}, {}).has_value(),
+                "a load is accepted");
+        require(std::chrono::steady_clock::now() - started < std::chrono::milliseconds{100},
+                "a load does not wait on the renderer");
+        require(background.snapshot().raw_path == "/track.flac" &&
+                    background.snapshot().state == audio::LocalAuditionState::buffering,
+                "what was asked shows at once");
+        const auto eventually = [](const auto& condition) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+            while (!condition() && std::chrono::steady_clock::now() < until) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            }
+            return condition();
+        };
+        require(eventually([&] {
+                    return background.snapshot().state == audio::LocalAuditionState::playing;
+                }),
+                "the worker starts the speaker");
+        require(background.pause().has_value() && background.play().has_value(),
+                "pause and resume are accepted at once");
+        require(eventually([&] {
+                    const std::lock_guard guard{slow->mutex};
+                    return prepared.load() >= 2 && slow->uri == "http://engine/stream?ticket=2";
+                }),
+                "an expiring ticket is renewed before the speaker needs it");
+    }
     std::cout << "UPnP tests passed\n";
 }

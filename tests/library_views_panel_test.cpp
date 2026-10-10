@@ -102,6 +102,7 @@ class LibraryViewsPanelTest final : public QObject {
     void initTestCase();
     void init();
     void thePanelShowsAView();
+    void theFooterFollowsALaterPalette();
 };
 
 void LibraryViewsPanelTest::initTestCase() { QStandardPaths::setTestModeEnabled(true); }
@@ -188,12 +189,14 @@ void LibraryViewsPanelTest::thePanelShowsAView() {
     QTRY_COMPARE(model->rowCount(jazz_alpha), 1);
     const auto jazz_one = model->index(0, 0, jazz_alpha);
     std::vector<std::string> resolved;
-    panel.resolveEntries(LibraryBrowser::selectedEntries({jazz_one}),
-                         [&resolved](std::vector<std::string> paths) { resolved = std::move(paths); });
+    panel.resolveEntries(
+        LibraryBrowser::selectedEntries({jazz_one}),
+        [&resolved](std::vector<std::string> paths) { resolved = std::move(paths); });
     QTRY_COMPARE(resolved, std::vector<std::string>{jazz_and_rock});
     resolved.clear();
-    panel.resolveEntries(LibraryBrowser::selectedEntries({rock}),
-                         [&resolved](std::vector<std::string> paths) { resolved = std::move(paths); });
+    panel.resolveEntries(
+        LibraryBrowser::selectedEntries({rock}),
+        [&resolved](std::vector<std::string> paths) { resolved = std::move(paths); });
     QTRY_COMPARE(resolved.size(), std::size_t{2});
 
     // A query narrows the view before it is grouped.
@@ -208,10 +211,11 @@ void LibraryViewsPanelTest::thePanelShowsAView() {
     QTRY_COMPARE(rows(model).size(), 3);
 
     // A view saved in the editor is offered at once, in every panel.
-    LibraryViewDefinition by_album{.id = QStringLiteral("mine"),
-                                   .name = QStringLiteral("By album"),
-                                   .levels = {{.format = "%album%", .sort = {}, .descending = true}},
-                                   .builtin = false};
+    LibraryViewDefinition by_album{
+        .id = QStringLiteral("mine"),
+        .name = QStringLiteral("By album"),
+        .levels = {{.format = "%album%", .sort = {}, .descending = true}},
+        .builtin = false};
     QVERIFY(saveCustomLibraryViews({by_album}).has_value());
     const auto mine = choice->findData(QStringLiteral("mine"));
     QVERIFY(mine >= 0);
@@ -280,16 +284,81 @@ void LibraryViewsPanelTest::thePanelShowsAView() {
     QCOMPARE(row(model, QStringLiteral("one"), root).data(library_kind_role).toString(),
              QStringLiteral("album"));
     resolved.clear();
-    panel.resolveEntries(LibraryBrowser::selectedEntries({root}),
-                         [&resolved](std::vector<std::string> paths) { resolved = std::move(paths); });
+    panel.resolveEntries(
+        LibraryBrowser::selectedEntries({root}),
+        [&resolved](std::vector<std::string> paths) { resolved = std::move(paths); });
     QTRY_COMPARE(resolved.size(), std::size_t{3});
 
-    // Go to album finds the file under its artist, in the artist tree.
+    // ADR-0273: locating finds the file in the layout shown, and keeps it.
+    // In Folders, its folder under the root.
     panel.locatePath(jazz_and_rock, true);
-    QTRY_COMPARE(choice->currentData().toString(), default_library_view_id);
+    QTRY_COMPARE(tree->currentIndex().data().toString(), QStringLiteral("one"));
+    QCOMPARE(tree->currentIndex().parent().data().toString(), model->index(0, 0).data().toString());
+    QCOMPARE(choice->currentData().toString(), folders_library_view_id);
+    QCOMPARE(QSettings{}.value(QStringLiteral("library/view")).toString(), folders_library_view_id);
+
+    // In a view, through its levels as the engine found them: the artist at
+    // the level that names it, under the file's first genre.
+    choice->setCurrentIndex(genres);
+    emit choice->activated(genres);
+    QTRY_COMPARE(rows(model).size(), 3);
+    panel.locatePath(jazz_and_rock, false);
+    QTRY_COMPARE(tree->currentIndex().data().toString(), QStringLiteral("Alpha"));
+    QCOMPARE(tree->currentIndex().parent().data().toString(), QStringLiteral("Jazz"));
+    QCOMPARE(choice->currentData().toString(), QStringLiteral("genre-artist-album"));
+    // The album at the last level.
+    panel.locatePath(jazz_and_rock, true);
+    QTRY_COMPARE(tree->currentIndex().data().toString(), QStringLiteral("One"));
+    QCOMPARE(tree->currentIndex().parent().data().toString(), QStringLiteral("Alpha"));
+    QCOMPARE(tree->currentIndex().parent().parent().data().toString(), QStringLiteral("Jazz"));
+
+    // Recently added: the album, whichever is asked for.
+    const auto recent = choice->findData(recent_library_view_id);
+    choice->setCurrentIndex(recent);
+    emit choice->activated(recent);
+    QTRY_COMPARE(rows(model).size(), 2);
+    panel.locatePath(jazz_and_rock, false);
+    QTRY_VERIFY(tree->currentIndex().data().toString().contains(QStringLiteral("One")));
+    QCOMPARE(choice->currentData().toString(), recent_library_view_id);
+
+    // The artist tree as ever: the artist, the album under it.
+    const auto artists = choice->findData(default_library_view_id);
+    choice->setCurrentIndex(artists);
+    emit choice->activated(artists);
     QTRY_COMPARE(rows(model), (QStringList{QStringLiteral("Alpha"), QStringLiteral("Beta")}));
+    panel.locatePath(jazz_and_rock, true);
+    QTRY_COMPARE(tree->currentIndex().data().toString(), QStringLiteral("One"));
+    QCOMPARE(tree->currentIndex().parent().data().toString(), QStringLiteral("Alpha"));
 
     (*server)->stop();
+}
+
+// The desktop says dark only after the window is up -- through its portal,
+// a moment after start -- and the colour scheme follows with a palette of
+// its own. The footer's status took it on too; under a style sheet it had
+// kept the palette it was first shown with: dark text on the dark ground.
+void LibraryViewsPanelTest::theFooterFollowsALaterPalette() {
+    const auto before = QGuiApplication::palette();
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    QSettings{}.setValue(QLatin1String(SettingsDialog::library_engine_socket_key),
+                         directory.path() + QStringLiteral("/no-engine.sock"));
+    const std::filesystem::path unused{
+        (directory.path() + QStringLiteral("/unused.sqlite3")).toStdString()};
+    CatalogueSource catalogues{unused, CatalogueSource::Role::remote};
+    LocalLibraryPanel panel{catalogues};
+    panel.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&panel));
+    auto* status = panel.findChild<QLabel*>(QStringLiteral("local-library-status"));
+    QVERIFY(status != nullptr);
+
+    auto later = before;
+    const QColor quiet{0x9a, 0xa0, 0xa8};
+    later.setColor(QPalette::Window, QColor{0x1e, 0x1f, 0x22});
+    later.setColor(QPalette::PlaceholderText, quiet);
+    QGuiApplication::setPalette(later);
+    QTRY_COMPARE(status->palette().color(QPalette::PlaceholderText), quiet);
+    QGuiApplication::setPalette(before);
 }
 
 } // namespace trackknife::bench

@@ -2,8 +2,11 @@
 
 #include "bench/metadata_properties_dialog.hpp"
 
+#include "bench/apply_actions_popover.hpp"
 #include "bench/cover_review.hpp"
+#include "bench/engine_folder_dialog.hpp"
 #include "bench/file_scope_view.hpp"
+#include "bench/identify_albums_dialog.hpp"
 #include "bench/metadata_artwork_section.hpp"
 #include "bench/metadata_dialog_helpers.hpp"
 #include "bench/metadata_exact_value_dialog.hpp"
@@ -86,7 +89,9 @@ class EmptyStateListWidget final : public QListWidget {
     QString empty_state_;
 };
 
-[[nodiscard]] SettingsDialog::Page settingsPage(const TaggerSession::SettingsPage page) {
+} // namespace
+
+SettingsDialog::Page settingsPage(const TaggerSession::SettingsPage page) {
     switch (page) {
     case TaggerSession::SettingsPage::naming:
         return SettingsDialog::Page::naming;
@@ -97,8 +102,6 @@ class EmptyStateListWidget final : public QListWidget {
     }
     return SettingsDialog::Page::naming;
 }
-
-} // namespace
 
 MetadataPropertiesDialog::MetadataPropertiesDialog(
     const std::size_t requested_item_count, MetadataPropertiesSourceReader source_reader,
@@ -121,6 +124,8 @@ MetadataPropertiesDialog::MetadataPropertiesDialog(
               .layout_store = std::move(layout_store),
               .musicbrainz = std::move(musicbrainz),
               .tools = std::move(tools),
+              .library_roots = {},
+              .undo = {},
           },
           parent) {}
 
@@ -289,11 +294,7 @@ MetadataPropertiesDialog::MetadataPropertiesDialog(
     replaygain_grouping_ = new QComboBox(side_panel);
     replaygain_grouping_->setObjectName(QStringLiteral("bench-replaygain-grouping"));
     replaygain_grouping_->setAccessibleName(QStringLiteral("ReplayGain album grouping"));
-    replaygain_grouping_->addItem(QStringLiteral("Album by release"));
-    replaygain_grouping_->addItem(QStringLiteral("Album merging discs"));
-    replaygain_grouping_->addItem(QStringLiteral("Selection as one album"));
-    replaygain_grouping_->addItem(QStringLiteral("Track gains only"));
-    replaygain_grouping_->addItem(QStringLiteral("Group by expression"));
+    replaygain_grouping_->addItems(replayGainGroupingNames());
     replaygain_row->addWidget(replaygain_grouping_, 1);
     side_layout->addLayout(replaygain_row);
     replaygain_expression_ = new QLineEdit(side_panel);
@@ -353,6 +354,12 @@ MetadataPropertiesDialog::MetadataPropertiesDialog(
     loading_ = new QLabel(this);
     loading_->setObjectName(QStringLiteral("bench-metadata-loading"));
     loading_->setAlignment(Qt::AlignCenter);
+    // "Stop" while the tags are being read.
+    connect(loading_, &QLabel::linkActivated, this, [this](const QString& link) {
+        if (link == QStringLiteral("stop") && session_ != nullptr) {
+            session_->stopReading();
+        }
+    });
     root_layout_->addWidget(loading_, 1);
 
     grid_tools_ = new QWidget(this);
@@ -405,6 +412,13 @@ MetadataPropertiesDialog::MetadataPropertiesDialog(
                        "draft edits"));
     identify_button_->setEnabled(false);
     grid_tools_layout->addWidget(identify_button_);
+    identify_albums_button_ = new QPushButton(QStringLiteral("Identify albums…"), grid_tools_);
+    identify_albums_button_->setObjectName(QStringLiteral("bench-metadata-identify-albums"));
+    identify_albums_button_->setToolTip(
+        QStringLiteral("Every album open here at once: grouped, looked up on MusicBrainz in the "
+                       "background, and the clear matches staged by themselves"));
+    identify_albums_button_->setEnabled(false);
+    grid_tools_layout->addWidget(identify_albums_button_);
     auto* more_button = new QToolButton(grid_tools_);
     more_button->setObjectName(QStringLiteral("bench-metadata-more"));
     more_button->setText(QStringLiteral("More"));
@@ -492,6 +506,16 @@ MetadataPropertiesDialog::MetadataPropertiesDialog(
     connect(suggest_button_, &QPushButton::clicked, session_, &TaggerSession::startProposals);
     connect(identify_button_, &QPushButton::clicked, this,
             &MetadataPropertiesDialog::startIdentify);
+    connect(identify_albums_button_, &QPushButton::clicked, this, [this] {
+        if (identify_albums_dialog_) {
+            identify_albums_dialog_->raise();
+            identify_albums_dialog_->activateWindow();
+            return;
+        }
+        auto* dialog = new IdentifyAlbumsDialog(*session_, session_->services().musicbrainz, this);
+        identify_albums_dialog_ = dialog;
+        dialog->show();
+    });
     connect(replaygain_scan_button_, &QPushButton::clicked, this,
             [this] { session_->startReplayGainScan(); });
     connect(replaygain_grouping_, &QComboBox::currentIndexChanged, session_,
@@ -524,8 +548,8 @@ MetadataPropertiesDialog::MetadataPropertiesDialog(
     });
     connect(output_layout_combo_, &QComboBox::currentIndexChanged, session_,
             &TaggerSession::selectLayout);
-    connect(destination_combo_, &QComboBox::currentIndexChanged, session_,
-            &TaggerSession::selectDestination);
+    connect(destination_combo_, &QComboBox::currentIndexChanged, this,
+            [this](const int index) { destinationActivated(destination_combo_, index); });
     connect(save_tags_check_, &QCheckBox::toggled, session_, &TaggerSession::setSaveTags);
     connect(rename_files_check_, &QCheckBox::toggled, session_, &TaggerSession::setRenameFiles);
     connect(move_files_check_, &QCheckBox::toggled, session_, &TaggerSession::setMoveFiles);
@@ -624,6 +648,7 @@ void MetadataPropertiesDialog::sync() {
     summary_->setText(session.summary());
     read_only_->setTextFormat(session.statusRich() ? Qt::RichText : Qt::PlainText);
     read_only_->setText(session.status());
+    read_only_->setToolTip(session.unreadableDetails());
     technical_status_->setText(session.technical());
     technical_status_->setToolTip(session.technical());
     apply_summary_->setText(session.applySummary());
@@ -643,6 +668,8 @@ void MetadataPropertiesDialog::sync() {
     suggest_button_->setEnabled(session.canSuggest());
     suggest_action_->setEnabled(session.canSuggest());
     identify_button_->setEnabled(session.canIdentify());
+    identify_albums_button_->setEnabled(session.itemCount() > 0U &&
+                                        static_cast<bool>(session.services().musicbrainz.fetch));
     replaygain_scan_button_->setEnabled(session.canScanReplayGain());
     replaygain_provenance_button_->setEnabled(session.canShowProvenance());
     transformation_list_->setEnabled(!session.scriptsLoading() && !session.scripts().empty() &&
@@ -693,7 +720,10 @@ void MetadataPropertiesDialog::sync() {
         file_list_->setEnabled(session.fileListEnabled());
     }
     field_layout_remove_action_->setEnabled(!session.activeFieldLayout().isEmpty());
-    syncActionsPopover();
+    if (metadata_splitter_ != nullptr) {
+        // ADR-0261: Identify albums… is writing some of these files.
+        metadata_splitter_->setEnabled(!session.writingElsewhere());
+    }
 }
 
 void MetadataPropertiesDialog::rebuildScripts(const QString& selected) {
@@ -732,6 +762,8 @@ void MetadataPropertiesDialog::rebuildOutputProfiles() {
         for (const auto& destination : session_->destinations()) {
             destination_combo_->addItem(destination.name, destination.id);
         }
+        // ADR-0262: a folder that is not a saved destination.
+        destination_combo_->addItem(QStringLiteral("Choose folder…"), chooseFolderItem());
     }
     sync();
 }
@@ -836,6 +868,15 @@ void MetadataPropertiesDialog::buildGrid() {
     connect(grid_model, &QAbstractItemModel::rowsRemoved, this,
             &MetadataPropertiesDialog::refreshFileListScope);
     refreshFileListScope();
+    // Read again -- cached tags replaced by the files' own, files written
+    // elsewhere -- the model is rebuilt, and its fields with it: still only
+    // the file names here.
+    connect(grid_model, &QAbstractItemModel::modelReset, file_list_, [this, grid_model] {
+        file_list_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+        for (auto column = 1; column < grid_model->columnCount(); ++column) {
+            file_list_->hideColumn(column);
+        }
+    });
     connect(grid_model, &QAbstractItemModel::columnsInserted, file_list_,
             [this](const QModelIndex& parent, const int first, const int last) {
                 if (parent.isValid()) {
@@ -994,182 +1035,29 @@ void MetadataPropertiesDialog::refreshFileListScope() {
 // go to the session, preset lists select the saved profiles, and Manage
 // entries open the matching Settings page.
 void MetadataPropertiesDialog::showActionsPopover() {
-    // Built afresh each time from the controls that show the state, so it
-    // can never show anything else.
     delete actions_popover_.data();
-    actions_popover_ = new QFrame(this, Qt::Popup);
-    actions_popover_->setObjectName(QStringLiteral("bench-metadata-actions-popover"));
-    actions_popover_->setAttribute(Qt::WA_DeleteOnClose);
-    actions_popover_->setFrameShape(QFrame::StyledPanel);
-    auto* grid = new QGridLayout(actions_popover_);
-    grid->setContentsMargins(12, 12, 12, 12);
-    grid->setHorizontalSpacing(12);
-    grid->setVerticalSpacing(8);
-    const auto link = [this](const QString& text, const QString& object_name, auto&& activated) {
-        auto* label = new QLabel(QStringLiteral("<a href=\"#\">%1</a>").arg(text.toHtmlEscaped()),
-                                 actions_popover_);
-        label->setObjectName(object_name);
-        label->setTextInteractionFlags(Qt::LinksAccessibleByMouse | Qt::LinksAccessibleByKeyboard);
-        connect(label, &QLabel::linkActivated, this,
-                [this, activated = std::forward<decltype(activated)>(activated)] {
-                    actions_popover_->close();
-                    activated();
-                });
-        return label;
-    };
-    const auto copy_items = [](QComboBox* from, QComboBox* to) {
-        for (int index = 0; index < from->count(); ++index) {
-            to->addItem(from->itemText(index), from->itemData(index));
-        }
-        to->setCurrentIndex(from->currentIndex());
-        to->setPlaceholderText(from->placeholderText());
-        to->setToolTip(from->toolTip());
-    };
-    int row = 0;
-
-    actions_save_tags_ = new QCheckBox(QStringLiteral("Save tags"), actions_popover_);
-    actions_save_tags_->setObjectName(QStringLiteral("bench-actions-save-tags"));
-    connect(actions_save_tags_, &QCheckBox::clicked, this, [this](const bool checked) {
-        session_->setSaveTags(checked);
-        session_->rememberActionChoices();
-    });
-    grid->addWidget(actions_save_tags_, row++, 0, 1, 2);
-
-    actions_rename_ = new QCheckBox(QStringLiteral("Rename files"), actions_popover_);
-    actions_rename_->setObjectName(QStringLiteral("bench-actions-rename-files"));
-    connect(actions_rename_, &QCheckBox::clicked, session_, &TaggerSession::chooseRename);
-    actions_layout_ = new QComboBox(actions_popover_);
-    actions_layout_->setObjectName(QStringLiteral("bench-actions-layout"));
-    actions_layout_->setAccessibleName(QStringLiteral("Naming layout"));
-    copy_items(output_layout_combo_, actions_layout_);
-    connect(actions_layout_, &QComboBox::activated, this, [this](const int index) {
-        session_->selectLayout(index);
-        session_->rememberActionChoices();
-    });
-    grid->addWidget(actions_rename_, row, 0);
-    grid->addWidget(actions_layout_, row++, 1);
-
-    actions_move_ = new QCheckBox(QStringLiteral("Move files"), actions_popover_);
-    actions_move_->setObjectName(QStringLiteral("bench-actions-move-files"));
-    connect(actions_move_, &QCheckBox::clicked, session_, &TaggerSession::chooseMove);
-    actions_destination_ = new QComboBox(actions_popover_);
-    actions_destination_->setObjectName(QStringLiteral("bench-actions-destination"));
-    actions_destination_->setAccessibleName(QStringLiteral("Move destination"));
-    copy_items(destination_combo_, actions_destination_);
-    connect(actions_destination_, &QComboBox::activated, this, [this](const int index) {
-        session_->selectDestination(index);
-        session_->rememberActionChoices();
-    });
-    grid->addWidget(actions_move_, row, 0);
-    grid->addWidget(actions_destination_, row++, 1);
-    auto* manage = new QHBoxLayout;
-    manage->setSpacing(16);
-    manage->addWidget(link(QStringLiteral("Manage naming layouts…"),
-                           QStringLiteral("bench-actions-manage-layouts"),
-                           [this] { emit openSettingsRequested(SettingsDialog::Page::naming); }));
-    manage->addWidget(link(QStringLiteral("Manage move destinations…"),
-                           QStringLiteral("bench-actions-manage-destinations"),
-                           [this] { emit openDestinationsRequested(); }));
-    manage->addStretch(1);
-    grid->addLayout(manage, row++, 1);
-
-    auto* replaygain = new QLabel(QStringLiteral("ReplayGain"), actions_popover_);
-    actions_grouping_ = new QComboBox(actions_popover_);
-    actions_grouping_->setObjectName(QStringLiteral("bench-actions-replaygain-grouping"));
-    actions_grouping_->setAccessibleName(QStringLiteral("ReplayGain grouping"));
-    copy_items(replaygain_grouping_, actions_grouping_);
-    connect(actions_grouping_, &QComboBox::activated, this, [this](const int index) {
-        session_->setReplayGainGrouping(index);
-        if (index == 4) {
-            bool accepted = false;
-            const auto expression = QInputDialog::getText(
-                this, QStringLiteral("Group by expression"), QStringLiteral("tkfmt-1 expression:"),
-                QLineEdit::Normal, session_->replayGainExpression(), &accepted);
-            if (accepted) {
-                replaygain_expression_->setText(expression);
-            }
-        }
-    });
-    actions_scan_ = new QPushButton(QStringLiteral("Scan now"), actions_popover_);
-    actions_scan_->setObjectName(QStringLiteral("bench-actions-replaygain-scan"));
-    connect(actions_scan_, &QPushButton::clicked, this, [this] {
-        actions_popover_->close();
-        replaygain_scan_button_->click();
-    });
-    auto* replaygain_row = new QHBoxLayout;
-    replaygain_row->addWidget(actions_grouping_, 1);
-    replaygain_row->addWidget(actions_scan_);
-    grid->addWidget(replaygain, row, 0);
-    grid->addLayout(replaygain_row, row++, 1);
-    auto* replaygain_links = new QHBoxLayout;
-    replaygain_links->setSpacing(16);
-    auto* sources =
-        link(QStringLiteral("Loudness sources…"), QStringLiteral("bench-actions-loudness-sources"),
-             [this] { replaygain_provenance_button_->click(); });
-    sources->setEnabled(replaygain_provenance_button_->isEnabled());
-    replaygain_links->addWidget(sources);
-    replaygain_links->addWidget(link(
-        QStringLiteral("ReplayGain settings…"), QStringLiteral("bench-actions-replaygain-settings"),
-        [this] { emit openSettingsRequested(SettingsDialog::Page::replaygain); }));
-    replaygain_links->addStretch(1);
-    grid->addLayout(replaygain_links, row++, 1);
-
-    auto* scripts = new QLabel(QStringLiteral("Scripts"), actions_popover_);
-    grid->addWidget(scripts, row, 0, Qt::AlignTop);
-    auto* script_column = new QVBoxLayout;
-    for (int index = 0; index < transformation_list_->count(); ++index) {
-        auto* item = transformation_list_->item(index);
-        auto* choice = new QCheckBox(item->text(), actions_popover_);
-        choice->setObjectName(QStringLiteral("bench-actions-script-%1").arg(index));
-        choice->setChecked(item->checkState() == Qt::Checked);
-        connect(choice, &QCheckBox::toggled, this, [this, index](const bool checked) {
-            if (auto* target = transformation_list_->item(index)) {
-                target->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
-            }
-        });
-        script_column->addWidget(choice);
-    }
-    auto* editor =
-        link(QStringLiteral("Open script editor…"), QStringLiteral("bench-actions-script-editor"),
-             [this] { transform_button_->click(); });
-    editor->setEnabled(transform_button_->isEnabled());
-    script_column->addWidget(editor);
-    grid->addLayout(script_column, row++, 1);
-
-    syncActionsPopover();
-    actions_popover_->adjustSize();
-    // Above the button: the footer is at the window's foot. Below it when
-    // there is no room above, and never past the screen's edges.
-    const auto size = actions_popover_->sizeHint();
-    auto at = actions_button_->mapToGlobal(QPoint{0, -size.height()});
-    if (const auto* screen = actions_button_->screen()) {
-        const auto area = screen->availableGeometry();
-        if (at.y() < area.top()) {
-            at.setY(actions_button_->mapToGlobal(QPoint{0, actions_button_->height()}).y());
-        }
-        at.setX(
-            std::clamp(at.x(), area.left(), std::max(area.left(), area.right() - size.width())));
-    }
-    actions_popover_->move(at);
-    actions_popover_->show();
+    actions_popover_ = new ApplyActionsPopover(
+        *session_,
+        ApplyActionsPopover::Links{
+            .loudness_sources = [this] { replaygain_provenance_button_->click(); },
+            .script_editor = [this] { transform_button_->click(); },
+        },
+        this);
+    actions_popover_->showAt(actions_button_);
 }
 
-void MetadataPropertiesDialog::syncActionsPopover() {
-    if (actions_popover_ == nullptr || actions_save_tags_ == nullptr) {
+void MetadataPropertiesDialog::destinationActivated(QComboBox* combo, const int index) {
+    if (combo->itemData(index).toString() != chooseFolderItem()) {
+        session_->selectDestination(index);
+        session_->rememberActionChoices();
         return;
     }
-    const auto mirror = [](QCheckBox* shown, const QCheckBox* state) {
-        const QSignalBlocker blocker{shown};
-        shown->setChecked(state->isChecked());
-        shown->setEnabled(state->isEnabled());
-        shown->setToolTip(state->toolTip());
-    };
-    mirror(actions_save_tags_, save_tags_check_);
-    mirror(actions_rename_, rename_files_check_);
-    mirror(actions_move_, move_files_check_);
-    actions_layout_->setEnabled(output_layout_combo_->isEnabled());
-    actions_destination_->setEnabled(destination_combo_->isEnabled());
-    actions_scan_->setEnabled(replaygain_scan_button_->isEnabled());
+    // Shown as it was until a folder is chosen.
+    {
+        const QSignalBlocker blocker{combo};
+        combo->setCurrentIndex(session_->destinationIndex());
+    }
+    chooseMoveFolder(this, *session_);
 }
 
 void MetadataPropertiesDialog::startIdentify() {

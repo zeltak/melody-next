@@ -3,6 +3,7 @@
 #include "bench/catalogue_source.hpp"
 
 #include "trackknife/protocol/message.hpp"
+#include "trackknife/protocol/version.hpp"
 
 #include "bench/engine_launcher.hpp"
 #include "bench/settings_keys.hpp"
@@ -163,6 +164,18 @@ class DeferredCatalogue final : public engine::Catalogue {
                   const core::CancellationToken& cancellation) const override {
         return get().cached_tracks(raw_paths, cancellation);
     }
+    // Forwarded, so an engine elsewhere formats the lines where the tags are.
+    [[nodiscard]] core::Result<std::vector<FoundTrack>>
+    find(const query::CompiledTkq& compiled, const std::string& format, const std::size_t limit,
+         const core::CancellationToken& cancellation) const override {
+        return get().find(compiled, format, limit, cancellation);
+    }
+    // Forwarded, so an engine elsewhere chooses where its library is.
+    [[nodiscard]] core::Result<engine::DynamicSelected>
+    select(const engine::DynamicSelection& selection, const std::set<std::string>& exclude,
+           const core::CancellationToken& cancellation) const override {
+        return get().select(selection, exclude, cancellation);
+    }
     [[nodiscard]] core::Result<std::vector<std::array<std::int64_t, 6>>>
     history_facts(const std::vector<persistence::LibraryHistorySource>& sources,
                   const core::CancellationToken& cancellation) const override {
@@ -223,8 +236,7 @@ CatalogueSource::CatalogueSource(std::filesystem::path database, const Role role
         // ADR-0227: this computer's engine is always there -- the one the
         // workspace starts, or one named for development and tests.
         const auto running =
-            settings
-                .value(QLatin1String(SettingsKeys::library_local_engine_socket_key), QString{})
+            settings.value(QLatin1String(SettingsKeys::library_local_engine_socket_key), QString{})
                 .toString();
         if (!running.isEmpty()) {
             endpoint_ = protocol::Endpoint::parse(running.toStdString(), {});
@@ -325,6 +337,17 @@ std::shared_ptr<protocol::Client> CatalogueSource::Link::connectLocked() {
         if (info->contains("id") && info->at("id").is_string()) {
             id = QString::fromStdString(info->at("id").get<std::string>());
         }
+        // ADR-0260: an engine of another protocol is not used.
+        const auto peer = protocol::peer_version(*info);
+        if (protocol::compatibility(peer) == protocol::Compatibility::incompatible) {
+            made->close();
+            const std::lock_guard guard{mutex};
+            client.reset();
+            failure = QString::fromStdString(
+                protocol::compatibility_message(peer, name.toStdString(), "Trackknife"));
+            refused = true;
+            return nullptr;
+        }
     }
     const std::lock_guard guard{mutex};
     client = made;
@@ -408,10 +431,11 @@ QString CatalogueSource::describe() const {
     if (endpoint_) {
         // A refused password is its own case: the engine is there, and saying
         // "unreachable" would send someone looking at the network.
-        return link_->refused ? QObject::tr("Library unavailable: the engine at %1 refused the password")
-                              .arg(endpointText(*endpoint_))
-                        : QObject::tr("Library unavailable: the engine at %1 is unreachable")
-                              .arg(endpointText(*endpoint_));
+        return link_->refused
+                   ? QObject::tr("Library unavailable: the engine at %1 refused the password")
+                         .arg(endpointText(*endpoint_))
+                   : QObject::tr("Library unavailable: the engine at %1 is unreachable")
+                         .arg(endpointText(*endpoint_));
     }
     return QObject::tr("Library unavailable: %1").arg(failure);
 }

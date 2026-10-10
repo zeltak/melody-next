@@ -141,9 +141,11 @@ class PhoneAgentTest {
             assertTrue(engine.ask(11, "audition.queue_next", JSONObject().put("source", source).put("token", 7)).has("result"))
             assertTrue(engine.ask(12, "audition.volume", JSONObject().put("percent", 40)).has("result"))
             assertTrue(engine.ask(13, "audition.replay_gain", JSONObject().put("mode", 2)).has("result"))
+            // ADR-0270: fetched where this phone reached the engine, not
+            // where the engine says it is.
+            val reached = engine.endpoint.streamUrl(6604, "path=x&token=t")
             assertEquals(
-                listOf("load http://engine:6604/stream?path=x&token=t play=true at=1500",
-                    "next http://engine:6604/stream?path=x&token=t token=7", "volume 40", "gain 2"),
+                listOf("load $reached play=true at=1500", "next $reached token=7", "volume 40", "gain 2"),
                 player.asked.toList(),
             )
             // What it does not do is refused, not ignored: the engine hears why.
@@ -162,21 +164,32 @@ class PhoneAgentTest {
         }
     }
 
+    // ADR-0274: out of doors the phone locking drops the connection, with
+    // minutes buffered. Playing on, it comes back saying what it plays --
+    // the same process -- for the engine to take it as it is.
     @Test
-    fun whenTheEngineGoesItPausesAndComesBack() = runBlocking {
+    fun whenTheEngineGoesItPlaysOnAndComesBackWithWhatItPlays() = runBlocking {
         FakeEngine().use { engine ->
             val player = StandIn()
             val agent = PhoneAgent(scope, player, "Pixel", playerThread, retryMs = 100)
             agent.start(engine.endpoint)
             engine.accept()
-            engine.ask(1, "audition.load", JSONObject().put("source", JSONObject().put("url", "http://x/")).put("play", true))
+            val first = engine.registration.last().getJSONObject("params")
+            assertTrue("nothing held at first", !first.has("report"))
+            engine.ask(1, "audition.load", JSONObject().put("source", JSONObject().put("url", "http://x/")).put("play", true).put("position_ms", 1500))
+            // Where it will have got to by the time it is back.
+            player.position = 7_000
             engine.drop()
-            // What played belonged to that connection: paused, not playing on
-            // with nobody to follow it.
-            eventually("paused") { player.asked.contains("pause") }
-            eventually("connecting again") { agent.status.value is PhoneAgent.Status.Connecting }
+            delay(300)
+            assertTrue("played on, not paused", !player.asked.contains("pause") && player.playing)
+
             engine.accept()
             eventually("registered again") { agent.status.value is PhoneAgent.Status.Registered }
+            val again = engine.registration.last().getJSONObject("params")
+            assertEquals("the same process", first.getString("instance"), again.getString("instance"))
+            val holding = again.getJSONObject("report")
+            assertEquals("playing", 4, holding.getInt("state"))
+            assertEquals("where it got to", 7_000L, holding.getLong("position_sample"))
             agent.stop()
         }
     }
@@ -200,7 +213,7 @@ class PhoneAgentTest {
 
             engine.drop()
             eventually("waiting for the engine") { reconnecting.value }
-            assertTrue("what played belonged to that connection", player.asked.contains("pause"))
+            assertTrue("playing on from what it has", player.playing)
 
             engine.accept()
             eventually("back") { agent.status.value is PhoneAgent.Status.Registered }

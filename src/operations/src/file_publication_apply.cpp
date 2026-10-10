@@ -73,6 +73,25 @@ class SynchronizedJournal final : public FilePublicationJournal {
         return journal_.load_reversals(journal_id);
     }
 
+    [[nodiscard]] core::Result<std::optional<FilePublicationBackupRecord>>
+    load_backup(const core::StableId& id) const override {
+        std::scoped_lock lock{mutex_};
+        return journal_.load_backup(id);
+    }
+
+    [[nodiscard]] core::Result<std::vector<FilePublicationBackupRecord>>
+    load_backups() const override {
+        std::scoped_lock lock{mutex_};
+        return journal_.load_backups();
+    }
+
+    [[nodiscard]] core::Result<void>
+    transition_backup(const core::StableId& id,
+                      const FilePublicationBackupTransition& transition) override {
+        std::scoped_lock lock{mutex_};
+        return journal_.transition_backup(id, transition);
+    }
+
   private:
     FilePublicationJournal& journal_;
     mutable std::mutex mutex_;
@@ -574,8 +593,8 @@ core::Result<FilePublicationApplyResult> apply_preparation_publications(
 
             if (outcome && metadata_source != nullptr && !refreshed) {
                 auto committed =
-                    commit_flac_metadata_source(*metadata_source, synchronized_metadata_journal,
-                                                metadata_dependent_state_committer, cancellation);
+                    commit_metadata_source(*metadata_source, synchronized_metadata_journal,
+                                           metadata_dependent_state_committer, cancellation);
                 if (committed) {
                     source_result.published_metadata = committed->document;
                     source_result.metadata_commit = std::move(*committed);

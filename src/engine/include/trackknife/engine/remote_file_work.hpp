@@ -12,6 +12,7 @@
 #include "trackknife/operations/file_publication_apply.hpp"
 #include "trackknife/operations/metadata_apply.hpp"
 #include "trackknife/operations/preparation_plan.hpp"
+#include "trackknife/operations/undo.hpp"
 #include "trackknife/persistence/list_repository.hpp"
 #include "trackknife/protocol/client.hpp"
 
@@ -51,6 +52,11 @@ probe_local_technicals(const std::string& raw_path, const core::CancellationToke
 // Its own connection, made on first use and again after it drops, so a scan
 // never waits behind playback. Safe to use from several worker threads; every
 // call blocks, so none may run on a UI thread.
+// The most one loudness.scan or metadata.apply job carries, in bytes of JSON:
+// half the engine's line limit. A larger one goes as several jobs -- a scan
+// with each album whole in one.
+inline constexpr std::size_t remote_job_bytes = 512U * 1024U;
+
 class RemoteFileWork final {
   public:
     explicit RemoteFileWork(protocol::Endpoint endpoint);
@@ -98,6 +104,12 @@ class RemoteFileWork final {
             const operations::FilePublicationApplyProgressCallback& progress,
             const core::CancellationToken& cancellation);
 
+    // ADR-0263: writes undone there (operations.undo), newest first as given.
+    [[nodiscard]] core::Result<std::vector<operations::UndoOutcome>>
+    undo(std::span<const operations::UndoRequest> requests,
+         const operations::UndoProgressCallback& progress,
+         const core::CancellationToken& cancellation);
+
     // Stage 6: a library file as it is, fetched into `to` on this computer
     // (streams.ticket, then the stream port) -- what the converter reads
     // when it cannot reach the engine's files itself.
@@ -123,6 +135,25 @@ class RemoteFileWork final {
     [[nodiscard]] core::Result<void> set_rating_scale(const std::string& scale);
     // ADR-0245: the tag ratings are copied into; empty for none.
     [[nodiscard]] core::Result<void> set_rating_backup_tag(const std::string& tag);
+    // ADR-0263: how long the files writes replace are kept there for undo
+    // (backups.set_retention); 0 keeps none.
+    [[nodiscard]] core::Result<void> set_backup_retention(int days, int writes, int gigabytes);
+    // ADR-0266: where the engine keeps undo copies (backups.location):
+    // "engine", "folder" or "beside", the folder when one was chosen, and
+    // the folder they are kept in (empty: beside each file).
+    // ADR-0268: which of these files are not there, on the engine's machine
+    // (files.missing), asked in parts.
+    [[nodiscard]] core::Result<std::vector<std::string>>
+    missing(const std::vector<std::string>& paths);
+    struct BackupLocation {
+        std::string place;
+        std::string folder;
+        std::string kept_in;
+    };
+    [[nodiscard]] core::Result<BackupLocation> backup_location();
+    // Kept there from now on, and every undo copy there is moved there.
+    [[nodiscard]] core::Result<BackupLocation> set_backup_location(const std::string& place,
+                                                                   const std::string& folder);
 
     // Naming layouts handed over (layouts.put): each added or updated, and
     // only `removed` taken away. This engine's own move destinations, and
@@ -150,12 +181,20 @@ class RemoteFileWork final {
     // ADR-0237, which the tools then do themselves, as before. Asked once.
     [[nodiscard]] bool supported();
 
+    // The most one scan or apply job carries (remote_job_bytes unless told).
+    void limitJobs(std::size_t bytes) noexcept { job_bytes_ = bytes; }
+
   private:
     [[nodiscard]] core::Result<std::shared_ptr<protocol::Client>> client();
+    // ADR-0237: files read a batch to a request, in order, one result each.
+    [[nodiscard]] core::Result<std::vector<core::Result<metadata::LocalMetadataRead>>>
+    read_many(const std::vector<std::string>& raw_paths,
+              const core::CancellationToken& cancellation);
     [[nodiscard]] core::Result<protocol::Json>
     read_one(const std::string& raw_path, const core::CancellationToken& cancellation);
 
     protocol::Endpoint endpoint_;
+    std::size_t job_bytes_{remote_job_bytes};
     std::mutex mutex_;
     std::shared_ptr<protocol::Client> client_;
     std::optional<bool> supported_;

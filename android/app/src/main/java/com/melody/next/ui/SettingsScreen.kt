@@ -54,7 +54,8 @@ fun SettingsScreen(vm: MainViewModel, onChangeEngine: () -> Unit, onClose: () ->
                 },
                 supportingContent = {
                     Text(when (val state = connection) {
-                        is ConnectionState.Connected -> "Connected · ${state.endpoint}"
+                        is ConnectionState.Connected ->
+                            "Connected · ${state.endpoint}" + state.notice.let { if (it.isEmpty()) "" else "\n$it" }
                         is ConnectionState.Connecting -> "Connecting…"
                         is ConnectionState.Refused -> state.reason
                         ConnectionState.Idle -> "Not connected"
@@ -139,8 +140,33 @@ fun SettingsScreen(vm: MainViewModel, onChangeEngine: () -> Unit, onClose: () ->
                     trailingContent = { Switch(settings.dynamicColor, onCheckedChange = settings::updateDynamicColor) },
                 )
             }
+            Diagnostics()
         }
     }
+}
+
+/** What the app kept of its connections and playing, to send to whoever looks into a problem. */
+@Composable
+private fun Diagnostics() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    Section("Diagnostics")
+    ListItem(
+        headlineContent = { Text("Share the connection log") },
+        supportingContent = { Text("When the engine was reached and lost, and what played -- no passwords") },
+        modifier = Modifier.clickable {
+            // The newest of it: a shared text has a size limit.
+            val log = com.melody.next.Diagnostics.read().takeLast(200 * 1024)
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND)
+                .setType("text/plain")
+                .putExtra(android.content.Intent.EXTRA_SUBJECT, "Melody connection log")
+                .putExtra(android.content.Intent.EXTRA_TEXT, log)
+            context.startActivity(android.content.Intent.createChooser(send, "Share the connection log"))
+        },
+    )
+    ListItem(
+        headlineContent = { Text("Clear the connection log") },
+        modifier = Modifier.clickable { com.melody.next.Diagnostics.clear() },
+    )
 }
 
 /**
@@ -201,7 +227,7 @@ private fun OtherEngines(vm: MainViewModel) {
         value = typed,
         onValueChange = { typed = it },
         label = { Text("Add by address") },
-        placeholder = { Text("host or host:port") },
+        placeholder = { Text("host:port, or wss://your.server") },
         singleLine = true,
         keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = {
             com.melody.next.engine.Endpoint.parse(typed, password)?.let {

@@ -22,6 +22,7 @@ qt_add_library(
     workspace_ingest.cpp
     workspace_library.cpp
     workspace_lists.cpp
+    tab_store.cpp
     workspace_playback.cpp
     workspace_ratings.cpp
     workspace_texts.cpp
@@ -34,6 +35,9 @@ qt_add_library(
     convert_job.cpp
     convert_job.hpp
     field_filter.cpp
+    album_batch_session.cpp
+    album_batch_write.cpp
+    album_lookup_queue.cpp
     identify_session.cpp
     identify_session.hpp
     field_filter.hpp
@@ -72,9 +76,11 @@ qt_add_library(
     playlist_transfer.cpp
     playlist_transfer.hpp
     profiles_session.cpp
+    undo_location_session.cpp
     shortcut_session.cpp
     shortcut_session.hpp
     profiles_session.hpp
+    undo_location_session.hpp
     search_session.cpp
     search_session.hpp
     settings_session.cpp
@@ -83,6 +89,8 @@ qt_add_library(
     sources.hpp
     startup.cpp
     startup.hpp
+    preparation_planning.cpp
+    preparation_planning.hpp
     tagger_session.cpp
     tagger_session.hpp
     ../bench/artwork_fitting.cpp

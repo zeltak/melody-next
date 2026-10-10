@@ -82,6 +82,9 @@ class EnginePlayback final : public QObject {
         // Changes whenever the engine's queue, modes or asks change --
         // including when this client was not the one that changed them.
         quint64 queue_revision{0};
+        // ADR-0269: moves whenever the engine's Up Next does; 0 from an
+        // engine that does not say.
+        quint64 requests_revision{0};
         // The entry the engine's consume mode last dropped, so this client
         // can drop the same row from the list it came from.
         QString consumed;
@@ -146,7 +149,24 @@ class EnginePlayback final : public QObject {
         QString rule_id;
         QString name;
         QString query;
+        // ADR-0258: how the rule selects.
+        QString group_by{};
+        int groups{0};
+        int per_group{0};
+        int limit{100};
+        bool shuffle{false};
+        // Whether the engine told how it selects; one older than ADR-0258
+        // keeps only the query.
+        bool selection_told{true};
         friend bool operator==(const Continuation&, const Continuation&) = default;
+        // The rule the window has against what `kept` tells the engine
+        // keeps: the same, as far as the engine tells.
+        [[nodiscard]] bool sameAs(const Continuation& kept) const {
+            return rule_id == kept.rule_id && name == kept.name && query == kept.query &&
+                   (!kept.selection_told || (group_by == kept.group_by && groups == kept.groups &&
+                                             per_group == kept.per_group && limit == kept.limit &&
+                                             shuffle == kept.shuffle));
+        }
     };
     [[nodiscard]] const QHash<QString, Continuation>& continuations() const noexcept {
         return continuations_;
@@ -166,6 +186,11 @@ class EnginePlayback final : public QObject {
     void play(const std::vector<LocalTrackRow>& rows,
               const std::vector<std::optional<formats::ReplayGainInfo>>& overrides,
               const core::StableId& entry, const QString& list = {});
+
+    // ADR-0256: plays `entry` of the engine's own copy of `list`, which
+    // becomes the queue -- nothing of the list is sent. The list's edits must
+    // have reached the engine first (EngineListSync::sendNow).
+    void playList(const QString& list, const core::StableId& entry);
 
     // The up-next order, stated rather than rebuilt one request at a time.
     // Entries not already in the engine's queue are added to it: an engine
@@ -200,8 +225,15 @@ class EnginePlayback final : public QObject {
     // Any other request -- one whose answer is not a state document: sent in
     // order with the commands, and answered on this object's thread. With no
     // connection it is answered at once, with the error.
+    // `settles`: a write to what the engine plays -- ADR-0256's list edits,
+    // which the queue follows -- counted as settling() while on its way, like
+    // a command, so a state from before it is not taken for the engine's
+    // answer to it.
+    // ADR-0269: an entry as the engine holds it (playback.requests with
+    // details), as a row; none when it names no file.
+    [[nodiscard]] static std::optional<LocalTrackRow> rowOfEntry(const protocol::Json& entry);
     using Answer = std::function<void(core::Result<protocol::Json>)>;
-    void request(const QString& method, protocol::Json params, Answer answer);
+    void request(const QString& method, protocol::Json params, Answer answer, bool settles = false);
 
     // For quitting: stops reconnecting, and never starts the engine again.
     // Its reconnect timer otherwise revives an engine that stopped -- the
@@ -220,12 +252,20 @@ class EnginePlayback final : public QObject {
     // The engine refused a command, with its reason -- a track the output
     // could not play, say. Emitted on this object's thread.
     void failed(const QString& message);
+    // ADR-0260: what the engine's version means for working with it -- it is
+    // older, or speaks another protocol and is not used -- said once until
+    // it changes. Emitted on this object's thread.
+    void versionNotice(const QString& message);
     // A rating was set on this engine, by any client: a track's or an
     // album's, by its rating hash. Emitted on this object's thread.
     void ratingChanged(const QString& hash, unsigned rating);
     // ADR-0233: a list on this engine was written or deleted, by any client
     // -- this one included. Emitted on this object's thread.
     void listChanged(const QString& id, quint64 revision, bool deleted);
+    // What changed in its library (catalogue.changed): the paths re-read or
+    // dropped, the albums they touched, or everything.
+    void catalogueChanged(const std::vector<std::string>& paths,
+                          const std::vector<std::string>& albums, bool everything);
     // The lists that continue changed, by any client (ADR-0253).
     void continuationsChanged();
 
@@ -276,6 +316,8 @@ class EnginePlayback final : public QObject {
     // stays silent when nothing is.
     QTimer* position_timer_{nullptr};
     mutable std::mutex mutex_;
+    // The last versionNotice, so that it is said once.
+    std::string version_said_;
     State state_;
     // The engine's sequence of the state adopted last. States come on two
     // threads -- events, and the answers to commands -- so one made earlier

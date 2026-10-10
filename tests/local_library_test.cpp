@@ -6,6 +6,7 @@
 #include "bench/dynamic_playlist_service.hpp"
 #include "bench/local_library_panel.hpp"
 #include "bench/search_dialog.hpp"
+#include "drag_position.hpp"
 #include "test_engine.hpp"
 #include "trackknife/core/sha256.hpp"
 #include "trackknife/metadata/local_reader.hpp"
@@ -117,7 +118,8 @@ bool triggerLibraryAction(LocalLibraryPanel* panel, const QModelIndex& index, in
 }
 
 bool dropFiles(QTableView* view, const QMimeData* mime, const QPoint& position) {
-    QDragEnterEvent enter{position, Qt::CopyAction, mime, Qt::LeftButton, Qt::NoModifier};
+    QDragEnterEvent enter{dragPosition(position), Qt::CopyAction, mime, Qt::LeftButton,
+                          Qt::NoModifier};
     QApplication::sendEvent(view->viewport(), &enter);
     if (!enter.isAccepted()) {
         return false;
@@ -656,9 +658,10 @@ void LocalLibraryTest::denseMetadataDoesNotProduceFalseMissingMatches() {
     // Migrations unwind strictly in reverse order down to the truncation-era
     // schema before the app re-migrates forward.
     for (const auto* name :
-         {"0049_operation_journal_backup_identity.down", "0047_list_engine.down",
-          "0046_engine_lists.down", "0045_library_revision.down", "0044_library_added.down",
-          "0043_remote_list_documents.down", "0042_engine_state.down",
+         {"0052_file_publication_backups.down", "0051_engine_list_drafts.down",
+          "0050_engine_list_item_details.down", "0049_operation_journal_backup_identity.down",
+          "0047_list_engine.down", "0046_engine_lists.down", "0045_library_revision.down",
+          "0044_library_added.down", "0043_remote_list_documents.down", "0042_engine_state.down",
           "0041_list_entry_identity.down", "0040_local_listening_occurrences.down",
           "0039_local_listening_history.down", "0038_folder_image_journal.down",
           "0037_mpd_list_documents.down", "0036_server_search_scope.down",
@@ -917,13 +920,16 @@ void LocalLibraryTest::migrationRoundTrip() {
     {
         auto repository = persistence::ListRepository::open(database);
         QVERIFY(repository);
-        QCOMPARE(*repository->schema_version(), 49U);
+        QCOMPARE(*repository->schema_version(), 53U);
     }
     sqlite3* db = nullptr;
     QCOMPARE(sqlite3_open(database.c_str(), &db), SQLITE_OK);
     // Down in reverse order, up in forward order: the ADR-0150 field table
     // references the track table, so 0030 must unwind before 0028.
-    for (const auto* name : {"0049_operation_journal_backup_identity.down",
+    for (const auto* name : {"0052_file_publication_backups.down",
+                             "0051_engine_list_drafts.down",
+                             "0050_engine_list_item_details.down",
+                             "0049_operation_journal_backup_identity.down",
                              "0047_list_engine.down",
                              "0046_engine_lists.down",
                              "0045_library_revision.down",
@@ -987,7 +993,7 @@ void LocalLibraryTest::migrationRoundTrip() {
     QCOMPARE(sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr), SQLITE_OK);
     sqlite3_close(db);
     QCOMPARE(repository->load_saved_searches()->size(), 1U);
-    QCOMPARE(*repository->schema_version(), 49U);
+    QCOMPARE(*repository->schema_version(), 53U);
     QVERIFY(repository->save_local_resume(std::string(64U, 'a'), 500, 1'000));
     QCOMPARE(sqlite3_open(database.c_str(), &db), SQLITE_OK);
     QFile history_downgrade{
@@ -1059,10 +1065,12 @@ void LocalLibraryTest::journalRebuildsKeepTheirEvidence() {
                   "completed_at_unix_seconds, updated_at_unix_seconds) VALUES('j1', 0, 1, 1);"),
              SQLITE_OK);
     for (const auto* name :
-         {"0049_operation_journal_backup_identity", "0047_list_engine", "0046_engine_lists",
-          "0045_library_revision", "0044_library_added", "0043_remote_list_documents",
-          "0042_engine_state", "0041_list_entry_identity", "0040_local_listening_occurrences",
-          "0039_local_listening_history", "0038_folder_image_journal"}) {
+         {"0052_file_publication_backups", "0051_engine_list_drafts",
+          "0050_engine_list_item_details", "0049_operation_journal_backup_identity",
+          "0047_list_engine", "0046_engine_lists", "0045_library_revision", "0044_library_added",
+          "0043_remote_list_documents", "0042_engine_state", "0041_list_entry_identity",
+          "0040_local_listening_occurrences", "0039_local_listening_history",
+          "0038_folder_image_journal"}) {
         QFile downgrade{
             QStringLiteral(TRACKKNIFE_MIGRATION_DIR "/%1.down.sql").arg(QLatin1String{name})};
         QVERIFY(downgrade.open(QIODevice::ReadOnly));
@@ -1075,7 +1083,7 @@ void LocalLibraryTest::journalRebuildsKeepTheirEvidence() {
     // Schema 38 runs again: the rebuild that emptied the child tables.
     auto repository = persistence::ListRepository::open(database);
     QVERIFY(repository.has_value());
-    QCOMPARE(*repository->schema_version(), 49U);
+    QCOMPARE(*repository->schema_version(), 53U);
     QCOMPARE(sqlite3_open(database.c_str(), &db), SQLITE_OK);
     const auto count = [&db](const char* table) {
         sqlite3_stmt* statement = nullptr;
@@ -1288,7 +1296,8 @@ void LocalLibraryTest::cachedSearchTabsLoadCovers() {
         auto* view = qobject_cast<QTableView*>(tabs->currentWidget());
         QVERIFY(view);
         auto* model = qobject_cast<LocalListModel*>(view->model());
-        QVERIFY(model && model->rowCount() == 2);
+        // Open at once, filled as the results come (ADR-0140).
+        QTRY_VERIFY(model && model->rowCount() == 2);
         QVERIFY(model->rows()[0].probed && model->rows()[0].technicals);
         QVERIFY(!model->rows()[0].source_revision);
         QCOMPARE(model->rows()[0].metadata.fields.front().provenance,
@@ -1339,12 +1348,12 @@ void LocalLibraryTest::dynamicRulesFollowIndexedTagsAndKeepRawPaths() {
     QVERIFY(library->scan({}, progress));
     DynamicPlaylistDialog dialog{QStringLiteral("local"),
                                  {},
-                                 [database](const EngineKey&, query::CompiledTkq compiled,
+                                 [database](const EngineKey&, engine::DynamicSelection selection,
                                             core::CancellationToken cancellation,
                                             DynamicPlaylistService::Completion completion) {
                                      const engine::LocalCatalogue catalogue{database};
                                      completion(
-                                         queryDynamicLibrary(catalogue, compiled, cancellation));
+                                         selectDynamicLibrary(catalogue, selection, cancellation));
                                  }};
     dialog.setAttribute(Qt::WA_DeleteOnClose, false);
     // ADR-0226: the catalogue is an engine's, here one on this database.
@@ -1390,10 +1399,10 @@ void LocalLibraryTest::dynamicRulesFollowIndexedTagsAndKeepRawPaths() {
     QVERIFY(snapshot.front().probed);
     auto cancelled = core::CancellationSource{};
     cancelled.request_cancellation();
-    const auto compiled = query::compile_tkq("ALL");
-    QVERIFY(compiled);
     const engine::LocalCatalogue catalogue{database};
-    QVERIFY(!queryDynamicLibrary(catalogue, *compiled, cancelled.token()));
+    engine::DynamicSelection everything;
+    everything.query = "ALL";
+    QVERIFY(!selectDynamicLibrary(catalogue, everything, cancelled.token()));
 }
 
 void LocalLibraryTest::databaseSearchOpensCachedRowsWithoutFiles() {
@@ -1437,13 +1446,23 @@ void LocalLibraryTest::databaseSearchOpensCachedRowsWithoutFiles() {
     mode->setChecked(true);
     input->setText(QStringLiteral("codec IS flac SORT DESCENDING BY %title%"));
     QTRY_COMPARE(results->count(), 2);
+    // A query's matches are shown as lines; their rows are read when opened.
     open->click();
-    QCOMPARE(requested.size(), 1);
+    QTRY_COMPARE(requested.size(), 1);
     const auto rows = requested.takeFirst().at(1).value<std::vector<LocalTrackRow>>();
     QCOMPARE(rows.size(), 2U);
     QCOMPARE(rows[0].raw_path, beta);
     QCOMPARE(rows[1].raw_path, alpha);
     QCOMPARE(rows[1].title, std::string{"Alpha"});
+    // The lines the library formatted read as the window formats its rows.
+    for (int index = 0; index < 2; ++index) {
+        const auto& row = rows[static_cast<std::size_t>(index)];
+        QCOMPARE(results->item(index)->text(),
+                 QString::fromStdString(
+                     (row.artist.empty() ? std::string{"Unknown artist"} : row.artist) + " — " +
+                     (row.track_number.empty() ? std::string{} : row.track_number + ". ") +
+                     row.title));
+    }
     QCOMPARE(rows[1].metadata.first_effective_value("albumartist"),
              std::optional<std::string>{"Björk"});
     QCOMPARE(rows[1].metadata.fields.front().provenance,

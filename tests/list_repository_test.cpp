@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+#include "trackknife/persistence/list_edits.hpp"
 #include "trackknife/persistence/list_repository.hpp"
 #include <sqlite3.h>
 #include <unistd.h>
@@ -332,7 +333,7 @@ void list_documents_round_trip_transactionally() {
         }
         require(opened.has_value(), "list repository must create and migrate a new database");
         auto repository = std::move(*opened);
-        require(repository.schema_version() == 49U, "state repository schema must be explicit");
+        require(repository.schema_version() == 53U, "state repository schema must be explicit");
         require(repository.replace_all(expected).has_value(),
                 "valid list documents must commit in one transaction");
         require(repository.load_all() == expected,
@@ -719,7 +720,7 @@ void output_layout_and_destination_profiles_round_trip_transactionally() {
         auto opened = persistence::ListRepository::open(database_path);
         require(opened.has_value(), "output-profile repository must open");
         auto repository = std::move(*opened);
-        require(repository.schema_version() == 49U,
+        require(repository.schema_version() == 53U,
                 "output profiles must survive the explicit schema-18 migration");
         require(repository.upsert_output_layout_profile(expected_layout).has_value() &&
                     repository.upsert_destination_profile(expected_destination).has_value(),
@@ -1455,7 +1456,7 @@ void committed_source_relocation_rekeys_every_occurrence_and_stale_snapshot() {
                 repository.load_all() == loaded,
             "a persisted target collision must reject the complete relocation transaction");
     auto reopened = persistence::ListRepository::open(database_path);
-    require(reopened && reopened->schema_version() == 49U && reopened->load_all() == loaded,
+    require(reopened && reopened->schema_version() == 53U && reopened->load_all() == loaded,
             "relocation evidence and resolved paths must survive reopening schema 18");
 
     cleanup();
@@ -1914,7 +1915,13 @@ void engine_lists_round_trip_and_refuse_stale_writes() {
         .duration_ms = 1'000,
         .title = "One",
         .artist = "Someone",
-        .album = "Album"};
+        .album = "Album",
+        .album_artist = "Various",
+        .date = "1999",
+        .replay_gain = persistence::ListItemReplayGain{.track_gain_db = -7.25,
+                                                       .track_peak = 0.98,
+                                                       .album_gain_db = std::nullopt,
+                                                       .album_peak = std::nullopt}};
     persistence::EngineListItem plain{.entry_id = StableId::random(),
                                       .raw_path = "/music/Album/02.flac",
                                       .logical_reference = std::nullopt,
@@ -1923,7 +1930,10 @@ void engine_lists_round_trip_and_refuse_stale_writes() {
                                       .duration_ms = std::nullopt,
                                       .title = {},
                                       .artist = {},
-                                      .album = {}};
+                                      .album = {},
+                                      .album_artist = {},
+                                      .date = {},
+                                      .replay_gain = std::nullopt};
     const auto id = StableId::random();
     auto created = repository.save_engine_list(id, "Untitled", persistence::EngineListKind::working,
                                                {cue, plain}, 0U, 1'000);
@@ -2005,6 +2015,158 @@ void engine_lists_round_trip_and_refuse_stale_writes() {
     std::filesystem::remove(path);
 }
 
+// ADR-0256: a list is changed by edits, in one transaction, against the
+// revision it was read at.
+void engine_lists_are_edited_in_place() {
+    namespace persistence = trackknife::persistence;
+    using persistence::ListEdit;
+    using trackknife::core::ErrorCode;
+    using trackknife::core::StableId;
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("trackknife-engine-list-edits-" + std::to_string(::getpid()) + ".sqlite3");
+    std::filesystem::remove(path);
+    auto opened = persistence::ListRepository::open(path);
+    require(opened.has_value(), "the repository opens");
+    auto& repository = *opened;
+    std::vector<persistence::EngineListItem> items;
+    for (int index = 0; index < 5; ++index) {
+        persistence::EngineListItem made;
+        made.raw_path = "/music/" + std::to_string(index) + ".flac";
+        made.title = "Track " + std::to_string(index);
+        items.push_back(std::move(made));
+    }
+    const auto id = StableId::random();
+    require(repository
+                .save_engine_list(id, "Edited", persistence::EngineListKind::working, items, 0U, 1)
+                .has_value(),
+            "a list to edit");
+
+    // Taken from the middle: the rest keep their places.
+    auto removed = repository.edit_engine_list(id, 1U,
+                                               {ListEdit{.kind = ListEdit::Kind::remove,
+                                                         .entries = {items[2].entry_id},
+                                                         .items = {},
+                                                         .after = {}}},
+                                               2);
+    const std::vector expected_after_removal{items[0], items[1], items[3], items[4]};
+    require(removed && removed->summary.revision == 2U && removed->items == expected_after_removal,
+            "a removal answers the list as it is, at the next revision");
+    require((*repository.load_engine_list(id))->items == expected_after_removal,
+            "and is what is stored");
+
+    // A new one at the start, and the last moved after the first.
+    persistence::EngineListItem fresh;
+    fresh.raw_path = "/music/new.flac";
+    fresh.album_artist = "Someone";
+    auto changed = repository.edit_engine_list(
+        id, 2U,
+        {ListEdit{.kind = ListEdit::Kind::insert, .entries = {}, .items = {fresh}, .after = {}},
+         ListEdit{.kind = ListEdit::Kind::move,
+                  .entries = {items[4].entry_id},
+                  .items = {},
+                  .after = fresh.entry_id}},
+        3);
+    const std::vector expected{fresh, items[4], items[0], items[1], items[3]};
+    require(changed && changed->summary.revision == 3U && changed->items == expected &&
+                (*repository.load_engine_list(id))->items == expected,
+            "inserts and moves apply in order");
+    // After a gap left by the removal, positions are still in order: a
+    // removal and an insert in the same list read back as written.
+    auto after_gap = repository.edit_engine_list(id, 3U,
+                                                 {ListEdit{.kind = ListEdit::Kind::remove,
+                                                           .entries = {items[0].entry_id},
+                                                           .items = {},
+                                                           .after = {}},
+                                                  ListEdit{.kind = ListEdit::Kind::move,
+                                                           .entries = {fresh.entry_id},
+                                                           .items = {},
+                                                           .after = items[3].entry_id}},
+                                                 4);
+    require(after_gap && (*repository.load_engine_list(id))->items ==
+                             std::vector{items[4], items[1], items[3], fresh},
+            "a mixed edit is stored in its order");
+
+    auto stale = repository.edit_engine_list(id, 2U,
+                                             {ListEdit{.kind = ListEdit::Kind::remove,
+                                                       .entries = {items[1].entry_id},
+                                                       .items = {},
+                                                       .after = {}}},
+                                             5);
+    require(!stale && stale.error().code == ErrorCode::conflict,
+            "an edit against an old revision is a conflict");
+
+    // Appends, in two inserts chained one after the other: added where the
+    // list ends, the rest untouched.
+    persistence::EngineListItem tail_one;
+    tail_one.raw_path = "/music/tail-1.flac";
+    persistence::EngineListItem tail_two;
+    tail_two.raw_path = "/music/tail-2.flac";
+    persistence::EngineListItem tail_three;
+    tail_three.raw_path = "/music/tail-3.flac";
+    auto appended = repository.edit_engine_list(id, 4U,
+                                                {ListEdit{.kind = ListEdit::Kind::insert,
+                                                          .entries = {},
+                                                          .items = {tail_one, tail_two},
+                                                          .after = fresh.entry_id},
+                                                 ListEdit{.kind = ListEdit::Kind::insert,
+                                                          .entries = {},
+                                                          .items = {tail_three},
+                                                          .after = tail_two.entry_id}},
+                                                5);
+    const std::vector after_appends{items[4], items[1], items[3],  fresh,
+                                    tail_one, tail_two, tail_three};
+    require(appended && appended->items == after_appends &&
+                (*repository.load_engine_list(id))->items == after_appends,
+            "appends land at the end");
+    auto quiet = repository.edit_engine_list(id, 5U,
+                                             {ListEdit{.kind = ListEdit::Kind::insert,
+                                                       .entries = {},
+                                                       .items = {tail_one},
+                                                       .after = tail_three.entry_id}},
+                                             6, std::nullopt, std::nullopt, false);
+    require(!quiet && (*repository.load_engine_list(id))->items == after_appends,
+            "an append of an entry already held is refused, nothing written");
+    persistence::EngineListItem tail_four;
+    tail_four.raw_path = "/music/tail-4.flac";
+    auto without = repository.edit_engine_list(id, 5U,
+                                               {ListEdit{.kind = ListEdit::Kind::insert,
+                                                         .entries = {},
+                                                         .items = {tail_four},
+                                                         .after = tail_three.entry_id}},
+                                               6, std::nullopt, std::nullopt, false);
+    require(without && without->items.empty() && without->summary.tracks == 8U,
+            "without items asked for, only the summary comes back");
+    // A move near the end rewrites from there; the order read back is right.
+    auto near_end = repository.edit_engine_list(id, 6U,
+                                                {ListEdit{.kind = ListEdit::Kind::move,
+                                                          .entries = {tail_four.entry_id},
+                                                          .items = {},
+                                                          .after = fresh.entry_id}},
+                                                7);
+    const std::vector after_move{items[4],  items[1], items[3], fresh,
+                                 tail_four, tail_one, tail_two, tail_three};
+    require(near_end && (*repository.load_engine_list(id))->items == after_move,
+            "a move keeps the lead in place and writes the rest in order");
+    auto unknown = repository.edit_engine_list(id, 7U,
+                                               {ListEdit{.kind = ListEdit::Kind::remove,
+                                                         .entries = {items[1].entry_id},
+                                                         .items = {},
+                                                         .after = {}},
+                                                ListEdit{.kind = ListEdit::Kind::remove,
+                                                         .entries = {StableId::random()},
+                                                         .items = {},
+                                                         .after = {}}},
+                                               5);
+    require(!unknown && unknown.error().code == ErrorCode::not_found &&
+                (*repository.load_engine_list(id))->items.size() == 8U &&
+                (*repository.load_engine_lists()).front().revision == 7U,
+            "an edit naming an unknown entry writes nothing, not even its first part");
+    require(repository.edit_engine_list(StableId::random(), 1U, {}, 5).error().code ==
+                ErrorCode::not_found,
+            "editing a list that is not there says so");
+    std::filesystem::remove(path);
+}
+
 } // namespace
 
 // ADR-0234: an older release's lists said only whether they were the
@@ -2039,6 +2201,16 @@ void lists_of_an_older_release_name_their_engine() {
     sqlite3* db = nullptr;
     require(sqlite3_open(path.c_str(), &db) == SQLITE_OK, "the database opens directly");
     require(sqlite3_exec(db,
+                         "DROP TABLE file_publication_backups;"
+                         "DROP INDEX engine_lists_draft;"
+                         "ALTER TABLE engine_lists DROP COLUMN draft_base;"
+                         "ALTER TABLE engine_lists DROP COLUMN draft_of;"
+                         "ALTER TABLE engine_list_items DROP COLUMN album_peak;"
+                         "ALTER TABLE engine_list_items DROP COLUMN album_gain_db;"
+                         "ALTER TABLE engine_list_items DROP COLUMN track_peak;"
+                         "ALTER TABLE engine_list_items DROP COLUMN track_gain_db;"
+                         "ALTER TABLE engine_list_items DROP COLUMN date;"
+                         "ALTER TABLE engine_list_items DROP COLUMN album_artist;"
                          "ALTER TABLE operation_journal DROP COLUMN backup_device;"
                          "ALTER TABLE operation_journal DROP COLUMN backup_inode;"
                          "ALTER TABLE operation_journal DROP COLUMN backup_size;"
@@ -2051,7 +2223,7 @@ void lists_of_an_older_release_name_their_engine() {
     sqlite3_close(db);
 
     auto reopened = persistence::ListRepository::open(path);
-    require(reopened.has_value() && reopened->schema_version() == 49U, "and is upgraded");
+    require(reopened.has_value() && reopened->schema_version() == 53U, "and is upgraded");
     const auto loaded = reopened->load_all();
     require(loaded.has_value() && loaded->size() == 2U, "with both lists");
     for (const auto& list : *loaded) {
@@ -2062,7 +2234,199 @@ void lists_of_an_older_release_name_their_engine() {
     std::filesystem::remove_all(directory, ignored);
 }
 
+// A workspace save writes a list's items only when they changed: an
+// unchanged list is its header, and what is stored of it stands. Two kept
+// searches of 66,841 tracks had every save rewrite 3.2 million rows.
+void a_workspace_save_writes_only_what_changed() {
+    namespace persistence = trackknife::persistence;
+    const auto database_path = std::filesystem::temp_directory_path() /
+                               ("trackknife-workspace-save-" +
+                                trackknife::core::StableId::random().to_string() + ".sqlite3");
+    const auto cleanup = [&database_path] {
+        std::error_code ignored;
+        std::filesystem::remove(database_path, ignored);
+        std::filesystem::remove(database_path.string() + "-wal", ignored);
+        std::filesystem::remove(database_path.string() + "-shm", ignored);
+    };
+    cleanup();
+    const auto item = [](const std::string& path, const std::string& title) {
+        persistence::ListItem made;
+        made.source = persistence::ListSource::local;
+        made.source_reference = path;
+        made.duration_ms = 1000;
+        made.fields = {{"title", title}};
+        return made;
+    };
+    const auto big_id = trackknife::core::StableId::random();
+    const auto small_id = trackknife::core::StableId::random();
+    const auto gone_id = trackknife::core::StableId::random();
+    const auto list = [](const trackknife::core::StableId& id, const std::string& name) {
+        persistence::ListDocument made;
+        made.id = id;
+        made.kind = persistence::ListKind::scratch;
+        made.name = name;
+        return made;
+    };
+    auto big = list(big_id, "Big");
+    for (int index = 0; index < 50; ++index) {
+        big.items.push_back(item("/music/" + std::to_string(index) + ".flac", "Song"));
+    }
+    auto small = list(small_id, "Small");
+    small.items.push_back(item("/music/a.flac", "A"));
+    auto gone = list(gone_id, "Gone");
+    gone.items.push_back(item("/music/g.flac", "G"));
+    {
+        auto repository = persistence::ListRepository::open(database_path);
+        require(repository.has_value(), "the repository opens");
+        require(repository
+                    ->save_workspace(std::vector<persistence::ListDocumentWrite>{
+                        {.document = big, .items = true},
+                        {.document = small, .items = true},
+                        {.document = gone, .items = true}})
+                    .has_value(),
+                "a first save writes every list");
+
+        // Big unchanged but renamed and moved to the front; Small changed;
+        // Gone closed.
+        auto header = big;
+        header.items.clear();
+        header.name = "Big, renamed";
+        small.items.push_back(item("/music/b.flac", "B"));
+        require(repository
+                    ->save_workspace(std::vector<persistence::ListDocumentWrite>{
+                        {.document = small, .items = true}, {.document = header, .items = false}})
+                    .has_value(),
+                "a save with one list's header only");
+        auto loaded = repository->load_all();
+        require(loaded.has_value() && loaded->size() == 2U, "the closed list is gone");
+        require((*loaded)[0].id == small_id && (*loaded)[1].id == big_id, "the lists trade places");
+        require((*loaded)[1].name == "Big, renamed", "a header change is written");
+        require((*loaded)[1].items.size() == 50U &&
+                    (*loaded)[1].items[49].source_reference == "/music/49.flac",
+                "an unchanged list's items stand");
+        require((*loaded)[0].items.size() == 2U &&
+                    (*loaded)[0].items[1].source_reference == "/music/b.flac",
+                "a changed list's items are replaced");
+
+        // And replace_all still replaces everything.
+        require(repository->replace_all(std::vector<persistence::ListDocument>{gone}).has_value(),
+                "replace_all writes the workspace whole");
+        loaded = repository->load_all();
+        require(loaded.has_value() && loaded->size() == 1U && (*loaded)[0].id == gone_id &&
+                    (*loaded)[0].items.size() == 1U,
+                "replace_all leaves only what it was given");
+    }
+    cleanup();
+}
+
+// ADR-0259: a saved list's unsaved edits are a draft on the engine.
+void a_saved_lists_draft_is_saved_into_it() {
+    namespace persistence = trackknife::persistence;
+    using persistence::ListEdit;
+    using trackknife::core::ErrorCode;
+    using trackknife::core::StableId;
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("trackknife-engine-list-drafts-" + std::to_string(::getpid()) + ".sqlite3");
+    std::filesystem::remove(path);
+    auto opened = persistence::ListRepository::open(path);
+    require(opened.has_value(), "the repository opens");
+    auto& repository = *opened;
+    const auto item = [](const char* raw_path) {
+        return persistence::EngineListItem{.entry_id = StableId::random(),
+                                           .raw_path = raw_path,
+                                           .logical_reference = std::nullopt,
+                                           .segment = std::nullopt,
+                                           .source_selection = std::nullopt,
+                                           .duration_ms = std::nullopt,
+                                           .title = raw_path,
+                                           .artist = {},
+                                           .album = {},
+                                           .album_artist = {},
+                                           .date = {},
+                                           .replay_gain = std::nullopt};
+    };
+    const std::vector items{item("/a.flac"), item("/b.flac")};
+    const auto saved_id = StableId::random();
+    auto saved = repository.save_engine_list(saved_id, "Kept", persistence::EngineListKind::saved,
+                                             items, 0U, 1'000);
+    require(saved && saved->revision == 1U, "a saved list");
+    const auto working_id = StableId::random();
+    require(repository
+                .save_engine_list(working_id, "Untitled", persistence::EngineListKind::working,
+                                  items, 0U, 1'000)
+                .has_value(),
+            "and a working one");
+    require(repository.draft_engine_list(working_id, StableId::random(), 1'100).error().code ==
+                ErrorCode::invalid_argument,
+            "a working list has no draft");
+    require(
+        repository.draft_engine_list(StableId::random(), StableId::random(), 1'100).error().code ==
+            ErrorCode::not_found,
+        "nor does a list that is not there");
+
+    const auto draft_id = StableId::random();
+    auto draft = repository.draft_engine_list(saved_id, draft_id, 1'100);
+    require(draft && draft->id == draft_id && draft->draft_of == saved_id &&
+                draft->draft_base == 1U && draft->kind == persistence::EngineListKind::working &&
+                draft->name == "Kept" && draft->tracks == 2U,
+            "a draft is a working list naming the list it drafts and its revision");
+    require((*repository.load_engine_list(draft_id))->items == items,
+            "holding its entries, identities and all");
+    auto again = repository.draft_engine_list(saved_id, StableId::random(), 1'200);
+    require(again && again->id == draft_id, "a saved list has one draft, whoever asks");
+    require(repository.draft_engine_list(draft_id, StableId::random(), 1'200).error().code ==
+                ErrorCode::invalid_argument,
+            "and a draft has none");
+
+    // Edited, then saved into the list it drafts.
+    require(repository
+                .edit_engine_list(draft_id, 1U,
+                                  {ListEdit{.kind = ListEdit::Kind::remove,
+                                            .entries = {items[0].entry_id},
+                                            .items = {},
+                                            .after = {}}},
+                                  1'300, std::string_view{"Kept, shorter"})
+                .has_value(),
+            "the draft is edited");
+    require((*repository.load_engine_list(saved_id))->items == items,
+            "the saved list is untouched meanwhile");
+    auto committed = repository.commit_engine_list_draft(draft_id, false, 1'400);
+    require(committed && committed->id == saved_id && committed->revision == 2U &&
+                committed->name == "Kept, shorter" && committed->modified_ms == 1'400 &&
+                committed->kind == persistence::EngineListKind::saved && !committed->draft_of,
+            "saving a draft writes it to the list it drafts");
+    require((*repository.load_engine_list(saved_id))->items == std::vector{items[1]},
+            "entries, identities and all");
+    require(!*repository.load_engine_list(draft_id), "and the draft is gone");
+
+    // The list moved on meanwhile: a conflict, unless forced.
+    auto second = repository.draft_engine_list(saved_id, StableId::random(), 1'500);
+    require(second && second->draft_base == 2U, "a new draft begins at the new revision");
+    require(repository
+                .save_engine_list(saved_id, "Kept", persistence::EngineListKind::saved, items, 2U,
+                                  1'600)
+                .has_value(),
+            "someone saves the list itself");
+    require(repository.commit_engine_list_draft(second->id, false, 1'700).error().code ==
+                ErrorCode::conflict,
+            "saving the draft then is a conflict");
+    require(repository.load_engine_list(second->id)->has_value(), "which keeps the draft");
+    require(repository.commit_engine_list_draft(second->id, true, 1'800).has_value(),
+            "kept regardless, when asked");
+    require(repository.commit_engine_list_draft(saved_id, false, 1'900).error().code ==
+                ErrorCode::invalid_argument,
+            "a list that is no draft cannot be saved as one");
+
+    // Deleting a saved list deletes its draft.
+    auto third = repository.draft_engine_list(saved_id, StableId::random(), 2'000);
+    require(third.has_value(), "a third draft");
+    require(repository.delete_engine_list(saved_id, std::nullopt) == true, "the list is deleted");
+    require(!*repository.load_engine_list(third->id), "and its draft with it");
+    std::filesystem::remove(path);
+}
+
 int main() {
+    a_workspace_save_writes_only_what_changed();
     saved_searches_are_persistent_and_conflict_checked();
     local_listening_history_is_monotonic_and_persistent();
     local_listening_occurrences_are_idempotent_and_source_qualified();
@@ -2079,5 +2443,7 @@ int main() {
     list_entry_identities_survive_reordering_and_separate_duplicates();
     an_up_to_date_database_is_opened_without_rechecking_it();
     engine_lists_round_trip_and_refuse_stale_writes();
+    engine_lists_are_edited_in_place();
+    a_saved_lists_draft_is_saved_into_it();
     return EXIT_SUCCESS;
 }

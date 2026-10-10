@@ -4,8 +4,8 @@
 
 #include "bench/bench_main_window_helpers.hpp"
 #include "uicommon/local_artwork.hpp"
-#include "workspace/library_view_definitions.hpp"
 #include "uicommon/local_files_mime_data.hpp"
+#include "workspace/library_view_definitions.hpp"
 
 #include <QFile>
 #include <QIcon>
@@ -14,6 +14,7 @@
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
+#include <filesystem>
 #include <unordered_set>
 #include <utility>
 
@@ -76,12 +77,14 @@ class LibraryModel final : public QStandardItemModel {
             if (entry.kind == persistence::LibraryEntryKind::artist ||
                 entry.kind == persistence::LibraryEntryKind::group)
                 return QString{};
-            const auto tracks =
-                LibraryBrowser::tr("%1 track%2").arg(entry.tracks).arg(entry.tracks == 1U ? "" : "s");
+            const auto tracks = LibraryBrowser::tr("%1 track%2")
+                                    .arg(entry.tracks)
+                                    .arg(entry.tracks == 1U ? "" : "s");
             // Under its artist, an album need not name them again.
             if (entry.kind == persistence::LibraryEntryKind::album)
-                return index.parent().isValid() ? tracks
-                                                : text(entry.artist) + QStringLiteral(" · ") + tracks;
+                return index.parent().isValid()
+                           ? tracks
+                           : text(entry.artist) + QStringLiteral(" · ") + tracks;
             return QString{};
         }
         if (role == library_kind_role || role == library_count_role ||
@@ -89,16 +92,19 @@ class LibraryModel final : public QStandardItemModel {
             const auto value = QStandardItemModel::data(index, entry_role);
             if (!value.isValid()) {
                 return role == library_kind_role || role == library_count_role ? QVariant{QString{}}
-                       : role == library_available_role ? QVariant{false}
-                                                        : QVariant{0U};
+                       : role == library_available_role                        ? QVariant{false}
+                                                                               : QVariant{0U};
             }
             const auto entry = value.value<persistence::LibraryEntry>();
             switch (role) {
             case library_kind_role:
-                return entry.kind == persistence::LibraryEntryKind::artist  ? QStringLiteral("artist")
-                       : entry.kind == persistence::LibraryEntryKind::album ? QStringLiteral("album")
-                       : entry.kind == persistence::LibraryEntryKind::group ? QStringLiteral("group")
-                                                                            : QStringLiteral("track");
+                return entry.kind == persistence::LibraryEntryKind::artist
+                           ? QStringLiteral("artist")
+                       : entry.kind == persistence::LibraryEntryKind::album
+                           ? QStringLiteral("album")
+                       : entry.kind == persistence::LibraryEntryKind::group
+                           ? QStringLiteral("group")
+                           : QStringLiteral("track");
             case library_count_role:
                 return entry.kind == persistence::LibraryEntryKind::artist ||
                                entry.kind == persistence::LibraryEntryKind::group
@@ -160,14 +166,14 @@ class LibraryModel final : public QStandardItemModel {
         for (const auto& entry : entries) {
             carried.push_back(QVariant::fromValue(entry));
         }
-        auto* mime = new ui::LocalFilesMimeData{
-            [browser = browser_, entries = std::move(entries)](
-                ui::LocalFilesMimeData::Completion done) {
-                if (browser) {
-                    browser->resolveEntries(entries, std::move(done));
-                }
-            },
-            engine};
+        auto* mime =
+            new ui::LocalFilesMimeData{[browser = browser_, entries = std::move(entries)](
+                                           ui::LocalFilesMimeData::Completion done) {
+                                           if (browser) {
+                                               browser->resolveEntries(entries, std::move(done));
+                                           }
+                                       },
+                                       engine};
         mime->setProperty(library_entries_property, carried);
         return mime;
     }
@@ -215,8 +221,7 @@ std::vector<persistence::LibraryEntry> LibraryBrowser::selectedEntries(QModelInd
     return entries;
 }
 
-LibraryBrowser::LibraryBrowser(const CatalogueSource& catalogues, EngineKey engine,
-                               QObject* parent)
+LibraryBrowser::LibraryBrowser(const CatalogueSource& catalogues, EngineKey engine, QObject* parent)
     : QObject(parent), catalogues_(&catalogues), engine_(std::move(engine)) {
     pool_.setMaxThreadCount(2);
     artwork_pool_.setMaxThreadCount(1);
@@ -278,8 +283,7 @@ LibraryBrowser::LibraryBrowser(const CatalogueSource& catalogues, EngineKey engi
     change_timer_.setSingleShot(true);
     change_timer_.setInterval(250);
     connect(&change_timer_, &QTimer::timeout, this, [this] {
-        invalidateCovers();
-        reload();
+        refreshInPlace();
         loadRoots();
         emit libraryContentChanged();
     });
@@ -485,56 +489,138 @@ void LibraryBrowser::locatePath(std::string raw_path, bool album) {
     ++generation_;
     const auto generation = generation_;
     setStatus(tr("Locating in library…"));
-    enqueue(
-        {[raw_path = std::move(raw_path),
-          cancellation = lifetime_cancellation_.token()](engine::Catalogue& library) {
-             Outcome outcome;
-             persistence::LibraryQuery query;
-             query.kind = persistence::LibraryEntryKind::album;
-             query.raw_path = raw_path;
-             auto page = library.query(query, cancellation);
-             if (page)
+    // ADR-0273: found in the layout shown, not by switching to another --
+    // a view asks the engine for the way to the file through its levels.
+    auto view = view_;
+    enqueue({[raw_path, view,
+              cancellation = lifetime_cancellation_.token()](engine::Catalogue& library) {
+                 Outcome outcome;
+                 persistence::LibraryQuery query;
+                 query.kind = persistence::LibraryEntryKind::album;
+                 query.raw_path = raw_path;
+                 auto page = library.query(query, cancellation);
+                 if (!page) {
+                     outcome.error = text(page.error().message);
+                     return outcome;
+                 }
                  outcome.page = std::move(*page);
-             else
-                 outcome.error = text(page.error().message);
-             return outcome;
-         },
-         [this, generation, album](Outcome outcome) {
-             // A failed or empty lookup is a fact about the queried path, true
-             // however the tree changed while the query ran. Reported before
-             // the staleness check, which guards the navigation below.
-             if (!outcome.error.isEmpty()) {
-                 setStatus(outcome.error);
-                 return;
-             }
-             if (outcome.page.entries.empty()) {
-                 setStatus(!engine_.isLocal()
-                               ? tr("This file is not in this library yet; it is found after the "
-                                    "engine's next scan.")
-                               : tr("This file is not in the local library. Add its folder and "
-                                    "Refresh first."));
-                 return;
-             }
-             if (generation != generation_)
-                 return;
-             auto entry = outcome.page.entries.front();
-             search_.clear();
-             // Found under its artist, so the artist tree, not the newest
-             // nor another view.
-             if (view_id_ != default_library_view_id) {
-                 adoptView(default_library_view_id);
-             }
-             emit searchChanged();
-             expanded_entries_.clear();
-             current_entry_.clear();
-             reload();
-             locate_artist_ = entry.artist;
-             if (!album) {
-                 entry.kind = persistence::LibraryEntryKind::artist;
-                 entry.key = entry.artist;
-             }
-             locate_target_ = std::move(entry);
-         }});
+                 if (!view.empty() && !outcome.page.entries.empty()) {
+                     persistence::LibraryQuery way;
+                     way.kind = persistence::LibraryEntryKind::group;
+                     way.view = view;
+                     way.raw_path = raw_path;
+                     auto located = library.query(way, cancellation);
+                     if (!located) {
+                         outcome.error = text(located.error().message);
+                         return outcome;
+                     }
+                     outcome.way = std::move(*located);
+                 }
+                 return outcome;
+             },
+             [this, generation, album, raw_path](Outcome outcome) {
+                 // A failed or empty lookup is a fact about the queried path, true
+                 // however the tree changed while the query ran. Reported before
+                 // the staleness check, which guards the navigation below.
+                 if (!outcome.error.isEmpty()) {
+                     setStatus(outcome.error);
+                     return;
+                 }
+                 if (outcome.page.entries.empty()) {
+                     setStatus(
+                         !engine_.isLocal()
+                             ? tr("This file is not in this library yet; it is found after the "
+                                  "engine's next scan.")
+                             : tr("This file is not in the local library. Add its folder and "
+                                  "Refresh first."));
+                     return;
+                 }
+                 if (generation != generation_)
+                     return;
+                 const auto found = outcome.page.entries.front();
+                 auto locating = this->locating(found, raw_path, album, outcome.way);
+                 if (!locating) {
+                     setStatus(view_.empty() ? tr("This file is not in this view.")
+                               : !outcome.way.located
+                                   ? tr("This engine cannot locate in a view yet; update "
+                                        "its melodyd.")
+                                   : tr("This file is not in this view."));
+                     return;
+                 }
+                 search_.clear();
+                 emit searchChanged();
+                 expanded_entries_.clear();
+                 current_entry_.clear();
+                 reload();
+                 locating_ = std::move(locating);
+             }});
+}
+
+LibraryBrowser::Locating LibraryBrowser::locating(const persistence::LibraryEntry& album_entry,
+                                                  const std::string& raw_path, const bool album,
+                                                  const persistence::LibraryPage& way) const {
+    using Kind = persistence::LibraryEntryKind;
+    // The library's folders: every folder the file is under, down to its own.
+    if (folders_) {
+        const auto folder = std::filesystem::path{raw_path}.parent_path().native();
+        return [folder](const persistence::LibraryEntry& entry, std::size_t) {
+            if (entry.kind == Kind::track || entry.view_value.empty()) {
+                return Step::none;
+            }
+            if (entry.view_value == folder) {
+                return Step::target;
+            }
+            const auto& under = entry.view_value;
+            const bool inside = folder.size() > under.size() && folder.starts_with(under) &&
+                                (under.ends_with('/') || folder[under.size()] == '/');
+            return inside ? Step::on_way : Step::none;
+        };
+    }
+    // A view: its node at each level, as the engine found the way; an
+    // artist at the level that names it, an album -- or an artist no level
+    // names -- at the last.
+    if (!view_.empty()) {
+        if (!way.located || way.entries.empty()) {
+            return {};
+        }
+        std::vector<std::string> labels;
+        auto target = way.entries.size() - 1U;
+        for (std::size_t depth = 0; depth < way.entries.size(); ++depth) {
+            const auto& node = way.entries[depth];
+            labels.push_back(node.view_value);
+            if (!album && target == way.entries.size() - 1U && !album_entry.artist.empty() &&
+                node.view_value == album_entry.artist) {
+                target = depth;
+            }
+        }
+        labels.resize(target + 1U);
+        return [labels](const persistence::LibraryEntry& entry, const std::size_t depth) {
+            if (depth >= labels.size() || entry.kind == Kind::track ||
+                entry.view_value != labels[depth]) {
+                return Step::none;
+            }
+            return depth + 1U == labels.size() ? Step::target : Step::on_way;
+        };
+    }
+    // Recently added lists albums, newest first: the album, whichever asked.
+    if (newest_first_) {
+        return [key = album_entry.key](const persistence::LibraryEntry& entry,
+                                       const std::size_t depth) {
+            return depth == 0U && entry.kind == Kind::album && entry.key == key ? Step::target
+                                                                                : Step::none;
+        };
+    }
+    // The artist tree: the artist, and under it the album.
+    return [artist = album_entry.artist, key = album_entry.key,
+            album](const persistence::LibraryEntry& entry, const std::size_t depth) {
+        if (depth == 0U && entry.kind == Kind::artist && entry.key == artist) {
+            return album ? Step::on_way : Step::target;
+        }
+        if (album && depth == 1U && entry.kind == Kind::album && entry.key == key) {
+            return Step::target;
+        }
+        return Step::none;
+    };
 }
 
 QString LibraryBrowser::emptyLibraryText() const {
@@ -546,7 +632,7 @@ QString LibraryBrowser::emptyLibraryText() const {
 }
 
 void LibraryBrowser::reload() {
-    locate_target_.reset();
+    locating_ = {};
     ++generation_;
     artwork_cancellation_.request_cancellation();
     view_cancellation_.request_cancellation();
@@ -633,6 +719,8 @@ void LibraryBrowser::reload() {
         persistence::LibraryQuery query;
         query.kind = kind;
         query.text = query_text;
+        // Loaded already, so not fetched again -- kept to be asked again.
+        group->setData(QVariant::fromValue(query), query_role);
         loadChildren(QPersistentModelIndex{group->index()}, query);
         emit expandRequested(group->index());
     }
@@ -667,6 +755,238 @@ void LibraryBrowser::noteCurrent(const QModelIndex& index) {
     }
 }
 
+// ADR-0254: a view's node opens, and resolves, as the view lists it -- under
+// a genre, an album is the genre's part of it.
+void LibraryBrowser::prepareEntry(persistence::LibraryEntry& entry,
+                                  const persistence::LibraryQuery& query) {
+    if ((!query.view.empty() || query.folders) &&
+        entry.kind != persistence::LibraryEntryKind::track) {
+        auto node = query;
+        node.kind = persistence::LibraryEntryKind::group;
+        node.offset = 0U;
+        if (query.folders) {
+            node.folder = entry.view_value;
+        } else {
+            node.view_path.push_back(entry.view_value);
+        }
+        entry.view_node = std::move(node);
+    }
+}
+
+// An entry's row as it shows: its label, icon, tooltip, and what opening it
+// lists. Its children and whether they are loaded are left as they are.
+void LibraryBrowser::describeItem(QStandardItem& item, const persistence::LibraryEntry& entry) {
+    auto label = entry.label.empty() && entry.view_node ? tr("Unknown") : text(entry.label);
+    if (entry.available == 0U) {
+        label += tr(" — unavailable");
+    } else if (entry.available < entry.tracks) {
+        label += tr(" — %1 unavailable").arg(entry.tracks - entry.available);
+    }
+    item.setText(label);
+    item.setEditable(false);
+    item.setDragEnabled(entry.available > 0U);
+    item.setDropEnabled(false);
+    item.setIcon(QIcon::fromTheme(
+        entry.kind == persistence::LibraryEntryKind::artist  ? QStringLiteral("avatar-default")
+        : entry.kind == persistence::LibraryEntryKind::album ? QStringLiteral("media-optical-audio")
+        : entry.kind == persistence::LibraryEntryKind::group ? QStringLiteral("folder-music")
+                                                             : QStringLiteral("audio-x-generic")));
+    item.setData(QVariant::fromValue(entry), entry_role);
+    // A track by its file, an album by whose it is, an artist by name alone.
+    item.setToolTip(entry.kind == persistence::LibraryEntryKind::track ? pathLabel(entry.key)
+                    : entry.kind == persistence::LibraryEntryKind::group
+                        ? tr("%1 album%2 · %3 track%4")
+                              .arg(entry.albums)
+                              .arg(entry.albums == 1U ? "" : "s")
+                              .arg(entry.tracks)
+                              .arg(entry.tracks == 1U ? "" : "s")
+                    : entry.album.empty() ? text(entry.artist)
+                                          : text(entry.artist + " — " + entry.album));
+    if (entry.view_node) {
+        item.setData(QVariant::fromValue(*entry.view_node), query_role);
+        item.setColumnCount(1);
+    } else if (entry.kind != persistence::LibraryEntryKind::track) {
+        persistence::LibraryQuery children;
+        if (entry.kind == persistence::LibraryEntryKind::artist) {
+            children.kind = persistence::LibraryEntryKind::album;
+            children.artist = entry.key;
+        } else {
+            children.kind = persistence::LibraryEntryKind::track;
+            children.album_key = entry.key;
+        }
+        item.setData(QVariant::fromValue(children), query_role);
+        // Its column before its rows: added with the first row, it is a
+        // column insertion under a nested row, which QML's tree adapter
+        // cannot follow.
+        item.setColumnCount(1);
+    }
+}
+
+std::optional<persistence::LibraryQuery> LibraryBrowser::topQuery() const {
+    if (!search_.trimmed().isEmpty()) {
+        return std::nullopt;
+    }
+    persistence::LibraryQuery top;
+    if (folders_) {
+        top.kind = persistence::LibraryEntryKind::group;
+        top.folders = true;
+    } else if (!view_.empty()) {
+        top.kind = persistence::LibraryEntryKind::group;
+        top.view = view_;
+    } else if (newest_first_) {
+        top.kind = persistence::LibraryEntryKind::album;
+        top.newest_first = true;
+        top.limit = 500;
+    }
+    return top;
+}
+
+void LibraryBrowser::applyChanges(const std::vector<std::string>& albums, const bool everything) {
+    if (stopped_) {
+        return;
+    }
+    if (everything) {
+        invalidateCovers();
+    } else if (!albums.empty()) {
+        // Asked again when shown; the old one stays until the new arrives.
+        for (const auto& album : albums) {
+            const auto key = text(album);
+            artwork_cache_.remove(key);
+            emit coverLoaded(key);
+        }
+        pumpCovers();
+    }
+    change_timer_.start();
+}
+
+void LibraryBrowser::refreshInPlace() {
+    if (stopped_) {
+        return;
+    }
+    // A query's results, or a tree not yet shown: as a new search.
+    if ((query_mode_ && !search_.trimmed().isEmpty()) || model_->rowCount() == 0) {
+        reload();
+        return;
+    }
+    std::vector<std::pair<QPersistentModelIndex, persistence::LibraryQuery>> levels;
+    if (const auto top = topQuery()) {
+        levels.emplace_back(QPersistentModelIndex{}, *top);
+    }
+    std::vector<QStandardItem*> pending{model_->invisibleRootItem()};
+    while (!pending.empty()) {
+        auto* item = pending.back();
+        pending.pop_back();
+        for (int row = 0; row < item->rowCount(); ++row) {
+            auto* child = item->child(row);
+            if (child == nullptr) {
+                continue;
+            }
+            if (child->data(loaded_role).toBool() && child->data(query_role).isValid() &&
+                !child->data(more_role).toBool()) {
+                levels.emplace_back(QPersistentModelIndex{child->index()},
+                                    child->data(query_role).value<persistence::LibraryQuery>());
+                pending.push_back(child);
+            }
+        }
+    }
+    for (auto& [parent, query] : levels) {
+        mergeChildren(parent, std::move(query));
+    }
+}
+
+void LibraryBrowser::mergeChildren(const QPersistentModelIndex& parent,
+                                   persistence::LibraryQuery query) {
+    if (query.limit < 100'000U && !query.newest_first) {
+        query.limit = 100'000U;
+    }
+    query.offset = 0U;
+    const auto generation = generation_;
+    const auto root = !parent.isValid();
+    enqueue({[query, cancellation = view_cancellation_.token()](engine::Catalogue& library) {
+                 Outcome outcome;
+                 const auto result = library.query(query, cancellation);
+                 if (result) {
+                     outcome.page = *result;
+                 } else {
+                     outcome.error = text(result.error().message);
+                 }
+                 return outcome;
+             },
+             [this, parent, root, query, generation](Outcome outcome) {
+                 if (generation != generation_ || (!root && !parent.isValid()) ||
+                     !outcome.error.isEmpty()) {
+                     return;
+                 }
+                 auto* target = root ? model_->invisibleRootItem() : model_->itemFromIndex(parent);
+                 if (target == nullptr) {
+                     return;
+                 }
+                 // Rows that are no entry -- "Show more…", "No matches" -- go;
+                 // what stays is matched by its entry.
+                 for (int row = target->rowCount() - 1; row >= 0; --row) {
+                     if (!target->child(row)->data(entry_role).isValid()) {
+                         target->removeRow(row);
+                     }
+                 }
+                 int at = 0;
+                 for (auto entry : outcome.page.entries) {
+                     prepareEntry(entry, query);
+                     const auto key = entryKey(entry);
+                     int found = -1;
+                     for (int row = at; row < target->rowCount(); ++row) {
+                         if (entryKey(target->child(row)
+                                          ->data(entry_role)
+                                          .value<persistence::LibraryEntry>()) == key) {
+                             found = row;
+                             break;
+                         }
+                     }
+                     QStandardItem* item = nullptr;
+                     if (found == at) {
+                         item = target->child(at);
+                     } else if (found > at) {
+                         // Moved: taken with what it holds, and opened again.
+                         auto taken = target->takeRow(found);
+                         target->insertRow(at, taken);
+                         item = target->child(at);
+                         if (expanded_entries_.contains(key)) {
+                             emit expandRequested(item->index());
+                         }
+                     } else {
+                         item = new QStandardItem;
+                         target->insertRow(at, item);
+                     }
+                     // Said again as it is now: counts, ratings, what is
+                     // available -- its rows and whether they are open kept.
+                     describeItem(*item, entry);
+                     if (found < 0 && expanded_entries_.contains(key)) {
+                         emit expandRequested(item->index());
+                     }
+                     ++at;
+                 }
+                 if (target->rowCount() > at) {
+                     target->removeRows(at, target->rowCount() - at);
+                 }
+                 if (outcome.page.more) {
+                     auto next = query;
+                     next.offset = outcome.page.entries.size();
+                     auto* more = new QStandardItem(tr("Show more…"));
+                     more->setEditable(false);
+                     more->setDragEnabled(false);
+                     more->setData(true, more_role);
+                     more->setData(QVariant::fromValue(next), query_role);
+                     target->appendRow(more);
+                 } else if (target->rowCount() == 0) {
+                     const bool top = root && query.text.empty();
+                     auto* empty = new QStandardItem(top ? emptyLibraryText() : tr("No matches"));
+                     empty->setEnabled(false);
+                     empty->setData(top, empty_state_role);
+                     target->appendRow(empty);
+                 }
+             },
+             true});
+}
+
 void LibraryBrowser::loadChildren(const QPersistentModelIndex& parent,
                                   persistence::LibraryQuery query) {
     // Browsing shows the complete level in one load -- the default 200-row
@@ -676,162 +996,91 @@ void LibraryBrowser::loadChildren(const QPersistentModelIndex& parent,
     query.limit = 100'000U;
     const auto generation = generation_;
     const auto root = !parent.isValid();
-    enqueue(
-        {[query, cancellation = view_cancellation_.token()](engine::Catalogue& library) {
-             Outcome outcome;
-             const auto result = library.query(query, cancellation);
-             if (result) {
-                 outcome.page = *result;
-             } else {
-                 outcome.error = text(result.error().message);
-             }
-             return outcome;
-         },
-         [this, parent, root, query, generation](Outcome outcome) mutable {
-             if (generation != generation_ || (!root && !parent.isValid())) {
-                 return;
-             }
-             auto* target = root ? model_->invisibleRootItem() : model_->itemFromIndex(parent);
-             if (target == nullptr) {
-                 return;
-             }
-             if (!outcome.error.isEmpty()) {
-                 setStatus(outcome.error);
-                 target->setData(false, loaded_role);
-                 return;
-             }
-             if (query.offset == 0U) {
-                 target->removeRows(0, target->rowCount());
-             }
-             if (!scanning_ && status_ == tr("Searching…")) {
-                 setStatus(search_.trimmed().isEmpty() ? tr("Browse artists and albums.")
-                                                       : tr("Search results"));
-             }
-             for (auto entry : outcome.page.entries) {
-                 // ADR-0254: a view's node opens, and resolves, as the view
-                 // lists it -- under a genre, an album is the genre's part
-                 // of it.
-                 if ((!query.view.empty() || query.folders) &&
-                     entry.kind != persistence::LibraryEntryKind::track) {
-                     auto node = query;
-                     node.kind = persistence::LibraryEntryKind::group;
-                     node.offset = 0U;
-                     if (query.folders) {
-                         node.folder = entry.view_value;
-                     } else {
-                         node.view_path.push_back(entry.view_value);
-                     }
-                     entry.view_node = std::move(node);
+    enqueue({[query, cancellation = view_cancellation_.token()](engine::Catalogue& library) {
+                 Outcome outcome;
+                 const auto result = library.query(query, cancellation);
+                 if (result) {
+                     outcome.page = *result;
+                 } else {
+                     outcome.error = text(result.error().message);
                  }
-                 auto label = entry.label.empty() && entry.view_node ? tr("Unknown")
-                                                                     : text(entry.label);
-                 if (entry.available == 0U) {
-                     label += tr(" — unavailable");
-                 } else if (entry.available < entry.tracks) {
-                     label += tr(" — %1 unavailable").arg(entry.tracks - entry.available);
+                 return outcome;
+             },
+             [this, parent, root, query, generation](Outcome outcome) mutable {
+                 if (generation != generation_ || (!root && !parent.isValid())) {
+                     return;
                  }
-                 auto* item = new QStandardItem(label);
-                 item->setEditable(false);
-                 item->setDragEnabled(entry.available > 0U);
-                 item->setDropEnabled(false);
-                 item->setIcon(QIcon::fromTheme(entry.kind == persistence::LibraryEntryKind::artist
-                                                    ? QStringLiteral("avatar-default")
-                                                : entry.kind == persistence::LibraryEntryKind::album
-                                                    ? QStringLiteral("media-optical-audio")
-                                                : entry.kind == persistence::LibraryEntryKind::group
-                                                    ? QStringLiteral("folder-music")
-                                                    : QStringLiteral("audio-x-generic")));
-                 item->setData(QVariant::fromValue(entry), entry_role);
-                 // A track by its file, an album by whose it is, an artist
-                 // by name alone.
-                 item->setToolTip(
-                     entry.kind == persistence::LibraryEntryKind::track ? pathLabel(entry.key)
-                     : entry.kind == persistence::LibraryEntryKind::group
-                         ? tr("%1 album%2 · %3 track%4")
-                               .arg(entry.albums)
-                               .arg(entry.albums == 1U ? "" : "s")
-                               .arg(entry.tracks)
-                               .arg(entry.tracks == 1U ? "" : "s")
-                     : entry.album.empty() ? text(entry.artist)
-                                           : text(entry.artist + " — " + entry.album));
-                 if (entry.view_node) {
-                     item->setData(QVariant::fromValue(*entry.view_node), query_role);
-                     item->setColumnCount(1);
-                 } else if (entry.kind != persistence::LibraryEntryKind::track) {
-                     persistence::LibraryQuery children;
-                     if (entry.kind == persistence::LibraryEntryKind::artist) {
-                         children.kind = persistence::LibraryEntryKind::album;
-                         children.artist = entry.key;
-                     } else {
-                         children.kind = persistence::LibraryEntryKind::track;
-                         children.album_key = entry.key;
-                     }
-                     item->setData(QVariant::fromValue(children), query_role);
-                     // Its column before its rows: added with the first row,
-                     // it is a column insertion under a nested row, which
-                     // QML's tree adapter cannot follow.
-                     item->setColumnCount(1);
+                 auto* target = root ? model_->invisibleRootItem() : model_->itemFromIndex(parent);
+                 if (target == nullptr) {
+                     return;
                  }
-                 target->appendRow(item);
-                 if (locate_target_) {
-                     const bool found =
-                         entry.kind == locate_target_->kind && entry.key == locate_target_->key;
-                     if (found) {
-                         emit currentRequested(item->index(), true);
-                         locate_target_.reset();
-                         setStatus(tr("Located in library."));
+                 if (!outcome.error.isEmpty()) {
+                     setStatus(outcome.error);
+                     target->setData(false, loaded_role);
+                     return;
+                 }
+                 if (query.offset == 0U) {
+                     target->removeRows(0, target->rowCount());
+                 }
+                 if (!scanning_ && status_ == tr("Searching…")) {
+                     setStatus(search_.trimmed().isEmpty() ? tr("Browse artists and albums.")
+                                                           : tr("Search results"));
+                 }
+                 // ADR-0273: how deep these rows are, for the way being located.
+                 std::size_t depth = 0U;
+                 for (QModelIndex above = parent; above.isValid(); above = above.parent()) {
+                     ++depth;
+                 }
+                 bool on_the_way = false;
+                 for (auto entry : outcome.page.entries) {
+                     prepareEntry(entry, query);
+                     auto* item = new QStandardItem;
+                     describeItem(*item, entry);
+                     target->appendRow(item);
+                     if (locating_) {
+                         const auto step = locating_(entry, depth);
+                         if (step != Step::none) {
+                             on_the_way = true;
+                             emit expandRequested(item->index());
+                         }
+                         if (step == Step::target) {
+                             emit currentRequested(item->index(), true);
+                             locating_ = {};
+                             setStatus(tr("Located in library."));
+                         }
                      }
-                     if (found || (entry.kind == persistence::LibraryEntryKind::artist &&
-                                   entry.key == locate_artist_)) {
+                     if (current_entry_ == entryKey(entry)) {
+                         emit currentRequested(item->index(), false);
+                     }
+                     if (expanded_entries_.contains(entryKey(entry))) {
                          emit expandRequested(item->index());
                      }
                  }
-                 if (current_entry_ == entryKey(entry)) {
-                     emit currentRequested(item->index(), false);
-                 }
-                 if (expanded_entries_.contains(entryKey(entry))) {
-                     emit expandRequested(item->index());
-                 }
-             }
-             if (outcome.page.more) {
-                 query.offset += outcome.page.entries.size();
-                 auto* more = new QStandardItem(tr("Show more…"));
-                 more->setEditable(false);
-                 more->setDragEnabled(false);
-                 more->setData(true, more_role);
-                 more->setData(QVariant::fromValue(query), query_role);
-                 target->appendRow(more);
-                 if (locate_target_) {
-                     bool seek_more = query.kind == persistence::LibraryEntryKind::album &&
-                                      query.artist == locate_artist_;
-                     if (query.kind == persistence::LibraryEntryKind::artist) {
-                         seek_more = true;
-                         for (int row = 0; row < target->rowCount(); ++row) {
-                             const auto value = target->child(row)->data(entry_role);
-                             if (value.isValid() &&
-                                 value.value<persistence::LibraryEntry>().key == locate_artist_) {
-                                 seek_more = false;
-                                 break;
-                             }
-                         }
-                     }
-                     if (seek_more) {
+                 if (outcome.page.more) {
+                     query.offset += outcome.page.entries.size();
+                     auto* more = new QStandardItem(tr("Show more…"));
+                     more->setEditable(false);
+                     more->setDragEnabled(false);
+                     more->setData(true, more_role);
+                     more->setData(QVariant::fromValue(query), query_role);
+                     target->appendRow(more);
+                     // Not among these: further on, then.
+                     if (locating_ && !on_the_way) {
                          target->removeRow(more->row());
                          loadChildren(parent, query);
                      }
+                 } else if (target->rowCount() == 0) {
+                     // Why it is empty, at the top: a search that found nothing
+                     // is not a library with no folders.
+                     const bool top = !parent.isValid() && query.text.empty();
+                     auto* empty = new QStandardItem(top ? emptyLibraryText() : tr("No matches"));
+                     empty->setEnabled(false);
+                     empty->setData(top, empty_state_role);
+                     target->appendRow(empty);
                  }
-             } else if (target->rowCount() == 0) {
-                 // Why it is empty, at the top: a search that found nothing
-                 // is not a library with no folders.
-                 const bool top = !parent.isValid() && query.text.empty();
-                 auto* empty = new QStandardItem(top ? emptyLibraryText() : tr("No matches"));
-                 empty->setEnabled(false);
-                 empty->setData(top, empty_state_role);
-                 target->appendRow(empty);
-             }
-             emit levelLoaded();
-         },
-         true});
+                 emit levelLoaded();
+             },
+             true});
 }
 
 void LibraryBrowser::loadFilterChildren(const QPersistentModelIndex& parent,
@@ -1097,6 +1346,7 @@ void LibraryBrowser::commitSearch() {
             return;
         }
         setQueryError({});
+        emit searchStarted(query_text);
         enqueue({[shared = std::make_shared<query::CompiledTkq>(std::move(*compiled)),
                   cancellation = lifetime_cancellation_.token()](engine::Catalogue& library) {
                      Outcome outcome;
@@ -1118,10 +1368,12 @@ void LibraryBrowser::commitSearch() {
                  [this, query_text](Outcome outcome) {
                      if (!outcome.error.isEmpty()) {
                          setStatus(outcome.error);
+                         emit searchFailed(query_text, outcome.error);
                          return;
                      }
                      if (outcome.rows.empty()) {
                          setStatus(tr("No search results to keep."));
+                         emit searchFailed(query_text, tr("Nothing matches “%1”").arg(query_text));
                          return;
                      }
                      setStatus(tr("Search kept as a new tab."));
@@ -1129,6 +1381,7 @@ void LibraryBrowser::commitSearch() {
                  }});
         return;
     }
+    emit searchStarted(query_text);
     enqueue({[query = bytes(query_text),
               cancellation = lifetime_cancellation_.token()](engine::Catalogue& library) {
                  Outcome outcome;
@@ -1164,10 +1417,12 @@ void LibraryBrowser::commitSearch() {
              [this, query_text](Outcome outcome) {
                  if (!outcome.error.isEmpty()) {
                      setStatus(outcome.error);
+                     emit searchFailed(query_text, outcome.error);
                      return;
                  }
                  if (outcome.rows.empty()) {
                      setStatus(tr("No search results to keep."));
+                     emit searchFailed(query_text, tr("Nothing matches “%1”").arg(query_text));
                      return;
                  }
                  setStatus(tr("Search kept as a new tab."));
@@ -1182,6 +1437,15 @@ QVariantList LibraryBrowser::roots() const {
                                    {QStringLiteral("tooltip"), root.tooltip}});
     }
     return list;
+}
+
+std::vector<std::string> LibraryBrowser::rootPaths() const {
+    std::vector<std::string> paths;
+    paths.reserve(roots_.size());
+    for (const auto& root : roots_) {
+        paths.push_back(root.raw_path);
+    }
+    return paths;
 }
 
 void LibraryBrowser::addRoot(const QString& path) {
@@ -1273,22 +1537,25 @@ void LibraryBrowser::loadRoots() {
                      if (unavailable) {
                          ++offline;
                      }
-                     roots_.push_back(Root{
-                         .raw_path = root.raw_path,
-                         .label = pathLabel(root.raw_path) + (root.available ? QString{}
-                                                              : unavailable ? tr(" — unavailable")
-                                                                            : tr(" — not scanned")),
-                         .tooltip = text(root.error)});
+                     roots_.push_back(Root{.raw_path = root.raw_path,
+                                           .label = pathLabel(root.raw_path) +
+                                                    (root.available ? QString{}
+                                                     : unavailable  ? tr(" — unavailable")
+                                                                    : tr(" — not scanned")),
+                                           .tooltip = text(root.error)});
                  }
                  emit rootsChanged();
                  if (offline > 0U && !scanning_) {
-                     setStatus(tr("%1 folders unavailable. Cached music is still shown.").arg(offline));
+                     setStatus(
+                         tr("%1 folders unavailable. Cached music is still shown.").arg(offline));
                  }
              }});
 }
 
 void LibraryBrowser::refreshLibrary() {
     if (!stopped_) {
+        // Not told which albums: every cover is asked again.
+        invalidateCovers();
         change_timer_.start();
     }
 }

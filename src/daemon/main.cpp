@@ -35,7 +35,9 @@
 #include "trackknife/engine/transcode_cache.hpp"
 #include "trackknife/engine/workspace.hpp"
 #include "trackknife/formats/probe.hpp"
+#include "trackknife/operations/undo_copies.hpp"
 #include "trackknife/protocol/client.hpp"
+#include "trackknife/protocol/version.hpp"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -343,13 +345,15 @@ int main(int argc, char** argv) {
             agent_music_root = std::filesystem::path{value()};
         } else if (argument == "--play-for-music-root") {
             play_for_option().music_root = std::filesystem::path{value()};
-        } else if (argument == "--play-for-bitrate-nearby" || argument == "--play-for-bitrate-away" ||
-                   argument == "--agent-bitrate-nearby" || argument == "--agent-bitrate-away") {
+        } else if (argument == "--play-for-bitrate-nearby" ||
+                   argument == "--play-for-bitrate-away" || argument == "--agent-bitrate-nearby" ||
+                   argument == "--agent-bitrate-away") {
             const auto text = value();
             const auto kbps = trackknife::agent::parse_kbps(text);
             if (!kbps) {
                 std::cerr << "melodyd: " << argument
-                          << " wants 0 (the original files) or 16 to 512 kbps, got " << text << "\n";
+                          << " wants 0 (the original files) or 16 to 512 kbps, got " << text
+                          << "\n";
                 return EXIT_FAILURE;
             }
             if (argument == "--play-for-bitrate-nearby") {
@@ -512,8 +516,14 @@ int main(int argc, char** argv) {
     dispatcher.on("engine.info",
                   [&engine_name, engine_id](const trackknife::protocol::Json&)
                       -> trackknife::core::Result<trackknife::protocol::Json> {
+                      // ADR-0260: what it speaks, for a client to decide
+                      // once whether and how it can work with it.
                       return trackknife::protocol::Json{
-                          {"name", engine_name}, {"id", engine_id}, {"protocol", 1}};
+                          {"name", engine_name},
+                          {"id", engine_id},
+                          {"protocol", trackknife::protocol::protocol_version},
+                          {"level", trackknife::protocol::protocol_level},
+                          {"release", TRACKKNIFE_RELEASE}};
                   });
 
     auto server = trackknife::engine::Server::listen(socket_path, dispatcher);
@@ -580,6 +590,12 @@ int main(int argc, char** argv) {
         relay->sink = sink;
     }
 
+    // What changed in the library, told to every client so that what shows
+    // it follows: the paths, the albums they touched, or everything.
+    catalogue.observe([sink](const trackknife::engine::LocalCatalogue::Change& change) {
+        sink(trackknife::engine::catalogue_change_event(change));
+    });
+
     // Jobs report through the sockets, so the registry is given its sink and
     // must be destroyed before the servers it writes to.
     trackknife::engine::JobRegistry jobs{sink};
@@ -592,8 +608,14 @@ int main(int argc, char** argv) {
     trackknife::engine::register_file_work_jobs(job_catalogue, database, catalogue, follow_moves);
     // File work a crash interrupted is finished or rolled back before anyone
     // connects (ADR-0237), and what could not be is kept for Trackknife to show.
-    auto file_work_recovery =
-        trackknife::engine::recover_file_work(database, catalogue, follow_moves);
+    // ADR-0266: where the files writes replace are kept, before anything is
+    // written or recovered.
+    trackknife::operations::set_undo_copy_folder(
+        trackknife::engine::undo_copy_folder(*workspace, database));
+    auto file_work_recovery = trackknife::engine::recover_file_work(
+        database, catalogue, follow_moves, trackknife::engine::backup_retention(*workspace));
+    // ADR-0263: how long the files writes replaced are kept, as clients set it.
+    trackknife::engine::register_backup_methods(dispatcher, database, *workspace);
     if (file_work_recovery.error) {
         std::cerr << "melodyd: could not recover interrupted file work: "
                   << file_work_recovery.error->message << "\n";
@@ -612,7 +634,7 @@ int main(int argc, char** argv) {
                                                    std::move(file_work_recovery));
     trackknife::engine::register_job_methods(dispatcher, jobs, job_catalogue);
     // ADR-0233: the engine's lists, working and saved, for every client.
-    trackknife::engine::register_list_methods(dispatcher, *workspace, sink, *player);
+    trackknife::engine::register_list_methods(dispatcher, *workspace, sink, *player, &catalogue);
     // ADR-0253: a list that ends continues with its rule, from this engine's
     // library, whether or not a window is open.
     trackknife::engine::ListContinuation continuation{*workspace, catalogue, sink};
@@ -633,7 +655,8 @@ int main(int argc, char** argv) {
     std::optional<trackknife::engine::PlaybackStore> playback_store;
     {
         watcher.emplace(*player, sink);
-        watcher->set_tick([&continuation, &player] { static_cast<void>(continuation.tick(*player)); });
+        watcher->set_tick(
+            [&continuation, &player] { static_cast<void>(continuation.tick(*player)); });
         watcher->start();
         recorder.emplace(*player, *workspace);
         recorder->start();
@@ -648,6 +671,33 @@ int main(int argc, char** argv) {
     // ADR-0228: the files an agent without its own copy fetches -- only
     // what the player holds, with a token that lives as long as this run and
     // reaches agents only in the URLs the engine gives them.
+#if TRACKKNIFE_ENABLE_UPNP
+    // ADR-0235: discovery starts before the streams, for its address: an
+    // engine kept to this machine serves its renderers there only, not on
+    // every network it is on. Renderers reach the outputs once it begins.
+    std::shared_ptr<trackknife::discovery::UpnpDiscovery> upnp;
+    trackknife::engine::Outputs* upnp_outputs = nullptr;
+    if (upnp_enabled) {
+        auto found = trackknife::discovery::UpnpDiscovery::start(
+            [&upnp_outputs](const auto& renderer) {
+                if (upnp_outputs != nullptr) {
+                    upnp_outputs->renderer_changed(renderer);
+                }
+            },
+            upnp_interface);
+        if (!found) {
+            std::cerr << found.error().message << "\n";
+            return EXIT_FAILURE;
+        }
+        upnp = std::move(*found);
+        if (const auto endpoint = trackknife::protocol::Endpoint::parse(http_address, {});
+            local_only && endpoint && endpoint->tcp() &&
+            (endpoint->host == "0.0.0.0" || endpoint->host == "::" || endpoint->host.empty()) &&
+            !upnp->address().empty()) {
+            http_address = upnp->address() + ":" + std::to_string(endpoint->port);
+        }
+    }
+#endif
     std::unique_ptr<trackknife::engine::TranscodeCache> transcodes;
     std::unique_ptr<trackknife::engine::MediaStreams> media;
     std::unique_ptr<trackknife::engine::StreamServer> streams;
@@ -665,9 +715,24 @@ int main(int argc, char** argv) {
         media = std::make_unique<trackknife::engine::MediaStreams>(
             *token, [&player](const std::string& raw_path) { return player->holds(raw_path); },
             transcodes.get());
+        // ADR-0271: the protocol as a WebSocket at /protocol, for clients
+        // behind an HTTP proxy -- a connection to the TCP listener, asking
+        // its password; none without one, as TCP needs one.
+        trackknife::engine::StreamServer::Connect connect;
+        if (tcp_server) {
+            connect = [&tcp_server]() -> int {
+                std::array<int, 2> pair{-1, -1};
+                if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair.data()) < 0) {
+                    return -1;
+                }
+                tcp_server->attach(pair[0], false);
+                return pair[1];
+            };
+        }
         auto listening = trackknife::engine::StreamServer::listen(
             endpoint->host, endpoint->port,
-            [&media](const std::string_view query) { return media->resolve(query); });
+            [&media](const std::string_view query) { return media->resolve(query); },
+            std::move(connect));
         if (!listening && listen_by_default) {
             std::cerr << "melodyd: " << http_address << " is taken (" << listening.error().message
                       << "); agents with no copy of the music "
@@ -704,20 +769,12 @@ int main(int argc, char** argv) {
         tcp_server->on_agent(admit);
     }
 #if TRACKKNIFE_ENABLE_UPNP
-    std::shared_ptr<trackknife::discovery::UpnpDiscovery> upnp;
-    if (upnp_enabled) {
+    if (upnp) {
         if (!streams) {
             std::cerr << "melodyd: --upnp needs --http bound to a LAN address\n";
             return EXIT_FAILURE;
         }
-        auto found = trackknife::discovery::UpnpDiscovery::start(
-            [&outputs](const auto& renderer) { outputs.renderer_changed(renderer); },
-            upnp_interface);
-        if (!found) {
-            std::cerr << found.error().message << "\n";
-            return EXIT_FAILURE;
-        }
-        upnp = std::move(*found);
+        upnp_outputs = &outputs;
         outputs.configure_upnp(
             upnp,
             [&media, &transcodes, &streams](const trackknife::output::StreamRequest& request,
@@ -741,11 +798,10 @@ int main(int argc, char** argv) {
                                                  ? request.selection.stream_index
                                                  : probe->best_audio_stream;
                 if (selected_stream && *selected_stream >= 0) {
-                    const auto found =
-                        std::ranges::find(probe->audio_streams, *selected_stream,
-                                          &formats::AudioStreamInfo::stream_index);
-                    if (found != probe->audio_streams.end()) {
-                        source_sample_rate = found->sample_rate;
+                    const auto chosen = std::ranges::find(probe->audio_streams, *selected_stream,
+                                                          &formats::AudioStreamInfo::stream_index);
+                    if (chosen != probe->audio_streams.end()) {
+                        source_sample_rate = chosen->sample_rate;
                     }
                 }
                 const auto delivery =
@@ -766,8 +822,14 @@ int main(int argc, char** argv) {
                 }
                 const auto base = "http://" + renderer.address + ":" +
                                   std::to_string(streams->port()) + "/stream?";
+                // Long enough to play the track and pause a while; the output
+                // prepares it again before a resume or seek past this.
+                const auto lifetime = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::hours{6} +
+                    std::chrono::milliseconds{std::max<std::int64_t>(0, duration)});
+                const auto expires = std::chrono::system_clock::now() + lifetime;
                 // Distinct URLs also distinguish two consecutive occurrences of the same song.
-                const auto url = base + media->ticket(delivery, std::chrono::hours{1}) +
+                const auto url = base + media->ticket(delivery, lifetime) +
                                  "&occurrence=" + core::StableId::random().to_string();
                 std::string title = std::filesystem::path{request.raw_path}.stem().string(), artist,
                             album, artwork;
@@ -792,14 +854,15 @@ int main(int argc, char** argv) {
                                                 .selection = {},
                                                 .segment = {},
                                                 .artwork = true};
-                    artwork = base + media->ticket(cover, std::chrono::hours{1});
+                    artwork = base + media->ticket(cover, lifetime);
                 }
                 return output::RendererTrack{
                     .source = request,
                     .url = url,
                     .metadata =
                         output::renderer_didl(url, mime, duration, title, artist, album, artwork),
-                    .duration_ms = duration};
+                    .duration_ms = duration,
+                    .expires = expires};
             });
     }
 #endif
@@ -830,8 +893,8 @@ int main(int argc, char** argv) {
                                            .name = engine_name,
                                            .music_root = target.music_root,
                                            .stream_only = !target.music_root.has_value(),
-                                           .stream = stream_choice(target.nearby_kbps,
-                                                                   target.away_kbps)},
+                                           .stream =
+                                               stream_choice(target.nearby_kbps, target.away_kbps)},
             std::move(*audition));
         if (!made) {
             std::cerr << "melodyd: cannot play for " << target.address << ": "

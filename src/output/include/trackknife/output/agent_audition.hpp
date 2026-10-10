@@ -8,10 +8,10 @@
 #include "trackknife/output/stream_query.hpp"
 #include "trackknife/protocol/client.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
-#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -60,8 +60,18 @@ class AgentAudition final : public audio::Audition {
     // what it registered: whether it opens files itself or must stream.
     // `reached` is the engine's address as this agent reached it, which is
     // where it can fetch streams too.
-    void attach(std::unique_ptr<protocol::Client> client, bool files, std::string reached = {},
-                StreamWishes wishes = {});
+    // ADR-0274: a speaker that comes back after a drop says which process it
+    // is and what it plays now. The same process, still holding what it was
+    // given -- having played on from its buffer, perhaps into what was
+    // armed -- is taken at its word: what the engine knew of it is kept and
+    // its report adopted. Anything else starts afresh. Answers whether it
+    // was kept.
+    struct Returning final {
+        std::string instance;
+        std::optional<protocol::Json> report;
+    };
+    bool attach(std::unique_ptr<protocol::Client> client, bool files, std::string reached = {},
+                StreamWishes wishes = {}, Returning returning = {});
     [[nodiscard]] bool online() const;
     [[nodiscard]] bool files() const;
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
@@ -126,9 +136,9 @@ class AgentAudition final : public audio::Audition {
                const std::optional<formats::SampleRange>& segment) const;
     // A load or arm; one naming a file the agent cannot open is sent again
     // as a stream.
-    [[nodiscard]] core::Result<protocol::Json>
-    call_with_fallback(const std::string& method, protocol::Json params,
-                       const std::string& raw_path);
+    [[nodiscard]] core::Result<protocol::Json> call_with_fallback(const std::string& method,
+                                                                  protocol::Json params,
+                                                                  const std::string& raw_path);
     // The engine's path, as this agent can play it.
     [[nodiscard]] core::Result<Source>
     source_for(const std::string& raw_path, formats::AudioSourceSelection selection,
@@ -157,7 +167,13 @@ class AgentAudition final : public audio::Audition {
     // the agent's are its own business.
     std::string current_raw_;
     std::string next_raw_;
+    // Gapless handovers as the engine counts them, which never go back --
+    // a lower count reads as one more handover -- and as this agent process
+    // last reported them, which a new process starts again from nothing.
     std::uint64_t seen_transitions_{0U};
+    std::uint64_t agent_transitions_{0U};
+    // The process last attached, as it named itself.
+    std::string instance_;
     // What the engine asked of this output, kept here rather than trusted to
     // the agent: a freshly started agent, or one offline when it was asked,
     // knows none of it, and is told again on connecting.

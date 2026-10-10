@@ -7,6 +7,7 @@
 #include "trackknife/engine/job_registry.hpp"
 #include "trackknife/metadata/document.hpp"
 #include "trackknife/operations/file_publication.hpp"
+#include "trackknife/operations/metadata_commit.hpp"
 #include "trackknife/protocol/dispatch.hpp"
 
 #include <cstddef>
@@ -28,6 +29,8 @@ class Workspace;
 // file exists but has no tags to read, which can still take gains in a
 // sidecar. At most metadata_read_limit paths per call.
 inline constexpr std::size_t metadata_read_limit = 256U;
+// How many files of one metadata.read are read at once.
+inline constexpr std::size_t metadata_read_threads = 8U;
 //
 // media.probe {paths: [encoded]} answers {files: [...]}, one per path: its
 // best audio stream as {codec, sample_rate, bits, channels, bit_rate,
@@ -55,12 +58,33 @@ using MoveFollower =
 
 // Recovers the engine's journals, as Trackknife recovers its own: tag writes
 // and moves finished or rolled back where that is safe, left for the user
-// otherwise. A move finished here is followed by `follow`. Backups are
-// released, as there is no undo to keep them for. Run once, at startup,
-// before clients connect.
-[[nodiscard]] FileWorkRecovery recover_file_work(const std::filesystem::path& database,
-                                                 LocalCatalogue& catalogue,
-                                                 const MoveFollower& follow);
+// otherwise. A move finished here is followed by `follow`; an undo a crash
+// interrupted is finished. The files writes replaced are kept for undo within
+// `retention` (ADR-0263). Run once, at startup, before clients connect.
+[[nodiscard]] FileWorkRecovery
+recover_file_work(const std::filesystem::path& database, LocalCatalogue& catalogue,
+                  const MoveFollower& follow,
+                  const operations::MetadataBackupRetentionPolicy& retention = {});
+
+// ADR-0263: how long the files a write replaced are kept for undo -- the
+// engine_state document "backups.retention", else the policy's defaults.
+[[nodiscard]] operations::MetadataBackupRetentionPolicy
+backup_retention(const Workspace& workspace);
+
+// ADR-0266: where this engine keeps the files writes replace -- the
+// engine_state document "backups.location": its own folder (`undo` beside
+// its database, the default), a folder given, or beside each file (empty).
+[[nodiscard]] std::filesystem::path undo_copy_folder(const Workspace& workspace,
+                                                     const std::filesystem::path& database);
+
+// backups.retention -> {max_age_days, max_writes, max_gigabytes};
+// backups.set_retention {any of them} -> the same, kept and applied at once
+// to the backups there are. 0 keeps none.
+// backups.location -> {place: "engine" | "folder" | "beside", folder?, kept_in};
+// backups.set_location {place, folder?} -> the same: kept, and every undo
+// copy there is moved there at once. Paths are encoded raw paths.
+void register_backup_methods(protocol::Dispatcher& dispatcher, std::filesystem::path database,
+                             Workspace& workspace);
 
 // metadata.interrupted answers {recovered, error, interrupted: [{id, path,
 // message, target?}]}: what startup recovery did, and each operation it could
@@ -84,6 +108,10 @@ void register_file_work_methods(protocol::Dispatcher& dispatcher,
 //     own disk, downloaded, or resized -- kept where the engine can write it
 //     from, in `staging`, and inspected there. Named by content, so staging
 //     the same image twice keeps one copy.
+//   artwork.stage_part {upload, offset, bytes, last?} -> {received} | {image}:
+//     a large image in parts, each under the engine's line limit, appended in
+//     order to the upload a client named (hex); the last stages it as
+//     artwork.stage would. A part out of place is refused as a conflict.
 void register_artwork_methods(protocol::Dispatcher& dispatcher, std::filesystem::path staging);
 
 // Staged images outlive the plan that used them by a week, then go; run at

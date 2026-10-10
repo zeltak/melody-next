@@ -125,6 +125,7 @@ LocalListModel::LocalListModel(QObject* parent) : QAbstractTableModel(parent) {
 
 void LocalListModel::replaceRows(std::vector<LocalTrackRow> rows, const bool remember,
                                  QString label) {
+    touched();
     Edit edit;
     if (remember) {
         edit.kind = Edit::Kind::replacement;
@@ -161,6 +162,35 @@ void LocalListModel::applyTechnicals(const std::string& raw_path,
     for (auto& row : rows_) {
         if (row.raw_path == raw_path) {
             row.technicals = technicals;
+        }
+    }
+}
+
+void LocalListModel::setMissing(const std::vector<std::string>& checked,
+                                const std::vector<std::string>& missing) {
+    const std::unordered_set<std::string> gone{missing.begin(), missing.end()};
+    std::unordered_set<std::string> changed;
+    for (const auto& path : checked) {
+        const bool was = missing_.contains(path);
+        const bool is = gone.contains(path);
+        if (was != is) {
+            if (is) {
+                missing_.insert(path);
+            } else {
+                missing_.erase(path);
+            }
+            changed.insert(path);
+        }
+    }
+    if (changed.empty()) {
+        return;
+    }
+    for (std::size_t row = 0; row < rows_.size(); ++row) {
+        // How it looks, not what it is: no list edit, no search gone stale.
+        if (changed.contains(rows_[row].raw_path)) {
+            emit dataChanged(index(static_cast<int>(row), 0),
+                             index(static_cast<int>(row), local_column_count - 1),
+                             {ui::track_missing_role, Qt::ToolTipRole});
         }
     }
 }
@@ -219,6 +249,7 @@ QStringList LocalListModel::ratingHashes() const {
 
 void LocalListModel::appendRows(std::vector<LocalTrackRow> rows, const int insertion_row,
                                 const bool remember) {
+    touched();
     if (rows.empty()) {
         return;
     }
@@ -249,6 +280,7 @@ void LocalListModel::appendRows(std::vector<LocalTrackRow> rows, const int inser
 }
 
 void LocalListModel::removeRowIndexes(std::vector<int> rows, const bool remember, QString label) {
+    touched();
     rows = normalized_rows(std::move(rows), static_cast<int>(rows_.size()));
     if (rows.empty())
         return;
@@ -265,6 +297,7 @@ void LocalListModel::removeRowIndexes(std::vector<int> rows, const bool remember
 }
 
 void LocalListModel::reorderRows(std::vector<int> rows, const int insertion_row) {
+    touched();
     rows = normalized_rows(std::move(rows), static_cast<int>(rows_.size()));
     if (rows.empty()) {
         return;
@@ -330,6 +363,7 @@ void LocalListModel::reorderRows(std::vector<int> rows, const int insertion_row)
 }
 
 bool LocalListModel::applyPermutation(const std::vector<int>& order, QString label) {
+    touched();
     if (order.size() != rows_.size())
         return false;
     Edit edit;
@@ -352,6 +386,7 @@ bool LocalListModel::applyPermutation(const std::vector<int>& order, QString lab
 }
 
 void LocalListModel::applyOrder(const std::vector<int>& order) {
+    touched();
     emit layoutAboutToBeChanged();
     const auto previous = persistentIndexList();
     std::vector<int> destinations(order.size());
@@ -456,6 +491,7 @@ void LocalListModel::trimHistory() {
 }
 void LocalListModel::removePositions(const std::vector<int>& positions,
                                      std::vector<LocalTrackRow>* detached) {
+    touched();
     if (detached != nullptr)
         detached->resize(positions.size());
     for (std::size_t end = positions.size(); end > 0;) {
@@ -482,6 +518,7 @@ void LocalListModel::removePositions(const std::vector<int>& positions,
 }
 
 void LocalListModel::replayEdit(Edit& edit, const bool undoing) {
+    touched();
     if (edit.kind == Edit::Kind::reorder) {
         std::vector<int> inverse(edit.order.size());
         for (std::size_t row = 0; row < edit.order.size(); ++row)
@@ -540,6 +577,7 @@ bool LocalListModel::redo() {
     return true;
 }
 std::vector<LocalTrackRow*> LocalListModel::retainedRows() {
+    touched();
     std::vector<LocalTrackRow*> retained;
     for (auto& edit : history_)
         for (auto& row : edit.detached)
@@ -549,6 +587,7 @@ std::vector<LocalTrackRow*> LocalListModel::retainedRows() {
 
 bool LocalListModel::applyMetadata(const std::string& raw_path, const int hint_row,
                                    LocalTrackRow metadata) {
+    touched();
     const auto row = rowOfPath(raw_path, hint_row);
     if (row < 0) {
         return false;
@@ -569,8 +608,33 @@ bool LocalListModel::applyMetadata(const std::string& raw_path, const int hint_r
     return true;
 }
 
+bool LocalListModel::describeRow(const int row, const core::StableId& entry,
+                                 LocalTrackRow described) {
+    if (row < 0 || row >= static_cast<int>(rows_.size())) {
+        return false;
+    }
+    auto& current = rows_[static_cast<std::size_t>(row)];
+    if (current.entry_id != entry) {
+        return false;
+    }
+    touched();
+    described.entry_id = current.entry_id;
+    described.raw_path = current.raw_path;
+    described.logical_reference = current.logical_reference;
+    described.selection = current.selection;
+    described.segment = current.segment;
+    if (!described.duration_ms) {
+        described.duration_ms = current.duration_ms;
+    }
+    described.probed = true;
+    current = std::move(described);
+    emitRowChanged(row);
+    return true;
+}
+
 bool LocalListModel::applyProbeRows(const std::string& raw_path, const int hint_row,
                                     std::vector<LocalTrackRow> rows) {
+    touched();
     if (rows.empty()) {
         return false;
     }
@@ -619,6 +683,7 @@ core::Result<std::size_t>
 LocalListModel::applyCommittedMetadata(const std::string& raw_path,
                                        const metadata::MetadataDocument& document,
                                        const core::LocalSourceRevision& published_revision) {
+    touched();
     const auto matches = [&raw_path](const LocalTrackRow& row) { return row.raw_path == raw_path; };
     auto retained_rows = retainedRows();
     if (std::ranges::any_of(retained_rows, [&](const auto* row) {
@@ -684,6 +749,7 @@ LocalListModel::applyCommittedMetadata(const std::string& raw_path,
 std::size_t
 LocalListModel::applyCueReplayGain(const std::string& reference, const bool prefix_match,
                                    const std::vector<CueReplayGainFieldUpdate>& fields) {
+    touched();
     if (fields.empty()) {
         return 0U;
     }
@@ -730,6 +796,7 @@ std::size_t
 LocalListModel::applySidecarLoudness(const std::string& raw_path,
                                      const SidecarRowIdentity& identity,
                                      const std::vector<CueReplayGainFieldUpdate>& fields) {
+    touched();
     if (fields.empty()) {
         return 0U;
     }
@@ -779,6 +846,7 @@ LocalListModel::applyCommittedRelocation(const std::string& source_raw_path,
                                          const std::string& target_raw_path,
                                          const core::LocalSourceRevision& previous_revision,
                                          const core::LocalSourceRevision& published_revision) {
+    touched();
     if (source_raw_path.empty() || target_raw_path.empty() || source_raw_path == target_raw_path ||
         previous_revision.inode == 0U || published_revision.inode == 0U) {
         return std::unexpected(core::Error{
@@ -968,6 +1036,8 @@ QVariant LocalListModel::data(const QModelIndex& index, const int role) const {
         return groupKey(index.row());
     case ui::track_disc_start_role:
         return discStart(index.row());
+    case ui::track_missing_role:
+        return missing_.contains(row.raw_path);
     case ui::track_album_group_start_role: {
         const auto row_index = static_cast<std::size_t>(index.row());
         // A lone track is an album of its own (ADR-0250).
@@ -1003,7 +1073,9 @@ QVariant LocalListModel::data(const QModelIndex& index, const int role) const {
         return QBrush{ui::ratingStarColor()};
     }
     if (role == Qt::ToolTipRole) {
-        return escaped(row.raw_path);
+        return missing_.contains(row.raw_path)
+                   ? tr("%1\nThe file is not there.").arg(escaped(row.raw_path))
+                   : escaped(row.raw_path);
     }
     return {};
 }
@@ -1039,7 +1111,8 @@ namespace {
     auto disc = metadata_value(row.metadata, {"discnumber", "disc"});
     disc = disc.substr(0, disc.find('/'));
     const auto first = disc.find_first_not_of(" 0");
-    return first == std::string::npos ? std::string{} : disc.substr(first, disc.find_last_not_of(' ') - first + 1);
+    return first == std::string::npos ? std::string{}
+                                      : disc.substr(first, disc.find_last_not_of(' ') - first + 1);
 }
 
 } // namespace
@@ -1074,7 +1147,8 @@ QString LocalListModel::discStart(const int row) const {
         return {};
     }
     auto label = QStringLiteral("Disc ") + display_utf8(disc);
-    if (const auto subtitle = metadata_value(rows_[at].metadata, {"discsubtitle", "setsubtitle"}); !subtitle.empty()) {
+    if (const auto subtitle = metadata_value(rows_[at].metadata, {"discsubtitle", "setsubtitle"});
+        !subtitle.empty()) {
         label += QStringLiteral(" · ") + display_utf8(subtitle);
     }
     return label;

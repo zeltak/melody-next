@@ -13,8 +13,8 @@
 #include "bench/local_playback_service.hpp"
 #include "bench/mpris_service.hpp"
 #include "bench/output_profile_store.hpp"
-#include "bench/remote_mount.hpp"
 #include "bench/remote_engines.hpp"
+#include "bench/remote_mount.hpp"
 #include "trackknife/audio/local_playback.hpp"
 #include "trackknife/core/cancellation.hpp"
 #include "trackknife/core/local_sources.hpp"
@@ -41,6 +41,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -58,6 +59,7 @@ namespace trackknife::bench {
 class LocalLibraryPanel;
 class LibraryBrowser;
 enum class LocalLibraryAction;
+class TabStore;
 class WorkspaceView;
 
 // Widget properties, persisted UI state and JSON all carry a document identity
@@ -71,7 +73,6 @@ class WorkspaceView;
     auto parsed = core::StableId::parse(text.toStdString());
     return parsed ? *parsed : core::StableId{};
 }
-
 
 // ADR-0220: the workspace a window shows -- the engines it reaches, the lists
 // open from them, what plays and waits to, and the work under way -- without
@@ -93,7 +94,6 @@ class Workspace final : public QObject {
     void setView(WorkspaceView* view) { view_ = view; }
     [[nodiscard]] WorkspaceView* view() const { return view_; }
 
-
     struct ListTab {
         persistence::ListDocument document;
         LocalListModel* model{nullptr};
@@ -101,6 +101,23 @@ class Workspace final : public QObject {
         ui::TrackViewLayout view_layout;
         QByteArray preserved_view_layout;
         bool view_layout_persistence_protected{false};
+        // What the last successful save wrote of this list -- its content
+        // revision and header; none, not saved yet. Unchanged since, a save
+        // writes its header only.
+        struct Saved {
+            std::uint64_t revision{0};
+            std::string name;
+            persistence::ListKind kind{persistence::ListKind::scratch};
+            bool pinned{false};
+            bool dirty{false};
+            std::string engine;
+            friend bool operator==(const Saved&, const Saved&) = default;
+        };
+        std::optional<Saved> saved;
+        // Said in the middle of the list while it is empty, in place of how
+        // to fill it: a kept search still being collected, or what it found
+        // nothing for. Empty, the usual words.
+        QString notice;
     };
     struct CrossTabMoveEdit {
         QString source_id;
@@ -197,11 +214,27 @@ class Workspace final : public QObject {
         bool move{false};
     };
 
+    // Kept searches on their way, by library, in the order asked: each
+    // library answers its searches in turn.
+    std::map<const LibraryBrowser*, std::deque<core::StableId>> pending_searches_;
     std::vector<std::unique_ptr<ListTab>> list_tabs_;
     QHash<QString, QByteArray> restored_track_view_layouts_;
     MprisService* mpris_{nullptr};
     // The cover file given to the desktop, and which album it is.
     QString desktop_cover_key_;
+    // A new track's cover still being fetched, by group key, and the track
+    // whose notification waits for it -- briefly: a notification without its
+    // cover, for an album no open list had shown yet (queued from
+    // melody-cli, say), looked broken.
+    QString desktop_cover_waiting_;
+    // The engine plays an entry no list here holds yet: its queue is on its
+    // way (another client -- melody-cli -- queued it).
+    bool desktop_track_unknown_{false};
+    QString notification_waiting_track_;
+    // Waited for long enough: this track's notification goes as it is.
+    QString notification_cover_given_up_;
+    QTimer* notification_wait_{nullptr};
+    QElapsedTimer notification_waited_;
     QString desktop_cover_path_;
     DesktopNotifier* notifier_{nullptr};
     ui::ListPersistenceService* persistence_{nullptr};
@@ -238,11 +271,24 @@ class Workspace final : public QObject {
     // holds, and if not, who changed it".
     QString engine_queue_;
     quint64 engine_queue_revision_{0};
+    // ADR-0269: the engine's Up Next revision last taken; none, not yet --
+    // the next state is taken whatever it says.
+    std::optional<quint64> engine_requests_revision_;
+    // Whether the playing engine's Up Next has been heard since it became
+    // the one playing: until then this window states nothing to it.
+    bool engine_requests_known_{false};
     // The last ask for the engine's queue, per purpose: only its answer is
     // taken, an earlier one being out of date by the time it comes.
     quint64 engine_queue_asked_{0};
     quint64 engine_reattach_asked_{0};
     QTimer* persistence_timer_{nullptr};
+    // ADR-0259: what of its tabs this window keeps -- not the lists.
+    std::unique_ptr<TabStore> tab_store_;
+    // The tab that was shown when the window last closed.
+    std::optional<core::StableId> restored_active_;
+    // ADR-0259: the tabs restored come from the lists this window used to
+    // keep, so none of them is in the tab store yet.
+    bool migrating_{false};
     QFutureWatcher<DiscoveryOutcome> discovery_watcher_;
     QString discovery_target_document_;
     int discovery_insertion_row_{-1};
@@ -252,6 +298,9 @@ class Workspace final : public QObject {
     bool discovery_running_{false};
     QFutureWatcher<std::vector<ProbeOutcome>> probe_watcher_;
     std::deque<ProbeJob> probe_queue_;
+    // Tabs being described, and those taken up again meanwhile.
+    QSet<QString> describing_;
+    QSet<QString> describe_again_;
     bool probe_running_{false};
     core::CancellationSource probe_cancellation_;
     QFutureWatcher<void> artwork_watcher_;
@@ -300,6 +349,7 @@ class Workspace final : public QObject {
     void rememberContinuationRules();
     // Last explicitly played local list; transport stop does not release it.
     QString active_local_list_id_;
+
   public:
     // Opens the workspace: this computer's engine connected, the saved lists
     // restored and the remote engines connected; then the window is told.
@@ -347,6 +397,10 @@ class Workspace final : public QObject {
     // every engine's destinations as places for the manager (ADR-0237).
     [[nodiscard]] OutputProfileStore
     buildOutputProfileStore(const EngineKey& destinations_of = EngineKey::local());
+    // ADR-0237: an engine's folders, listed by it, for choosing one on its
+    // machine.
+    [[nodiscard]] EngineFolderLister
+    engineFolderLister(const std::shared_ptr<engine::RemoteFileWork>& work);
     // What a file tool changed, followed by the lists, the library and the
     // queue.
     void applyCommittedMetadata(const operations::MetadataCommitResult& result);
@@ -382,6 +436,8 @@ class Workspace final : public QObject {
     struct ContinuationChoice {
         QString rule_id;
         QString name;
+        // ADR-0258: one of the rules that ship.
+        bool shipped{false};
     };
     [[nodiscard]] std::vector<ContinuationChoice> continuationChoices() const;
     // The rule `tab` continues with, as its engine keeps it; none, nothing.
@@ -404,6 +460,16 @@ class Workspace final : public QObject {
     // The lists. One is added with its rows as its document holds them, and
     // the window is asked to show it; its tags and covers are looked for.
     ListTab* addList(persistence::ListDocument document, bool select);
+    // A list with its rows already made from its items -- made off the
+    // window's thread, as restoring does.
+    struct PreparedList {
+        persistence::ListDocument document;
+        std::vector<LocalTrackRow> rows;
+    };
+    ListTab* addList(PreparedList prepared, bool select);
+    // The stored lists as rows, for a worker thread: the slow part of a start.
+    [[nodiscard]] static std::vector<PreparedList>
+    prepareLists(std::vector<persistence::ListDocument> documents);
     // Rows a search found (ADR-0153, ADR-0227), put in a tab of the engine
     // whose library they are: the current one if it is, else that engine's
     // first, else (for another engine) its own tab; or a new tab.
@@ -461,9 +527,27 @@ class Workspace final : public QObject {
     // it; the current database kept for rollback.
     static void scheduleWorkspaceRestore(const QString& path);
     // The lists as the workspace starts: those saved, or one to begin with.
-    void restoreLists(std::vector<persistence::ListDocument> documents);
+    void restoreLists(std::vector<PreparedList> documents);
+    // ADR-0259: the tabs as this window keeps them, each from its cache --
+    // or, its cache gone, empty until its engine answers.
+    void restoreFromTabStore();
+    void sayVersion(EnginePlayback& playback);
+    // What a start does once the lists are restored.
+    void restoredWorkspace(const QString& error);
     // What is saved of each open list, in the order they are shown.
     [[nodiscard]] std::vector<persistence::ListDocument> collectDocuments();
+    // One list as it is stored, with its items; and without them.
+    [[nodiscard]] persistence::ListDocument documentOf(const ListTab& tab) const;
+    // ADR-0256: a tab's entries as its engine stores them -- with what a
+    // queue entry needs that the engine cannot read, so the list plays by
+    // reference.
+    [[nodiscard]] static std::vector<persistence::EngineListItem> engineItemsOf(const ListTab& tab);
+    // The sync's way of reading them, by list.
+    [[nodiscard]] EngineListSync::ItemsOf engineItems();
+    [[nodiscard]] static persistence::ListDocument headerOf(const ListTab& tab);
+    [[nodiscard]] static ListTab::Saved savedStateOf(const ListTab& tab);
+    // Every list for a save: with items where they changed since the last.
+    [[nodiscard]] std::vector<persistence::ListDocumentWrite> collectWrites();
     [[nodiscard]] std::vector<persistence::TrackViewPreset> collectTrackViewLayouts();
     // A presentation's columns as a new list shows them.
     [[nodiscard]] static ui::TrackViewLayout defaultTrackViewLayout(
@@ -481,7 +565,8 @@ class Workspace final : public QObject {
     // the same entry of the same file keeps what is already known of it.
     void adoptEngineList(const persistence::ListDocument& document);
     // The open lists of one engine, in the order shown, by id and name.
-    [[nodiscard]] std::vector<std::pair<QString, QString>> listTargets(const EngineKey& engine) const;
+    [[nodiscard]] std::vector<std::pair<QString, QString>>
+    listTargets(const EngineKey& engine) const;
     // An engine's list opened here -- or shown, when it already is -- and
     // then whatever is to be done with it.
     void openEngineList(const EngineKey& key, const QString& id, std::function<void()> then = {});
@@ -593,6 +678,15 @@ class Workspace final : public QObject {
     void rate(const EngineKey& engine, const QStringList& hashes, bool album, unsigned rating);
     // A rating an engine stored, shown in its lists.
     void adoptEngineRating(const EngineKey& engine, const QString& hash, unsigned rating);
+    // What changed in an engine's library, followed by what shows it.
+    void adoptLibraryChange(const EngineKey& engine, const std::vector<std::string>& paths,
+                            const std::vector<std::string>& albums, bool everything);
+    // ADR-0268: a list's rows whose files are not there, asked of its engine
+    // -- every row, soon (rows came), or those at `paths` now.
+    void scheduleMissingCheck(const QString& document_id);
+    void checkMissing(const QString& document_id, std::vector<std::string> paths);
+    QSet<QString> missing_pending_;
+    bool missing_scheduled_{false};
     // ADR-0237: whether an engine does the file tools' work, asked each time
     // it connects; one that does is handed this workspace's naming layouts.
     void watchFileWork(EngineLink& link);
@@ -636,6 +730,9 @@ class Workspace final : public QObject {
     void syncEngineQueue();
     void syncEngineRequests();
     void adoptEngineQueue();
+    // ADR-0269: Up Next as the playing engine holds it, taken as this
+    // window's -- what another client added, reordered or cleared shows.
+    void adoptEngineRequests();
     void adoptEngineQueue(std::vector<LocalTrackRow> held);
     // The playing entry's row in `tab`, or -1.
     [[nodiscard]] int resolvePlaybackRow(const ListTab* tab) const;
@@ -742,6 +839,12 @@ class Workspace final : public QObject {
         QString tooltip;
         QString window_title{QStringLiteral("Trackknife")};
         QString cover_entry;
+        // What plays, to rate from the header: its rating and key on the
+        // engine of the list it plays from -- where the row's Rate stores
+        // it. No key: not in a library, nothing to rate.
+        QString rating_hash;
+        EngineKey rating_engine;
+        unsigned rating{0U};
     };
     [[nodiscard]] NowPlaying nowPlaying(const EnginePlayback::State& state);
     // ADR-0226, ADR-0228: where it sounds. Taken from each state -- saying
@@ -808,6 +911,10 @@ class Workspace final : public QObject {
                        LocalLibraryAction action, const QString& name = {});
     void libraryAddToList(LibraryBrowser& browser, std::vector<persistence::LibraryEntry> entries,
                           const QString& id);
+    // ADR-0140: Enter keeps a search as a tab, opened at once and filled
+    // when the results come -- or saying there were none.
+    void librarySearchStarted(LibraryBrowser& browser, const QString& query);
+    void librarySearchFailed(LibraryBrowser& browser, const QString& why);
     void librarySearchCommitted(LibraryBrowser& browser, const QString& query,
                                 std::vector<LocalTrackRow> rows);
     [[nodiscard]] int insertionForNext(const ListTab& target);
@@ -817,6 +924,9 @@ class Workspace final : public QObject {
     void startLastFm();
     void sampleLastFm(const EnginePlayback::State& state);
     // What plays, as MPRIS and the track-change notification show it.
+    // What the desktop -- media keys, the notification -- is told of what an
+    // engine reports.
+    [[nodiscard]] MprisPlaybackState desktopStateOf(const EnginePlayback::State& engine);
     void publishDesktopState();
     // The play order as MPRIS names it: repeat and single together loop the
     // track ("Track"), repeat alone the list ("Playlist"), else "None"; and
@@ -836,6 +946,11 @@ class Workspace final : public QObject {
     void startDiscovery(std::vector<std::string> raw_paths, QString target_document_id,
                         int insertion_row, bool replace_and_play = false);
     void enqueueUnprobedRows(ListTab& tab);
+    // ADR-0259: rows of an engine's list the engine's library can describe,
+    // filled in from it a part at a time, top first.
+    void describeEngineRows(ListTab& tab);
+    void describeEngineRowsFrom(const QString& document_id, std::vector<core::StableId> entries,
+                                std::size_t from);
     void enrichRemoteRows(ListTab& tab);
     // Rows from paths a remote engine gave -- a drag from its library --
     // without looking for them on this computer, where they need not be.
@@ -855,7 +970,6 @@ class Workspace final : public QObject {
     void finishArtworkLoad();
 
     WorkspaceView* view_{nullptr};
-
 };
 
 } // namespace trackknife::bench

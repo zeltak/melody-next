@@ -83,6 +83,17 @@ class Player final {
     [[nodiscard]] std::vector<QueueEntry> queue() const;
     // The list the queue came from; empty when not known.
     [[nodiscard]] std::string queue_list() const;
+    // ADR-0259: the list `from` is now `to` -- a draft saved into the list it
+    // drafted, with the same entries -- so a queue played from it is played
+    // from `to`. Says whether it was.
+    bool adopt_queue_list(const std::string& from, const std::string& to);
+    // ADR-0256: the list `list` changed, and these are its entries now. When
+    // the queue was played from it, the queue follows: in the list's order,
+    // without what the list dropped, with what it gained -- `fresh` -- and
+    // without what had already left the queue (consumed, say). Answers
+    // whether it did.
+    bool follow_list(const std::string& list, std::vector<QueueEntry> entries,
+                     const std::vector<core::StableId>& fresh);
     // ADR-0253: whether nothing would follow the entry playing now -- the
     // list ends after it under the modes and asks in force. Repeat never
     // ends a list; single stops on purpose, which is not ending either.
@@ -108,6 +119,9 @@ class Player final {
     // mistake worth reporting, not a second way to add tracks.
     [[nodiscard]] core::Result<void> request(const core::StableId& entry_id);
     [[nodiscard]] std::vector<core::StableId> requests() const;
+    // ADR-0269: the asks as the entries they name, in order -- what a client
+    // shows as Up Next.
+    [[nodiscard]] std::vector<QueueEntry> request_entries() const;
 
     // Replaces the whole request list in one go. A client that owns the
     // up-next order -- the window's panel does -- has to be able to state it,
@@ -165,6 +179,11 @@ class Player final {
     // resume -- a restore that failed because the output was not there yet.
     [[nodiscard]] core::Result<void> resume_output(std::optional<std::int64_t> position_ms,
                                                    std::optional<bool> playing);
+    // ADR-0274: an agent back after a drop that played on from its buffer,
+    // and holds `raw_path`: true, and nothing taken up again, when that is
+    // the playing entry -- or the one armed after it, handed over while the
+    // agent was away, which its report moves the player on to.
+    [[nodiscard]] bool keep_output(const std::string& raw_path);
 
     // Which sink plays and how much decoded audio is held ahead of it. The
     // engine's, not a client's: they describe the machine the engine runs on,
@@ -230,6 +249,10 @@ class Player final {
         // How many explicit asks are outstanding. A client renders up-next
         // from playback.requests; this is enough to show that there are any.
         std::size_t requests{0};
+        // ADR-0269: bumped whenever the asks change -- added, reordered,
+        // played, cleared -- by any client or by playing one. A client
+        // showing Up Next asks for them again when it moves.
+        std::uint64_t requests_revision{0};
         audio::PlaybackModes modes;
         int volume_percent{100};
         // What is armed to follow the current track without a gap, if
@@ -357,6 +380,7 @@ class Player final {
     // none does, having dropped the ones that do not.
     [[nodiscard]] std::optional<core::Result<void>> start_next_request_locked();
     // An entry by identity, in the list or among the asks; null when neither.
+    void replace_queue_locked(std::vector<QueueEntry> entries, std::string list);
     [[nodiscard]] const QueueEntry* find_locked(const core::StableId& entry_id) const;
     // Drops asks nothing refers to any more: not requested, not playing.
     void prune_asks_locked();
@@ -426,6 +450,7 @@ class Player final {
     // Identities rather than sources, so a request survives the queue being
     // reordered for the same reason playback does.
     std::vector<core::StableId> requests_;
+    std::uint64_t requests_revision_{0};
     // Tracks asked for from outside the list -- up-next fed from the library.
     // Kept apart from the queue: they are not list entries, so they take no
     // part in its order, its consume or what a client shows as the list. They

@@ -28,6 +28,12 @@ core::Result<void> Workspace::replace_all(std::span<const persistence::ListDocum
     return repository_.replace_all(documents);
 }
 
+core::Result<void>
+Workspace::save_workspace(std::span<const persistence::ListDocumentWrite> documents) {
+    const std::lock_guard guard{*mutex_};
+    return repository_.save_workspace(documents);
+}
+
 core::Result<persistence::LocalMetadataRefreshResult>
 Workspace::refresh_local_metadata(const persistence::LocalMetadataRefresh& refresh) {
     const std::lock_guard guard{*mutex_};
@@ -178,28 +184,59 @@ Workspace::load_engine_list(const core::StableId& id) const {
     return repository_.load_engine_list(id);
 }
 
-core::Result<persistence::EngineListSummary>
-Workspace::save_engine_list(const core::StableId& id, const std::string_view name,
-                         const persistence::EngineListKind kind,
-                         const std::vector<persistence::EngineListItem>& items,
-                         const std::optional<std::uint64_t> expected_revision,
-                         const std::int64_t now_ms) {
+core::Result<persistence::EngineListSummary> Workspace::save_engine_list(
+    const core::StableId& id, const std::string_view name, const persistence::EngineListKind kind,
+    const std::vector<persistence::EngineListItem>& items,
+    const std::optional<std::uint64_t> expected_revision, const std::int64_t now_ms) {
     const std::lock_guard guard{*mutex_};
     return repository_.save_engine_list(id, name, kind, items, expected_revision, now_ms);
 }
 
+core::Result<persistence::EngineList>
+Workspace::edit_engine_list(const core::StableId& id, const std::uint64_t expected_revision,
+                            const std::vector<persistence::ListEdit>& edits,
+                            const std::int64_t now_ms, const std::optional<std::string_view> name,
+                            const std::optional<persistence::EngineListKind> kind,
+                            const bool with_items) {
+    const std::lock_guard guard{*mutex_};
+    return repository_.edit_engine_list(id, expected_revision, edits, now_ms, name, kind,
+                                        with_items);
+}
+
 core::Result<persistence::EngineListSummary>
 Workspace::rename_engine_list(const core::StableId& id, const std::string_view name,
-                           const std::optional<std::uint64_t> expected_revision,
-                           const std::int64_t now_ms) {
+                              const std::optional<std::uint64_t> expected_revision,
+                              const std::int64_t now_ms) {
     const std::lock_guard guard{*mutex_};
     return repository_.rename_engine_list(id, name, expected_revision, now_ms);
 }
 
-core::Result<bool> Workspace::delete_engine_list(const core::StableId& id,
-                                              const std::optional<std::uint64_t> expected_revision) {
+core::Result<bool>
+Workspace::delete_engine_list(const core::StableId& id,
+                              const std::optional<std::uint64_t> expected_revision) {
     const std::lock_guard guard{*mutex_};
     return repository_.delete_engine_list(id, expected_revision);
+}
+
+core::Result<std::pair<std::uint64_t, std::vector<std::optional<std::string>>>>
+Workspace::engine_list_entry_paths(const core::StableId& id,
+                                   const std::vector<core::StableId>& entries) const {
+    const std::lock_guard guard{*mutex_};
+    return repository_.engine_list_entry_paths(id, entries);
+}
+
+core::Result<persistence::EngineListSummary>
+Workspace::draft_engine_list(const core::StableId& of, const core::StableId& id,
+                             const std::int64_t now_ms) {
+    const std::lock_guard guard{*mutex_};
+    return repository_.draft_engine_list(of, id, now_ms);
+}
+
+core::Result<persistence::EngineListSummary>
+Workspace::commit_engine_list_draft(const core::StableId& id, const bool force,
+                                    const std::int64_t now_ms) {
+    const std::lock_guard guard{*mutex_};
+    return repository_.commit_engine_list_draft(id, force, now_ms);
 }
 
 core::Result<std::vector<persistence::EngineListSummary>>

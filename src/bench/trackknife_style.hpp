@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 
+#include <QFrame>
 #include <QProxyStyle>
-#include <QTabBar>
-#include <QVariantAnimation>
 #include <QWidget>
 
 #include <cstdint>
@@ -70,6 +69,18 @@ class TrackknifeStyle final : public QProxyStyle {
                             QPainter* painter, const QWidget* widget = nullptr) const override;
 };
 
+// A footer under a hairline, drawn from the palette as it is when painted:
+// a style sheet's border, which this replaces, froze the palette of every
+// widget below it at first show -- the status line kept a light palette's
+// dark text after the scheme turned dark.
+class RuledFrame final : public QFrame {
+  public:
+    explicit RuledFrame(QWidget* parent = nullptr);
+
+  protected:
+    void paintEvent(QPaintEvent* event) override;
+};
+
 // A header, footer or side area, shaded: a step off the window (sunken),
 // with a hairline toward the content on one edge.
 class Band final : public QWidget {
@@ -82,29 +93,6 @@ class Band final : public QWidget {
 
   private:
     Edge edge_;
-};
-
-// A choice of a few sources: one rounded box
-// split into equal segments, the chosen one lifted out of it, the lift
-// sliding to a segment chosen. A QTabBar still, for everything that asks it
-// which tab is current.
-class SegmentedTabBar final : public QTabBar {
-  public:
-    explicit SegmentedTabBar(QWidget* parent = nullptr);
-
-  protected:
-    [[nodiscard]] QSize tabSizeHint(int index) const override;
-    [[nodiscard]] QSize minimumTabSizeHint(int index) const override;
-    [[nodiscard]] QSize sizeHint() const override;
-    [[nodiscard]] QSize minimumSizeHint() const override;
-    void paintEvent(QPaintEvent* event) override;
-    void mouseMoveEvent(QMouseEvent* event) override;
-    void leaveEvent(QEvent* event) override;
-
-  private:
-    [[nodiscard]] qreal segment() const;
-    QVariantAnimation lift_;
-    int hovered_{-1};
 };
 
 } // namespace trackknife::bench

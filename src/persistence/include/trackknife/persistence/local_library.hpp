@@ -120,12 +120,19 @@ struct LibraryEntry {
 struct LibraryPage {
     std::vector<LibraryEntry> entries;
     bool more{false};
+    // ADR-0273: a view's query that named a file answered with the way to
+    // it -- its node at each level, from the top -- rather than a node's
+    // children. Said, so an engine that does not know the question is not
+    // read as having answered it.
+    bool located{false};
 };
 
 // Presentation snapshot only; never a complete native metadata write baseline.
 struct LibraryTrackSnapshot {
     std::string raw_path;
     TkqRowFacts facts;
+    // The file as it was when its tags were indexed (ADR-0259).
+    std::optional<core::LocalSourceRevision> revision;
 };
 
 // ADR-0254: an indexed track as a view groups it -- the entry the tree shows,
@@ -218,6 +225,11 @@ class LocalLibrary final {
     core::Result<std::vector<LibraryTrackSnapshot>>
     cached_tracks(const std::vector<std::string>& raw_paths,
                   const core::CancellationToken& cancellation = {}) const;
+    // ADR-0259: the same, with nothing for a path the library does not
+    // index -- a list may hold files from anywhere.
+    core::Result<std::vector<std::optional<LibraryTrackSnapshot>>>
+    described_tracks(const std::vector<std::string>& raw_paths,
+                     const core::CancellationToken& cancellation = {}) const;
     core::Result<std::optional<std::string>>
     artwork_source(const std::string& album_key,
                    const core::CancellationToken& cancellation = {}) const;
@@ -257,14 +269,19 @@ class LocalLibrary final {
     // library that was deleted.
     core::Result<std::size_t> refresh(const std::vector<std::string>& raw_paths,
                                       const core::CancellationToken& cancellation = {});
+    // The albums a change at these paths touches, by album key: a track's
+    // own; every album under a folder; and for a path with none under it --
+    // a cover image -- every album in its folder and below. No filesystem
+    // access.
+    [[nodiscard]] core::Result<std::vector<std::string>>
+    albums_touching(const std::vector<std::string>& raw_paths) const;
     // See LibraryFolder. A trailing slash names the same folder.
     [[nodiscard]] core::Result<LibraryFolder>
     folder(const std::string& raw_path, const core::CancellationToken& cancellation = {}) const;
     // ADR-0232: what is indexed under `folder`, in path order, the page after
     // the path `after` (empty for the first). No filesystem access.
     core::Result<LibraryInventoryPage> inventory(const std::string& folder,
-                                                 const std::string& after,
-                                                 std::size_t limit) const;
+                                                 const std::string& after, std::size_t limit) const;
 
   private:
     struct Impl;

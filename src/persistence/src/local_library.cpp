@@ -951,6 +951,33 @@ std::pair<std::uint64_t, std::int64_t> revision_size_and_time(const std::string&
     return {size, seconds};
 }
 
+// A revision key read back whole; nothing for one of an older form.
+std::optional<core::LocalSourceRevision> revision_from_key(const std::string& key) {
+    std::array<std::string_view, 6> parts{};
+    std::string_view rest{key};
+    for (std::size_t index = 0; index < parts.size(); ++index) {
+        const auto colon = rest.find(':');
+        if ((colon == std::string_view::npos) != (index + 1U == parts.size())) {
+            return std::nullopt;
+        }
+        parts[index] = rest.substr(0, colon);
+        rest.remove_prefix(colon == std::string_view::npos ? rest.size() : colon + 1U);
+    }
+    if (parts[0] != "2") {
+        return std::nullopt;
+    }
+    core::LocalSourceRevision revision;
+    const auto number = [](const std::string_view text, auto& value) {
+        return std::from_chars(text.data(), text.data() + text.size(), value).ec == std::errc{};
+    };
+    if (!number(parts[1], revision.device) || !number(parts[2], revision.inode) ||
+        !number(parts[3], revision.size) || !number(parts[4], revision.modification_time_seconds) ||
+        !number(parts[5], revision.modification_time_nanoseconds)) {
+        return std::nullopt;
+    }
+    return revision;
+}
+
 } // namespace
 
 struct LocalLibrary::Impl {
@@ -1220,15 +1247,13 @@ core::Result<LibraryPage> LocalLibrary::query(const LibraryQuery& query,
         // lists a whole level, and the cap here was once 200 whatever was
         // asked, which put most of a real library behind "Show more…".
         const auto limit = std::clamp<std::size_t>(query.limit, 1U, filter_match_cap);
-        Statement statement{db,
-                            "SELECT " + columns + " FROM local_library_tracks" +
-                                (query.kind == LibraryEntryKind::track && !query.newest_first &&
-                                         !query.random
-                                     ? with_album_years("local_library_tracks")
-                                     : std::string{}) +
-                                filter.sql +
-                                order + " LIMIT " + std::to_string(limit + 1U) + " OFFSET " +
-                                std::to_string(std::min<std::size_t>(query.offset, 1'000'000U))};
+        Statement statement{
+            db, "SELECT " + columns + " FROM local_library_tracks" +
+                    (query.kind == LibraryEntryKind::track && !query.newest_first && !query.random
+                         ? with_album_years("local_library_tracks")
+                         : std::string{}) +
+                    filter.sql + order + " LIMIT " + std::to_string(limit + 1U) + " OFFSET " +
+                    std::to_string(std::min<std::size_t>(query.offset, 1'000'000U))};
         filter.bind(statement);
         LibraryPage page;
         while (statement.next()) {
@@ -1376,6 +1401,9 @@ struct FilterRow {
 
 // One row of filter_columns. Every reader of those columns goes through
 // here, so a path that shows results cannot hold less of a row than another.
+// The columns of filter_columns, which read_filter_row reads.
+constexpr int filter_column_count = 20;
+
 void read_filter_row(Statement& select, FilterRow& row) {
     row.raw_path = select.bytes(0);
     row.facts.title = select.bytes(1);
@@ -1640,17 +1668,16 @@ collect_filter_matches(sqlite3* db, const query::CompiledTkq& compiled, const Fi
     // Each folder below: its name, what it holds, whether it has folders of
     // its own, and -- for one album -- that album.
     Statement below{
-        db,
-        "SELECT g.*,coalesce((SELECT rating FROM local_ratings WHERE hash=g.rating_key),0) "
-        "FROM (SELECT name,count(*),sum(available),count(DISTINCT album_key),min(album_key),"
-        "max(deeper),min(artist),min(album),min(date),max(added),"
-        "CASE WHEN min(duration_ms)<0 THEN -1 ELSE sum(duration_ms) END,"
-        "min(album_rating_hash) AS rating_key FROM ("
-        "SELECT substr(raw_path,?1,instr(substr(raw_path,?1),x'2f')-1) AS name,"
-        "instr(substr(raw_path,?1+instr(substr(raw_path,?1),x'2f')),x'2f')>0 AS deeper,"
-        "available,album_key,artist,album,date,added,duration_ms,album_rating_hash "
-        "FROM local_library_tracks WHERE raw_path>=?2 AND raw_path<?3 "
-        "AND instr(substr(raw_path,?1),x'2f')>0) GROUP BY name) g ORDER BY g.name"};
+        db, "SELECT g.*,coalesce((SELECT rating FROM local_ratings WHERE hash=g.rating_key),0) "
+            "FROM (SELECT name,count(*),sum(available),count(DISTINCT album_key),min(album_key),"
+            "max(deeper),min(artist),min(album),min(date),max(added),"
+            "CASE WHEN min(duration_ms)<0 THEN -1 ELSE sum(duration_ms) END,"
+            "min(album_rating_hash) AS rating_key FROM ("
+            "SELECT substr(raw_path,?1,instr(substr(raw_path,?1),x'2f')-1) AS name,"
+            "instr(substr(raw_path,?1+instr(substr(raw_path,?1),x'2f')),x'2f')>0 AS deeper,"
+            "available,album_key,artist,album,date,added,duration_ms,album_rating_hash "
+            "FROM local_library_tracks WHERE raw_path>=?2 AND raw_path<?3 "
+            "AND instr(substr(raw_path,?1),x'2f')>0) GROUP BY name) g ORDER BY g.name"};
     below.number(1, rest);
     below.blob(2, from);
     below.blob(3, to);
@@ -1769,10 +1796,9 @@ core::Result<LibraryPage> LocalLibrary::filter(const query::CompiledTkq& compile
         LibraryPage page;
         if (!plan.residual && !compiled.sort) {
             // Fully indexable and unsorted: page in SQL like ordinary queries.
-            Statement statement{db, std::string{"SELECT "} + filter_columns +
-                                        filter_from + filter_where(plan) +
-                                        filter_order + " LIMIT " + std::to_string(page_limit + 1U) +
-                                        " OFFSET " +
+            Statement statement{db, std::string{"SELECT "} + filter_columns + filter_from +
+                                        filter_where(plan) + filter_order + " LIMIT " +
+                                        std::to_string(page_limit + 1U) + " OFFSET " +
                                         std::to_string(std::min<std::size_t>(offset, 1'000'000U))};
             if (plan.pushed) {
                 bind_clause(statement, *plan.pushed);
@@ -1838,41 +1864,43 @@ core::Result<void> LocalLibrary::each_track(const std::function<void(LibraryView
                                             const bool history,
                                             const core::CancellationToken& cancellation) const {
     return checked([&] {
-        auto* db = implementation_->db;
-        QueryCancellation guard{db, cancellation};
-        require_complete_field_index(db);
-        Transaction snapshot{db, true};
-        const auto played = history ? collect_history(db, cancellation)
-                                    : std::map<std::string, std::array<std::int64_t, 6>>{};
-        Statement select{db, std::string{"SELECT "} + filter_columns + ",t.available" +
-                                 filter_from + filter_order};
-        Statement fields{db, "SELECT canonical_name,value,value_lower FROM local_library_fields "
-                             "WHERE raw_path=? ORDER BY canonical_name,position"};
-        while (select.next()) {
-            if (cancellation.is_cancellation_requested()) {
-                fail("Library query cancelled", core::ErrorCode::cancelled);
-            }
-            FilterRow row;
-            read_filter_row(select, row);
-            load_field_rows(fields, row.raw_path, row);
-            if (const auto found = played.find(row.raw_path); found != played.end()) {
-                row.facts.history = found->second;
-            }
-            LibraryViewTrack track{.entry = filter_entry(row),
-                                   .album_key = row.album_key,
-                                   .facts = std::move(row.facts)};
-            // As the tree shows a track, not as a search names it: formatted
-            // from its title, which the search label already wraps.
-            track.entry.label = track.entry.title;
-            track.entry.label = format_label(track.entry, false);
-            const auto available = select.number(20) != 0;
-            track.entry.available = available ? 1U : 0U;
-            track.entry.added = track.facts.added;
-            visit(std::move(track));
-        }
-        snapshot.commit();
-        return true;
-    }).transform([](bool) {});
+               auto* db = implementation_->db;
+               QueryCancellation guard{db, cancellation};
+               require_complete_field_index(db);
+               Transaction snapshot{db, true};
+               const auto played = history ? collect_history(db, cancellation)
+                                           : std::map<std::string, std::array<std::int64_t, 6>>{};
+               Statement select{db, std::string{"SELECT "} + filter_columns + ",t.available" +
+                                        filter_from + filter_order};
+               Statement fields{db,
+                                "SELECT canonical_name,value,value_lower FROM local_library_fields "
+                                "WHERE raw_path=? ORDER BY canonical_name,position"};
+               while (select.next()) {
+                   if (cancellation.is_cancellation_requested()) {
+                       fail("Library query cancelled", core::ErrorCode::cancelled);
+                   }
+                   FilterRow row;
+                   read_filter_row(select, row);
+                   load_field_rows(fields, row.raw_path, row);
+                   if (const auto found = played.find(row.raw_path); found != played.end()) {
+                       row.facts.history = found->second;
+                   }
+                   LibraryViewTrack track{.entry = filter_entry(row),
+                                          .album_key = row.album_key,
+                                          .facts = std::move(row.facts)};
+                   // As the tree shows a track, not as a search names it: formatted
+                   // from its title, which the search label already wraps.
+                   track.entry.label = track.entry.title;
+                   track.entry.label = format_label(track.entry, false);
+                   const auto available = select.number(20) != 0;
+                   track.entry.available = available ? 1U : 0U;
+                   track.entry.added = track.facts.added;
+                   visit(std::move(track));
+               }
+               snapshot.commit();
+               return true;
+           })
+        .transform([](bool) {});
 }
 
 core::Result<std::string> LocalLibrary::view_stamp(const bool history) const {
@@ -1911,6 +1939,27 @@ core::Result<std::string> LocalLibrary::view_stamp(const bool history) const {
 core::Result<std::vector<LibraryTrackSnapshot>>
 LocalLibrary::cached_tracks(const std::vector<std::string>& raw_paths,
                             const core::CancellationToken& cancellation) const {
+    auto described = described_tracks(raw_paths, cancellation);
+    if (!described) {
+        return std::unexpected(std::move(described.error()));
+    }
+    std::vector<LibraryTrackSnapshot> result;
+    result.reserve(described->size());
+    for (auto& track : *described) {
+        if (!track) {
+            return std::unexpected(
+                core::Error{.code = core::ErrorCode::conflict,
+                            .message = "A search result is no longer indexed; run the search again",
+                            .context = {}});
+        }
+        result.push_back(std::move(*track));
+    }
+    return result;
+}
+
+core::Result<std::vector<std::optional<LibraryTrackSnapshot>>>
+LocalLibrary::described_tracks(const std::vector<std::string>& raw_paths,
+                               const core::CancellationToken& cancellation) const {
     return checked([&] {
         if (raw_paths.size() > filter_match_cap) {
             fail("Selection exceeds 100000 files", core::ErrorCode::limit_exceeded);
@@ -1919,10 +1968,10 @@ LocalLibrary::cached_tracks(const std::vector<std::string>& raw_paths,
         QueryCancellation guard{db, cancellation};
         Transaction snapshot{db, true};
         Statement select{db, std::string{"SELECT "} + filter_columns +
-                                 " FROM local_library_tracks t WHERE t.raw_path=?"};
+                                 ",t.revision FROM local_library_tracks t WHERE t.raw_path=?"};
         Statement fields{db, "SELECT canonical_name,value,value_lower FROM local_library_fields "
                              "WHERE raw_path=? ORDER BY canonical_name,position"};
-        std::vector<LibraryTrackSnapshot> result;
+        std::vector<std::optional<LibraryTrackSnapshot>> result;
         result.reserve(raw_paths.size());
         for (const auto& path : raw_paths) {
             if (cancellation.is_cancellation_requested()) {
@@ -1931,13 +1980,15 @@ LocalLibrary::cached_tracks(const std::vector<std::string>& raw_paths,
             select.reset();
             select.blob(1, path);
             if (!select.next()) {
-                fail("A search result is no longer indexed; run the search again",
-                     core::ErrorCode::conflict);
+                result.emplace_back();
+                continue;
             }
             FilterRow row;
             read_filter_row(select, row);
+            auto revision = revision_from_key(select.bytes(filter_column_count));
             load_field_rows(fields, path, row);
-            result.push_back({path, std::move(row.facts)});
+            result.push_back(LibraryTrackSnapshot{
+                .raw_path = path, .facts = std::move(row.facts), .revision = revision});
         }
         snapshot.commit();
         return result;
@@ -2165,8 +2216,7 @@ CommitOutcome commit_prepared_file(sqlite3* db, const PreparedFile& prepared,
                                    const std::string& generation, const bool first_scan) {
     if (prepared.failed) {
         Statement incomplete{
-            db,
-            "UPDATE local_library_tracks SET field_index_complete=0 WHERE raw_path=?"};
+            db, "UPDATE local_library_tracks SET field_index_complete=0 WHERE raw_path=?"};
         incomplete.blob(1, prepared.raw_path);
         incomplete.next();
         return CommitOutcome::failed;
@@ -2178,8 +2228,7 @@ CommitOutcome commit_prepared_file(sqlite3* db, const PreparedFile& prepared,
     if (!after || prepared.before != *after) {
         return CommitOutcome::failed;
     }
-    Statement exists{
-        db, "SELECT 1 FROM local_library_roots WHERE raw_path=? AND scan_token=?"};
+    Statement exists{db, "SELECT 1 FROM local_library_roots WHERE raw_path=? AND scan_token=?"};
     exists.blob(1, prepared.root);
     exists.text(2, generation);
     if (!exists.next()) {
@@ -2191,23 +2240,23 @@ CommitOutcome commit_prepared_file(sqlite3* db, const PreparedFile& prepared,
         row.blob(1, prepared.raw_path);
         return row.next();
     }();
-    Statement upsert{
-        db, "INSERT INTO "
-            "local_library_tracks(raw_path,root,revision,title,artist,album,album_key,"
-            "release_id,date,disc,track,search_track,search_album,available,seen,"
-            "codec_name,sample_rate,bits,channels,duration_ms,"
-            "rating_hash,album_rating_hash,added) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(raw_path) DO UPDATE SET "
-            "root=excluded.root,revision=excluded.revision,title=excluded.title,artist="
-            "excluded.artist,album=excluded.album,album_key=excluded.album_key,"
-            "release_id=excluded.release_id,date=excluded.date,disc=excluded.disc,"
-            "track=excluded.track,search_track=excluded.search_track,search_album="
-            "excluded.search_album,available=1,seen=excluded.seen,"
-            "codec_name=excluded.codec_name,sample_rate=excluded.sample_rate,"
-            "bits=excluded.bits,channels=excluded.channels,"
-            "duration_ms=excluded.duration_ms,rating_hash=excluded.rating_hash,"
-            "album_rating_hash=excluded.album_rating_hash"};
+    Statement upsert{db,
+                     "INSERT INTO "
+                     "local_library_tracks(raw_path,root,revision,title,artist,album,album_key,"
+                     "release_id,date,disc,track,search_track,search_album,available,seen,"
+                     "codec_name,sample_rate,bits,channels,duration_ms,"
+                     "rating_hash,album_rating_hash,added) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?) "
+                     "ON CONFLICT(raw_path) DO UPDATE SET "
+                     "root=excluded.root,revision=excluded.revision,title=excluded.title,artist="
+                     "excluded.artist,album=excluded.album,album_key=excluded.album_key,"
+                     "release_id=excluded.release_id,date=excluded.date,disc=excluded.disc,"
+                     "track=excluded.track,search_track=excluded.search_track,search_album="
+                     "excluded.search_album,available=1,seen=excluded.seen,"
+                     "codec_name=excluded.codec_name,sample_rate=excluded.sample_rate,"
+                     "bits=excluded.bits,channels=excluded.channels,"
+                     "duration_ms=excluded.duration_ms,rating_hash=excluded.rating_hash,"
+                     "album_rating_hash=excluded.album_rating_hash"};
     upsert.blob(1, prepared.raw_path);
     upsert.blob(2, prepared.root);
     upsert.text(3, prepared.revision);
@@ -2366,6 +2415,42 @@ class PreparationPipeline {
 
 } // namespace
 
+core::Result<std::vector<std::string>>
+LocalLibrary::albums_touching(const std::vector<std::string>& raw_paths) const {
+    return checked([&] {
+        auto* db = implementation_->db;
+        std::set<std::string> albums;
+        // How many albums it found under the folder.
+        const auto under = [&](const std::string& folder) {
+            const auto [from, to] = subtree_range(folder);
+            Statement select{db, "SELECT DISTINCT album_key FROM local_library_tracks "
+                                 "WHERE raw_path>=? AND raw_path<?"};
+            select.blob(1, from);
+            select.blob(2, to);
+            std::size_t found = 0U;
+            while (select.next()) {
+                albums.insert(select.bytes(0));
+                ++found;
+            }
+            return found;
+        };
+        for (const auto& raw_path : raw_paths) {
+            Statement exact{db, "SELECT album_key FROM local_library_tracks WHERE raw_path=?"};
+            exact.blob(1, raw_path);
+            if (exact.next()) {
+                albums.insert(exact.bytes(0));
+                continue;
+            }
+            // Not a track: a folder holding some, or else a file beside
+            // them -- a cover -- standing for the albums of its folder.
+            if (under(raw_path) == 0U && !audio_path(std::filesystem::path{raw_path})) {
+                static_cast<void>(under(std::filesystem::path{raw_path}.parent_path().native()));
+            }
+        }
+        return std::vector<std::string>{albums.begin(), albums.end()};
+    });
+}
+
 core::Result<std::size_t> LocalLibrary::refresh(const std::vector<std::string>& raw_paths,
                                                 const core::CancellationToken& cancellation) {
     return checked([&] {
@@ -2448,8 +2533,9 @@ core::Result<std::size_t> LocalLibrary::refresh(const std::vector<std::string>& 
     });
 }
 
-core::Result<LibraryFolder> LocalLibrary::folder(const std::string& raw_path,
-                                                 const core::CancellationToken& cancellation) const {
+core::Result<LibraryFolder>
+LocalLibrary::folder(const std::string& raw_path,
+                     const core::CancellationToken& cancellation) const {
     return checked([&] {
         auto* db = implementation_->db;
         QueryCancellation guard{db, cancellation};
@@ -2460,9 +2546,10 @@ core::Result<LibraryFolder> LocalLibrary::folder(const std::string& raw_path,
         // what comes before that slash is the folder it is in.
         const auto rest = static_cast<sqlite3_int64>(from.size() + 1U);
         LibraryFolder folder;
-        Statement below{db, "SELECT DISTINCT substr(raw_path,?1,instr(substr(raw_path,?1),x'2f')-1) "
-                            "FROM local_library_tracks WHERE raw_path>=?2 AND raw_path<?3 "
-                            "AND instr(substr(raw_path,?1),x'2f')>0"};
+        Statement below{db,
+                        "SELECT DISTINCT substr(raw_path,?1,instr(substr(raw_path,?1),x'2f')-1) "
+                        "FROM local_library_tracks WHERE raw_path>=?2 AND raw_path<?3 "
+                        "AND instr(substr(raw_path,?1),x'2f')>0"};
         below.number(1, rest);
         below.blob(2, from);
         below.blob(3, to);
@@ -2470,9 +2557,10 @@ core::Result<LibraryFolder> LocalLibrary::folder(const std::string& raw_path,
             folder.folders.push_back(below.bytes(0));
         }
         std::ranges::sort(folder.folders);
-        Statement in{db, std::string{"SELECT "} + filter_columns +
-                             " FROM local_library_tracks t WHERE t.raw_path>=?2 AND t.raw_path<?3 "
-                             "AND instr(substr(t.raw_path,?1),x'2f')=0 ORDER BY t.disc,t.track,t.raw_path"};
+        Statement in{
+            db, std::string{"SELECT "} + filter_columns +
+                    " FROM local_library_tracks t WHERE t.raw_path>=?2 AND t.raw_path<?3 "
+                    "AND instr(substr(t.raw_path,?1),x'2f')=0 ORDER BY t.disc,t.track,t.raw_path"};
         in.number(1, rest);
         in.blob(2, from);
         in.blob(3, to);
@@ -2487,8 +2575,8 @@ core::Result<LibraryFolder> LocalLibrary::folder(const std::string& raw_path,
 }
 
 core::Result<LibraryInventoryPage> LocalLibrary::inventory(const std::string& folder,
-                                                          const std::string& after,
-                                                          const std::size_t limit) const {
+                                                           const std::string& after,
+                                                           const std::size_t limit) const {
     return checked([&] {
         auto* db = implementation_->db;
         const auto [from, to] = subtree_range(folder);

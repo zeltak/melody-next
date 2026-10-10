@@ -28,8 +28,10 @@
 #include "trackknife/operations/output_path_plan.hpp"
 #include "trackknife/operations/output_path_preflight.hpp"
 #include "trackknife/operations/preparation_plan.hpp"
+#include "trackknife/operations/undo.hpp"
 #include "trackknife/persistence/file_publication_journal.hpp"
 #include "trackknife/persistence/musicbrainz_cache.hpp"
+#include "trackknife/persistence/operation_journal.hpp"
 #include "trackknife/protocol/dispatch.hpp"
 #include "trackknife/protocol/message.hpp"
 
@@ -137,6 +139,37 @@ void require_same(const loudness::LoudnessScanResult& left,
 }
 
 void encodings_are_exact() {
+    // ADR-0263: undo requests and outcomes as they travel.
+    {
+        namespace operations = trackknife::operations;
+        const std::array requests{operations::UndoRequest{.kind = operations::UndoKind::publication,
+                                                          .journal_id = core::StableId::random()},
+                                  operations::UndoRequest{.kind = operations::UndoKind::metadata,
+                                                          .journal_id = core::StableId::random()}};
+        const auto decoded = wire::decode_undo_requests(wire::encode(requests));
+        require(decoded && *decoded == std::vector(requests.begin(), requests.end()),
+                "undo requests travel exactly");
+        const std::array outcomes{
+            operations::UndoOutcome{.request = requests[0],
+                                    .issue = std::nullopt,
+                                    .from_raw_path = std::string{"/a/\xff.flac"},
+                                    .to_raw_path = "/b/c.flac",
+                                    .restored = std::nullopt,
+                                    .moved_back = std::nullopt,
+                                    .published_metadata = std::nullopt},
+            operations::UndoOutcome{.request = requests[1],
+                                    .issue = core::Error{.code = core::ErrorCode::conflict,
+                                                         .message = "changed",
+                                                         .context = {}},
+                                    .from_raw_path = {},
+                                    .to_raw_path = {},
+                                    .restored = std::nullopt,
+                                    .moved_back = std::nullopt,
+                                    .published_metadata = std::nullopt}};
+        const auto answered = wire::decode_undo_outcomes(wire::encode(outcomes));
+        require(answered && *answered == std::vector(outcomes.begin(), outcomes.end()),
+                "undo outcomes travel exactly");
+    }
     const core::Error error{.code = core::ErrorCode::conflict,
                             .message = "changed since it was read",
                             .context = {{"path", "/music/a.flac"}, {"path", "/music/b.flac"}}};
@@ -932,8 +965,9 @@ void ratings_are_copied_into_a_backup_tag(const std::filesystem::path& directory
                 .value_or(false),
             "a FLAC is rated, with a copy");
     const auto read = metadata::read_local_metadata(flac);
-    require(read && read->document.first_effective_value("FMPS_RATING") ==
-                        std::optional<std::string>{"0.8"} &&
+    require(read &&
+                read->document.first_effective_value("FMPS_RATING") ==
+                    std::optional<std::string>{"0.8"} &&
                 read->document.first_effective_value("TRACKKNIFE_RATING") ==
                     std::optional<std::string>{"8"},
             "the rating, and its copy as 0-10");
@@ -941,9 +975,9 @@ void ratings_are_copied_into_a_backup_tag(const std::filesystem::path& directory
                  .value_or(true),
             "nothing to write when both are there");
     // Named after the rating was already written: only the copy is added.
-    require(engine::RatingTags::write(database, catalogue, flac, 8, {}, "RATING_COPY")
-                .value_or(false),
-            "a new name gets the copy");
+    require(
+        engine::RatingTags::write(database, catalogue, flac, 8, {}, "RATING_COPY").value_or(false),
+        "a new name gets the copy");
     require(metadata::read_local_metadata(flac)->document.first_effective_value("RATING_COPY") ==
                 std::optional<std::string>{"8"},
             "under it");
@@ -1236,6 +1270,13 @@ void a_client_does_file_work_through_the_engine(const std::filesystem::path& dir
     require(revision && *revision == here->source_revision, "and so is its revision");
     require(!access.read((directory / "absent.flac").string(), {}),
             "a file that is not there fails through the engine too");
+    // A batch in one request, read at once on the engine: answered in order,
+    // each file for itself, the missing one failing alone.
+    const auto absent = (directory / "absent.flac").string();
+    const auto many = access.read_many({flac, absent, flac}, {});
+    require(many && many->size() == 3U && (*many)[0] && *(*many)[0] == *here && !(*many)[1] &&
+                (*many)[2] && *(*many)[2] == *here,
+            "a batch read through the engine is each file read here, in order");
     const auto probed_there = remote.probe(flac, {});
     const auto probed_here = engine::probe_local_technicals(flac, {});
     require(probed_there && probed_here && *probed_there == *probed_here &&
@@ -1258,6 +1299,40 @@ void a_client_does_file_work_through_the_engine(const std::filesystem::path& dir
     require_same(*local, *measured, "and measures the same");
     require(reported >= 1U, "reporting its progress");
 
+    // A scan bigger than one job: several, each album whole in one, the
+    // result back in the order given and the same as one scan here.
+    {
+        std::vector<loudness::LoudnessScanItem> several;
+        for (std::size_t index = 0; index < 7U; ++index) {
+            several.push_back({.item_index = 100U + index,
+                               .raw_path = flac,
+                               .selection = {},
+                               .range = std::nullopt,
+                               .album_key = index == 6U ? std::nullopt
+                                                        : std::optional<std::string>{
+                                                              index < 3U ? "album:a" : "album:b"}});
+        }
+        remote.limitJobs(900U);
+        std::size_t last_completed = 0;
+        const auto split =
+            remote.scan(several, {.measure_true_peak = false, .maximum_parallelism = 1},
+                        [&last_completed](const loudness::LoudnessScanProgress& step) {
+                            last_completed = std::max(last_completed, step.completed_items);
+                        },
+                        {});
+        const auto whole = loudness::scan_loudness(
+            several, {.measure_true_peak = false, .maximum_parallelism = 1});
+        require(split && whole, "a scan in several jobs runs");
+        require_same(*whole, *split, "and measures what one scan does, albums included");
+        require(last_completed == several.size(), "counting its progress across the jobs");
+        remote.limitJobs(100U);
+        const auto too_big =
+            remote.scan(several, {.measure_true_peak = false, .maximum_parallelism = 1}, {}, {});
+        require(!too_big && too_big.error().code == core::ErrorCode::limit_exceeded,
+                "an album too large for one job is refused, not cut in two");
+        remote.limitJobs(engine::remote_job_bytes);
+    }
+
     // A plan built from what the engine read, written by the engine.
     const std::array<std::string_view, 1> preferred{"title"};
     auto selection = metadata::StagedMetadataSelection::create(
@@ -1277,12 +1352,105 @@ void a_client_does_file_work_through_the_engine(const std::filesystem::path& dir
             "a title is staged");
     const auto plan = metadata::build_metadata_write_plan(*selection, patches, access);
     require(plan && plan->ready(), "the plan is built through the engine");
+    const auto bytes_of = [](const std::string& path) {
+        std::ifstream input{path, std::ios::binary};
+        return std::string{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    };
+    const auto original_bytes = bytes_of(flac);
+    const auto original = metadata::read_local_metadata(flac);
+    require(original.has_value(), "the file is read first");
     const auto applied = remote.apply(*plan, {}, {});
     require(applied && applied->committed_source_count() == 1U, "and written by it");
     const auto after = metadata::read_local_metadata(flac);
     require(after && after->document.first_effective_value("title") ==
                          std::optional<std::string>{"Through the engine"},
             "the file has it");
+
+    // ADR-0263: undone through the engine, the file as it was.
+    {
+        const std::array undo{trackknife::operations::UndoRequest{
+            .kind = trackknife::operations::UndoKind::metadata,
+            .journal_id = applied->sources.front().commit->journal_id}};
+        const auto undone = remote.undo(undo, {}, {});
+        require(undone && undone->size() == 1U && !undone->front().issue &&
+                    undone->front().to_raw_path == flac && undone->front().restored &&
+                    undone->front().restored->document.first_effective_value("title") ==
+                        original->document.first_effective_value("title"),
+                "a write is undone through the engine, saying what it restored");
+        require(bytes_of(flac) == original_bytes, "the file is the original, byte for byte");
+        const auto again = remote.undo(undo, {}, {});
+        require(again && again->size() == 1U && again->front().issue.has_value(),
+                "a write undone is not undone twice");
+        // Written once more, for what follows.
+        const auto rewritten = metadata::build_metadata_write_plan(
+            *metadata::StagedMetadataSelection::create(
+                {metadata::StagedMetadataSource{
+                    .raw_path = flac,
+                    .source_revision = metadata::read_local_metadata(flac)->source_revision,
+                    .baseline = metadata::read_local_metadata(flac)->document}},
+                preferred),
+            patches, access);
+        require(rewritten && rewritten->ready() && remote.apply(*rewritten, {}, {}),
+                "and written again");
+    }
+
+    // A plan bigger than one job goes in parts, each file written once and
+    // the results in the plan's order.
+    {
+        std::vector<std::string> copies;
+        std::vector<metadata::StagedMetadataSource> sources;
+        for (int index = 0; index < 3; ++index) {
+            const auto copy = (directory / ("part-" + std::to_string(index) + ".flac")).string();
+            std::filesystem::copy_file(flac, copy,
+                                       std::filesystem::copy_options::overwrite_existing);
+            const auto read = access.read(copy, {});
+            require(read.has_value(), "a copy is read through the engine");
+            copies.push_back(copy);
+            sources.push_back({.raw_path = copy,
+                               .source_revision = read->source_revision,
+                               .baseline = read->document});
+        }
+        auto parts_selection = metadata::StagedMetadataSelection::create(sources, preferred);
+        require(parts_selection.has_value(), "a selection of three files");
+        std::size_t part_title = 0;
+        for (std::size_t index = 0; index < parts_selection->field_count(); ++index) {
+            if (parts_selection->field(index).canonical_name == "title") {
+                part_title = index;
+            }
+        }
+        metadata::StagedMetadataPatchSet part_patches;
+        for (std::size_t item = 0; item < 3U; ++item) {
+            require(part_patches
+                        .replace_values(*parts_selection, item, part_title,
+                                        {"Part " + std::to_string(item)})
+                        .has_value(),
+                    "a title for each");
+        }
+        const auto parts_plan =
+            metadata::build_metadata_write_plan(*parts_selection, part_patches, access);
+        require(parts_plan && parts_plan->ready() && parts_plan->sources.size() == 3U,
+                "the plan reads all three through the engine in one batch");
+        remote.limitJobs(1U);
+        std::size_t last_completed = 0;
+        const auto written = remote.apply(
+            *parts_plan,
+            [&last_completed](const trackknife::operations::MetadataApplyProgress& step) {
+                last_completed = std::max(last_completed, step.completed_sources);
+            },
+            {});
+        remote.limitJobs(engine::remote_job_bytes);
+        require(written && written->committed_source_count() == 3U &&
+                    written->sources.size() == 3U && written->sources[2].source_index == 2U &&
+                    written->sources[2].raw_path == copies[2],
+                "written in parts, the results in the plan's order");
+        require(last_completed == 3U, "progress counted across the parts");
+        for (std::size_t item = 0; item < 3U; ++item) {
+            const auto now = metadata::read_local_metadata(copies[item]);
+            require(now && now->document.first_effective_value("title") ==
+                               std::optional<std::string>{"Part " + std::to_string(item)},
+                    "each file has its own title");
+        }
+    }
 
     // The tagger's lookups through the engine: a cached answer comes back as
     // it was, a URL elsewhere is refused, the key is handed over.
@@ -1313,6 +1481,24 @@ void a_client_does_file_work_through_the_engine(const std::filesystem::path& dir
         const auto art_here = local_access.inventory(art, policy, {});
         require(art_there && art_here && *art_there == *art_here,
                 "a file's pictures through the engine are its pictures");
+        // An image over one part -- an original cover -- goes in parts and
+        // arrives whole. Bytes after a JPEG's end are no part of the picture,
+        // so a small one padded out stands for a large one.
+        {
+            std::ifstream input{cover_path, std::ios::binary};
+            std::string large{std::istreambuf_iterator<char>{input},
+                              std::istreambuf_iterator<char>{}};
+            large.append(1'200'000U, '\0');
+            const auto staged = remote.stage(
+                std::span{reinterpret_cast<const unsigned char*>(large.data()), large.size()});
+            require(staged && staged->byte_size == large.size() &&
+                        staged->mime_type == "image/jpeg",
+                    "a large image is staged in parts, whole");
+            std::ifstream kept{staged->raw_path, std::ios::binary};
+            const std::string back{std::istreambuf_iterator<char>{kept},
+                                   std::istreambuf_iterator<char>{}};
+            require(back == large, "byte for byte");
+        }
         require(!art_here->items.empty(), "and it has one to replace");
 
         std::ifstream input{cover_path, std::ios::binary};
@@ -1410,6 +1596,22 @@ void the_engine_makes_the_taggers_lookups(const std::filesystem::path& parent) {
     const auto database = directory / "services.sqlite3";
     engine::MetadataServices services{database, directory};
 
+    // ADR-0261: a throttled answer is asked again, twice at most, never
+    // after more than 30 s.
+    {
+        using Throttle = engine::MetadataServices::Throttle;
+        const auto decide = engine::MetadataServices::throttle;
+        require(decide(200, 0, 0) == Throttle{} && decide(404, 5, 0) == Throttle{},
+                "an answer is taken, whatever it says");
+        require(decide(429, 0, 0) == Throttle{.kind = Throttle::Kind::wait, .seconds = 2} &&
+                    decide(503, 0, 1) == Throttle{.kind = Throttle::Kind::wait, .seconds = 4},
+                "throttled without a word: 2 s, then 4");
+        require(decide(429, 7, 0) == Throttle{.kind = Throttle::Kind::wait, .seconds = 7},
+                "or as long as it asks");
+        require(decide(429, 7, 2).kind == Throttle::Kind::give_up, "and not a third time");
+        require(decide(503, 120, 0) == Throttle{.kind = Throttle::Kind::give_up, .seconds = 120},
+                "nor after a wait too long to sit through");
+    }
     require(
         engine::MetadataServices::fetchable("https://musicbrainz.org/ws/2/release/x?fmt=json") &&
             engine::MetadataServices::fetchable("https://coverartarchive.org/release/x"),
@@ -1438,6 +1640,30 @@ void the_engine_makes_the_taggers_lookups(const std::filesystem::path& parent) {
     require(served && *served == cached, "a cached answer is served as it was");
     require(std::chrono::steady_clock::now() - started < std::chrono::milliseconds{500},
             "at once, without waiting its turn");
+
+    // Only answers are served from the cache: an archive's 404 page an older
+    // engine kept for a release with no covers is not served as its listing
+    // -- it is asked again (here, cancelled before reaching the network). An
+    // image is bytes, and is served as it was kept.
+    {
+        const std::string listing = "https://coverartarchive.org/release/"
+                                    "00000000-0000-0000-0000-000000000000";
+        const std::string image = listing + "/1-250.jpg";
+        auto cache = trackknife::persistence::SqliteMusicBrainzResponseCache::open(database);
+        require(cache.has_value(), "the cache opens again");
+        const auto now = static_cast<std::int64_t>(std::time(nullptr));
+        require(cache->store(listing, "<!doctype html><title>404 Not Found</title>", now,
+                             14LL * 24 * 60 * 60, 100U)
+                        .has_value() &&
+                    cache->store(image, "\xff\xd8\xff", now, 14LL * 24 * 60 * 60, 100U).has_value(),
+                "a kept error page and a kept image");
+        core::CancellationSource stop;
+        stop.request_cancellation();
+        const auto page = services.fetch(listing, stop.token());
+        require(!page || !page->starts_with("<!doctype"), "an error page is not an answer");
+        const auto bytes = services.fetch(image, stop.token());
+        require(bytes && *bytes == "\xff\xd8\xff", "an image is served as it was kept");
+    }
 
     // The AcoustID key is the engine's, readable by its owner only.
     require(!services.has_acoustid_key(), "no key to begin with");
@@ -1517,6 +1743,59 @@ void the_engine_makes_the_taggers_lookups(const std::filesystem::path& parent) {
 
 } // namespace
 
+// ADR-0263: how long backups are kept is the engine's, as clients set it;
+// a lower limit lets go of what it no longer keeps at once.
+void backups_are_kept_as_long_as_asked(const std::filesystem::path& directory,
+                                       const std::filesystem::path& fixtures) {
+    namespace metadata = trackknife::metadata;
+    namespace operations = trackknife::operations;
+    const auto database = directory / "retention.sqlite3";
+    auto workspace = engine::Workspace::open(database);
+    require(workspace.has_value(), "a workspace");
+    protocol::Dispatcher dispatcher;
+    engine::register_backup_methods(dispatcher, database, *workspace);
+    const auto ask = [&dispatcher](std::string method, protocol::Json params) {
+        return dispatcher.dispatch(protocol::Request{
+            .id = 1, .method = std::move(method), .params = over_the_wire(std::move(params))});
+    };
+    const auto first = ask("backups.retention", protocol::Json::object());
+    require(first.result && first.result->at("max_age_days") == 7 &&
+                first.result->at("max_writes") == 256 && first.result->at("max_gigabytes") == 10,
+            "the defaults to begin with");
+    require(ask("backups.set_retention", {{"max_writes", -1}}).error.has_value(),
+            "a limit below 0 is refused");
+
+    // A write keeps the file it replaced...
+    const auto flac =
+        materialize(fixtures, "tagged-tone-flac", directory / "retention.flac").string();
+    const auto read = metadata::read_local_metadata(flac);
+    require(read.has_value(), "the file is read");
+    auto selection = metadata::StagedMetadataSelection::create({metadata::StagedMetadataSource{
+        .raw_path = flac, .source_revision = read->source_revision, .baseline = read->document}});
+    require(selection.has_value(), "a selection");
+    const auto title = selection->field_index("title");
+    require(title.has_value(), "with a title");
+    metadata::StagedMetadataPatchSet patches;
+    require(patches.replace_values(*selection, 0U, *title, {"Kept"}).has_value(), "staged");
+    const auto plan = metadata::build_metadata_write_plan(*selection, patches,
+                                                          metadata::local_metadata_file_access());
+    require(plan && plan->ready(), "planned");
+    auto journal = trackknife::persistence::SqliteMetadataOperationJournal::open(database);
+    require(journal.has_value(), "the journal");
+    const auto committed = operations::commit_metadata_source(
+        plan->sources.front(), *journal,
+        [](const operations::MetadataCommitResult&) -> core::Result<void> { return {}; });
+    require(committed && std::filesystem::exists(committed->backup_raw_path),
+            "a write keeps the file it replaced");
+
+    // ...until none are to be kept: let go at once, and remembered.
+    const auto set = ask("backups.set_retention", {{"max_writes", 0}});
+    require(set.result && set.result->at("max_writes") == 0 && set.result->at("max_age_days") == 7,
+            "the limit is set, the others kept");
+    require(!std::filesystem::exists(committed->backup_raw_path), "and the backup let go");
+    require(engine::backup_retention(*workspace).maximum_entries == 0U, "and remembered");
+}
+
 int main(int argc, char** argv) {
     require(argc == 2, "usage: engine_file_work_test <fixture-dir>");
     const auto directory = std::filesystem::temp_directory_path() /
@@ -1526,6 +1805,7 @@ int main(int argc, char** argv) {
     documents_are_exact();
     the_engine_reads_as_this_process_would(directory, argv[1]);
     the_engine_writes_what_was_previewed(directory, argv[1]);
+    backups_are_kept_as_long_as_asked(directory, argv[1]);
     the_engine_moves_what_was_previewed(directory, argv[1]);
     ratings_go_into_tags_when_asked(directory, argv[1]);
     ratings_in_files_are_imported(directory, argv[1]);

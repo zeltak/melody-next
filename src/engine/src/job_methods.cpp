@@ -14,6 +14,8 @@
 #include "trackknife/operations/loudness_sidecar_apply.hpp"
 #include "trackknife/operations/metadata_apply.hpp"
 #include "trackknife/operations/metadata_commit.hpp"
+#include "trackknife/operations/undo.hpp"
+#include "trackknife/operations/undo_copies.hpp"
 #include "trackknife/persistence/file_publication_journal.hpp"
 #include "trackknife/persistence/operation_journal.hpp"
 
@@ -63,8 +65,7 @@ apply_metadata_plan(const metadata::MetadataWritePlan& plan, const std::filesyst
         plan,
         [&journal, &dependent](const metadata::MetadataWritePlanSource& source,
                                const core::CancellationToken& source_token) {
-            return operations::commit_flac_metadata_source(source, journal, dependent,
-                                                           source_token);
+            return operations::commit_metadata_source(source, journal, dependent, source_token);
         },
         [&journal, &dependent](const metadata::MetadataWritePlanCueSheet& sheet,
                                const core::CancellationToken& sheet_token) {
@@ -338,7 +339,7 @@ void register_file_work_jobs(JobCatalog& jobs, std::filesystem::path database,
     jobs.on(
         "preparation.apply",
         [database = database, &catalogue,
-         follow = std::move(follow)](const Json& params) -> core::Result<JobRegistry::Work> {
+         follow](const Json& params) -> core::Result<JobRegistry::Work> {
             const auto given = params.find("plan");
             if (given == params.end()) {
                 return std::unexpected(bad_params("a reviewed plan is required", "plan"));
@@ -388,10 +389,79 @@ void register_file_work_jobs(JobCatalog& jobs, std::filesystem::path database,
                         report(wire::encode(progress));
                     },
                     token, operations::FilePublicationApplyOptions{.maximum_parallelism = 2U});
+                // ADR-0266: the sources moves retain, where undo copies are kept.
+                if (auto kept =
+                        operations::keep_undo_copies_in_place(metadata_journal, file_journal);
+                    !kept) {
+                    std::cerr << "melodyd: undo copies not all moved: " << kept.error().message
+                              << "\n";
+                }
                 if (!applied) {
                     return Json{{"error", wire::encode(applied.error())}};
                 }
                 return Json{{"result", wire::encode(*applied)}};
+            };
+        });
+    // ADR-0263: writes undone, newest first as given, each followed by the
+    // library as the write was.
+    jobs.on(
+        "operations.undo",
+        [database = database, &catalogue,
+         follow](const Json& params) -> core::Result<JobRegistry::Work> {
+            const auto given = params.find("operations");
+            if (given == params.end()) {
+                return std::unexpected(bad_params("writes to undo are required", "operations"));
+            }
+            auto requests = wire::decode_undo_requests(*given);
+            if (!requests) {
+                return std::unexpected(std::move(requests.error()));
+            }
+            if (requests->empty()) {
+                return std::unexpected(bad_params("writes to undo are required", "operations"));
+            }
+            return [requests = std::move(*requests), database, &catalogue, follow](
+                       const core::CancellationToken& token, const JobRegistry::Reporter& report) {
+                auto metadata_opened = persistence::SqliteMetadataOperationJournal::open(database);
+                if (!metadata_opened) {
+                    return Json{{"error", wire::encode(metadata_opened.error())}};
+                }
+                auto file_opened = persistence::SqliteFilePublicationJournal::open(database);
+                if (!file_opened) {
+                    return Json{{"error", wire::encode(file_opened.error())}};
+                }
+                auto metadata_journal = std::move(*metadata_opened);
+                auto file_journal = std::move(*file_opened);
+                const operations::MetadataDependentStateCommitter refreshed =
+                    [&catalogue](
+                        const operations::MetadataCommitResult& result) -> core::Result<void> {
+                    auto done = catalogue.refresh({result.source_raw_path});
+                    return done ? core::Result<void>{} : std::unexpected(std::move(done.error()));
+                };
+                // Moved back: followed there, with its own tags again
+                // where the write had changed them.
+                const operations::FilePublicationDependentStateCommitter moved_back =
+                    [&follow](const operations::FilePublicationCommitResult& result)
+                    -> core::Result<void> {
+                    if (result.content !=
+                        operations::FilePublicationContentKind::prepared_destination_artifact) {
+                        return follow(result, nullptr);
+                    }
+                    auto read = metadata::read_local_metadata(result.target_raw_path);
+                    if (!read) {
+                        return std::unexpected(std::move(read.error()));
+                    }
+                    return follow(result, &read->document);
+                };
+                auto undone = operations::undo_operations(
+                    requests, metadata_journal, file_journal, refreshed, moved_back,
+                    [&report](const std::size_t completed, const std::size_t total) {
+                        report(Json{{"completed", completed}, {"total", total}});
+                    },
+                    token);
+                if (!undone) {
+                    return Json{{"error", wire::encode(undone.error())}};
+                }
+                return Json{{"result", wire::encode(*undone)}};
             };
         });
     jobs.on(

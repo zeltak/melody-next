@@ -39,17 +39,6 @@ constexpr std::array<std::string_view, 12> default_metadata_fields{
     "Total Tracks", "Disc Number", "Total Discs",  "Genre", "Composer", "Comment",
 };
 
-[[nodiscard]] persistence::LocalMetadataRefresh
-metadata_refresh(const operations::MetadataCommitResult& result) {
-    return persistence::LocalMetadataRefresh{
-        .operation_id = result.journal_id,
-        .source_reference = result.source_raw_path,
-        .previous_revision = result.previous_revision,
-        .published_revision = result.published_revision,
-        .document = result.document,
-    };
-}
-
 } // namespace
 
 Workspace::ConvertOpening Workspace::convertItems(LocalListModel& list, const EngineKey& engine,
@@ -179,11 +168,11 @@ Workspace::TaggerOpening Workspace::taggerServices(std::shared_ptr<engine::Remot
     auto mounted = std::make_shared<MountedMoves>();
     const auto unavailable = QStringLiteral("Trackknife persistence is unavailable");
     TaggerOpening opening{
-        .services =
-            TaggerServices{
-                .plan_applier_factory = engineMetadataPlanApplierFactory(work),
-                .apply_observer = metadataApplyObserver(),
-                .transformation_store = MetadataTransformationStore{
+        .services = TaggerServices{
+            .plan_applier_factory = engineMetadataPlanApplierFactory(work),
+            .apply_observer = metadataApplyObserver(),
+            .transformation_store =
+                MetadataTransformationStore{
                     .load =
                         [persistence_service,
                          unavailable](MetadataTransformationStore::LoadCompletion completion) {
@@ -216,47 +205,48 @@ Workspace::TaggerOpening Workspace::taggerServices(std::shared_ptr<engine::Remot
                                 id, std::move(completion));
                         },
                 },
-                .output_profile_store = buildOutputProfileStore(work_engine),
-                .file_plan_applier_factory =
-                    enginePublicationPlanApplierFactory(work, elsewhere, mount, mounted),
-                .file_apply_observer =
-                    [this, elsewhere, work_engine,
-                     mounted](const operations::FilePublicationApplyResult& result) {
-                        auto committed = false;
-                        for (const auto& source : result.sources) {
-                            if (source.metadata_commit) {
-                                applyCommittedMetadata(*source.metadata_commit);
-                                committed = true;
-                            }
-                            if (source.commit && elsewhere) {
-                                const auto here = std::ranges::find(
-                                    *mounted, source.commit->journal_id,
-                                    &operations::FilePublicationCommitResult::journal_id);
-                                applyEngineRelocation(work_engine, *source.commit,
-                                                      here == mounted->end() ? nullptr : &*here);
-                                if (source.published_metadata) {
-                                    applyCommittedPublicationMetadata(*source.commit,
-                                                                      *source.published_metadata);
-                                    if (here != mounted->end()) {
-                                        applyCommittedPublicationMetadata(
-                                            *here, *source.published_metadata);
-                                    }
-                                }
-                                committed = true;
-                            } else if (source.commit) {
-                                applyCommittedRelocation(*source.commit);
-                                if (source.published_metadata) {
-                                    applyCommittedPublicationMetadata(*source.commit,
+            .output_profile_store = buildOutputProfileStore(work_engine),
+            .file_plan_applier_factory =
+                enginePublicationPlanApplierFactory(work, elsewhere, mount, mounted),
+            .file_apply_observer =
+                [this, elsewhere, work_engine,
+                 mounted](const operations::FilePublicationApplyResult& result) {
+                    auto committed = false;
+                    for (const auto& source : result.sources) {
+                        if (source.metadata_commit) {
+                            applyCommittedMetadata(*source.metadata_commit);
+                            committed = true;
+                        }
+                        if (source.commit && elsewhere) {
+                            const auto here = std::ranges::find(
+                                *mounted, source.commit->journal_id,
+                                &operations::FilePublicationCommitResult::journal_id);
+                            applyEngineRelocation(work_engine, *source.commit,
+                                                  here == mounted->end() ? nullptr : &*here);
+                            if (source.published_metadata) {
+                                applyCommittedPublicationMetadata(*source.commit,
+                                                                  *source.published_metadata);
+                                if (here != mounted->end()) {
+                                    applyCommittedPublicationMetadata(*here,
                                                                       *source.published_metadata);
                                 }
-                                committed = true;
                             }
+                            committed = true;
+                        } else if (source.commit) {
+                            applyCommittedRelocation(*source.commit);
+                            if (source.published_metadata) {
+                                applyCommittedPublicationMetadata(*source.commit,
+                                                                  *source.published_metadata);
+                            }
+                            committed = true;
                         }
-                        if (committed) {
-                            schedulePersist();
-                        }
-                    },
-                .layout_store = MetadataDialogLayoutStore{
+                    }
+                    if (committed) {
+                        schedulePersist();
+                    }
+                },
+            .layout_store =
+                MetadataDialogLayoutStore{
                     .load =
                         [persistence_service, unavailable](
                             QString key, MetadataDialogLayoutStore::LoadCompletion completion) {
@@ -280,9 +270,23 @@ Workspace::TaggerOpening Workspace::taggerServices(std::shared_ptr<engine::Remot
                                                              std::move(completion));
                         },
                 },
-                .musicbrainz = engineLookupService(work, this),
-                .tools = engineFileWorkTools(work),
+            .musicbrainz = engineLookupService(work, this),
+            .tools = engineFileWorkTools(work),
+            .library_roots =
+                [browser = work_link != nullptr ? work_link->browser : QPointer<LibraryBrowser>{}] {
+                    return browser ? browser->rootPaths() : std::vector<std::string>{};
+                },
+            .undo = [work](std::vector<operations::UndoRequest> requests,
+                           const core::CancellationToken& cancellation)
+                -> core::Result<std::vector<operations::UndoOutcome>> {
+                if (!work) {
+                    return std::unexpected(core::Error{.code = core::ErrorCode::unsupported,
+                                                       .message = "No engine to undo the write",
+                                                       .context = {}});
+                }
+                return work->undo(requests, {}, cancellation);
             },
+        },
         .artwork_applier = engineArtworkPlanApplierFactory(work),
         .artwork_observer =
             [this](const operations::ArtworkApplyResult& result) {
@@ -322,6 +326,23 @@ template <typename Work, typename Done> void offThread(QObject* context, Work wo
 }
 
 } // namespace
+
+EngineFolderLister
+Workspace::engineFolderLister(const std::shared_ptr<engine::RemoteFileWork>& work) {
+    return [this, work](std::string path, EngineFolderListingCompletion done) {
+        offThread(
+            this, [work, path] { return work->folders(path); },
+            [done = std::move(done)](auto listed) {
+                if (!listed) {
+                    done(std::unexpected(std::move(listed.error())));
+                    return;
+                }
+                done(EngineFolderListing{.path = std::move(listed->path),
+                                         .parent = std::move(listed->parent),
+                                         .folders = std::move(listed->folders)});
+            });
+    };
+}
 
 MetadataPropertiesSourceReader
 Workspace::selectionSourceReader(ListTab& tab, std::vector<QPersistentModelIndex> rows) {
@@ -398,19 +419,29 @@ Workspace::selectionSourceReader(LocalListModel* source_model,
                           .end_sample = row.segment ? row.segment->end_sample : std::nullopt,
                       }}
                     : std::nullopt;
+        // ADR-0257: tags the library cached are read from the file in the
+        // background, the cache shown meanwhile -- also when the row knows
+        // the file's revision, as a row the engine described does
+        // (ADR-0259): its revision says which file, not that its tags are
+        // the file's.
+        const auto cached = std::ranges::any_of(row.metadata.fields, [](const auto& field) {
+            return field.provenance == metadata::FieldProvenance::cached_snapshot;
+        });
+        const auto to_read = (cached || !row.source_revision) && row.probed && !logical;
         return MetadataPropertiesSource{
             .source =
                 metadata::StagedMetadataSource{
                     .raw_path = row.raw_path,
-                    .source_revision = row.source_revision,
+                    .source_revision = to_read ? std::nullopt : row.source_revision,
                     .baseline = row.metadata,
                     .logical_track = logical,
                     .cue_sheet = std::move(cue_binding),
                     .logical_identity = logical_identity,
-                    .needs_metadata_capture = !row.source_revision && row.probed && !logical,
+                    .needs_metadata_capture = to_read,
                 },
             .track_label = std::move(label),
             .audio = {.selection = row.selection, .range = row.segment},
+            .duration_ms = row.duration_ms,
         };
     };
 }
@@ -447,95 +478,31 @@ MetadataApplyObserver Workspace::metadataApplyObserver() {
 
 ArtworkWritePlanApplierFactory
 Workspace::engineArtworkPlanApplierFactory(std::shared_ptr<engine::RemoteFileWork> work) {
-    auto* const persistence_service = persistence_;
-    return [this, persistence_service, work = std::move(work)] {
-        auto documents = collectDocuments();
-        auto view_layouts = collectTrackViewLayouts();
-        return ArtworkWritePlanApplier{[persistence_service, work, documents = std::move(documents),
-                                        view_layouts = std::move(view_layouts)](
-                                           const metadata::ArtworkWritePlan& plan,
-                                           const operations::ArtworkApplyProgressCallback& progress,
-                                           const core::CancellationToken& cancellation) mutable
-                                           -> core::Result<operations::ArtworkApplyResult> {
-            if (!persistence_service) {
-                return std::unexpected(core::Error{
-                    .code = core::ErrorCode::cancelled,
-                    .message = "Trackknife closed during artwork Apply",
-                    .context = {},
-                });
-            }
-            const auto persistence_error = persistence_service->saveWorkspaceAndWait(
-                std::move(documents), std::move(view_layouts));
-            if (!persistence_error.isEmpty()) {
-                return std::unexpected(core::Error{
-                    .code = core::ErrorCode::database,
-                    .message = utf8Bytes(persistence_error),
-                    .context = {},
-                });
-            }
-            // ADR-0237: the engine writes the pictures and journals them.
-            auto applied = work->artwork_apply(plan, progress, cancellation);
-            if (!applied) {
-                return applied;
-            }
-            for (const auto& source : applied->sources) {
-                if (source.commit) {
-                    static_cast<void>(persistence_service->refreshLocalMetadataAndWait(
-                        metadata_refresh(*source.commit)));
-                }
-            }
-            return applied;
-        }};
+    return [work = std::move(work)] {
+        return ArtworkWritePlanApplier{
+            [work](const metadata::ArtworkWritePlan& plan,
+                   const operations::ArtworkApplyProgressCallback& progress,
+                   const core::CancellationToken& cancellation)
+                -> core::Result<operations::ArtworkApplyResult> {
+                // ADR-0237: the engine writes the pictures and journals them; the
+                // open tabs follow from what it answers (ADR-0259: there is no
+                // copy of the lists here to follow too).
+                return work->artwork_apply(plan, progress, cancellation);
+            }};
     };
 }
 
 MetadataWritePlanApplierFactory
 Workspace::engineMetadataPlanApplierFactory(std::shared_ptr<engine::RemoteFileWork> work) {
-    auto* const persistence_service = persistence_;
-    return [this, persistence_service, work = std::move(work)] {
-        auto documents = collectDocuments();
-        auto view_layouts = collectTrackViewLayouts();
+    return [work = std::move(work)] {
         return MetadataWritePlanApplier{
-            [persistence_service, work, documents = std::move(documents),
-             view_layouts =
-                 std::move(view_layouts)](const metadata::MetadataWritePlan& plan,
-                                          const operations::MetadataApplyProgressCallback& progress,
-                                          const core::CancellationToken& cancellation) mutable
+            [work](const metadata::MetadataWritePlan& plan,
+                   const operations::MetadataApplyProgressCallback& progress,
+                   const core::CancellationToken& cancellation)
                 -> core::Result<operations::MetadataApplyResult> {
-                if (!persistence_service) {
-                    return std::unexpected(core::Error{
-                        .code = core::ErrorCode::cancelled,
-                        .message = "Trackknife closed during metadata Apply",
-                        .context = {},
-                    });
-                }
-                // As before the engine wrote: the lists are saved first, so
-                // what they cache of a written file can follow it.
-                const auto persistence_error = persistence_service->saveWorkspaceAndWait(
-                    std::move(documents), std::move(view_layouts));
-                if (!persistence_error.isEmpty()) {
-                    return std::unexpected(core::Error{
-                        .code = core::ErrorCode::database,
-                        .message = utf8Bytes(persistence_error),
-                        .context = {},
-                    });
-                }
                 // ADR-0237: the engine writes, journals, and refreshes its
                 // library in the same commit.
-                auto applied = work->apply(plan, progress, cancellation);
-                if (!applied) {
-                    return applied;
-                }
-                // What this window's lists cache of each written file.
-                for (const auto& source : applied->sources) {
-                    if (source.commit &&
-                        source.commit->content_kind ==
-                            operations::MetadataOperationContentKind::text_fields) {
-                        static_cast<void>(persistence_service->refreshLocalMetadataAndWait(
-                            metadata_refresh(*source.commit)));
-                    }
-                }
-                return applied;
+                return work->apply(plan, progress, cancellation);
             }};
     };
 }
@@ -553,83 +520,43 @@ FilePublicationPlanApplierFactory
 Workspace::enginePublicationPlanApplierFactory(std::shared_ptr<engine::RemoteFileWork> work,
                                                const bool elsewhere, RemoteMount mount,
                                                std::shared_ptr<MountedMoves> mounted) {
-    auto* const persistence_service = persistence_;
-    return [this, persistence_service, work = std::move(work), elsewhere, mount = std::move(mount),
+    return [this, work = std::move(work), elsewhere, mount = std::move(mount),
             mounted = std::move(mounted)] {
-        auto documents = collectDocuments();
-        auto view_layouts = collectTrackViewLayouts();
+        // What this computer's lists last saw of each file, for a move
+        // elsewhere to be followed here under its own revision: read from
+        // the lists themselves, not from a copy of every one.
+        std::map<std::string, core::LocalSourceRevision> seen_here;
+        if (elsewhere) {
+            for (const auto& tab : list_tabs_) {
+                for (const auto& row : tab->model->rows()) {
+                    if (row.source_revision) {
+                        seen_here.emplace(row.raw_path, *row.source_revision);
+                    }
+                }
+            }
+        }
         return FilePublicationPlanApplier{
-            [persistence_service, work, elsewhere, mount, mounted, documents = std::move(documents),
-             view_layouts = std::move(view_layouts)](
+            [work, elsewhere, mount, mounted, seen_here = std::move(seen_here)](
                 const operations::PreparationPlan& plan,
                 const operations::FilePublicationApplyProgressCallback& progress,
                 const core::CancellationToken& cancellation) mutable
                 -> core::Result<operations::FilePublicationApplyResult> {
-                if (!persistence_service) {
-                    return std::unexpected(core::Error{
-                        .code = core::ErrorCode::cancelled,
-                        .message = "Trackknife closed during file publication",
-                        .context = {},
-                    });
-                }
-                // What this computer's lists last saw of each file, for a
-                // move elsewhere to be followed here under its own revision.
-                std::map<std::string, core::LocalSourceRevision> seen_here;
-                if (elsewhere) {
-                    for (const auto& document : documents) {
-                        for (const auto& item : document.items) {
-                            if (item.source == persistence::ListSource::local &&
-                                item.source_revision) {
-                                seen_here.emplace(item.source_reference, *item.source_revision);
-                            }
-                        }
-                    }
-                }
-                const auto persistence_error = persistence_service->saveWorkspaceAndWait(
-                    std::move(documents), std::move(view_layouts));
-                if (!persistence_error.isEmpty()) {
-                    return std::unexpected(core::Error{
-                        .code = core::ErrorCode::database,
-                        .message = utf8Bytes(persistence_error),
-                        .context = {},
-                    });
-                }
                 // ADR-0237: the engine moves the files, and its lists, queue
-                // and library follow in the same commit.
+                // and library follow in the same commit; the open tabs follow
+                // from what it answers (ADR-0259: there is no copy of the
+                // lists here to follow too).
                 auto applied = work->publish(plan, progress, cancellation);
                 if (!applied) {
                     return applied;
                 }
-                const auto relocate =
-                    [persistence_service](
-                        const operations::FilePublicationCommitResult& done,
-                        const std::optional<metadata::MetadataDocument>& published) {
-                        return persistence_service->relocateLocalSourceAndWait(
-                            persistence::LocalSourceRelocation{
-                                .operation_id = done.journal_id,
-                                .source_reference = done.source_raw_path,
-                                .target_reference = done.target_raw_path,
-                                .previous_revision = done.source_revision,
-                                .published_revision = done.target_revision,
-                                .published_document = published,
-                            });
-                    };
                 mounted->clear();
+                if (!elsewhere) {
+                    return applied;
+                }
+                // Another machine's files, as this computer reaches them
+                // through its mount.
                 for (const auto& source : applied->sources) {
-                    if (source.metadata_commit &&
-                        source.metadata_commit->content_kind ==
-                            operations::MetadataOperationContentKind::text_fields) {
-                        static_cast<void>(persistence_service->refreshLocalMetadataAndWait(
-                            metadata_refresh(*source.metadata_commit)));
-                    }
                     if (!source.commit) {
-                        continue;
-                    }
-                    if (!elsewhere) {
-                        // This computer's files: this workspace's lists
-                        // follow as they did when Trackknife moved them (a
-                        // replay where they share the engine's database).
-                        static_cast<void>(relocate(*source.commit, source.published_metadata));
                         continue;
                     }
                     const auto from = mount.local_path_of(source.commit->source_raw_path);
@@ -648,7 +575,6 @@ Workspace::enginePublicationPlanApplierFactory(std::shared_ptr<engine::RemoteFil
                     if (const auto seen = seen_here.find(*from); seen != seen_here.end()) {
                         here.source_revision = seen->second;
                     }
-                    static_cast<void>(relocate(here, source.published_metadata));
                     mounted->push_back(std::move(here));
                 }
                 return applied;
@@ -776,21 +702,7 @@ OutputProfileStore Workspace::buildOutputProfileStore(const EngineKey& destinati
                         this, [work, id] { return work->remove_destination(id); },
                         [done = std::move(done)](auto removed) { done(failure(removed)); });
                 },
-            .folders =
-                [this, work](std::string path, EngineFolderListingCompletion done) {
-                    offThread(
-                        this, [work, path] { return work->folders(path); },
-                        [done = std::move(done)](auto listed) {
-                            if (!listed) {
-                                done(std::unexpected(std::move(listed.error())));
-                                return;
-                            }
-                            done(EngineFolderListing{.path = std::move(listed->path),
-                                                             .parent = std::move(listed->parent),
-                                                             .folders =
-                                                                 std::move(listed->folders)});
-                        });
-                },
+            .folders = engineFolderLister(work),
             // Only through a mount: a folder of this computer is that
             // engine's only where the mount says it is.
             .copyable = mount.local_folder.empty() || mount.remote_folder.empty()

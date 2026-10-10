@@ -67,8 +67,9 @@ SettingsSession::SettingsSession(QObject* parent) : QObject(parent) {
         (capacity < 10 || capacity > 10000 || threshold < 1 || threshold > capacity)) {
         profile = QStringLiteral("balanced");
     }
-    if (std::ranges::none_of(bufferProfiles(),
-                             [&profile](const Choice& choice) { return choice.value == profile; })) {
+    if (std::ranges::none_of(bufferProfiles(), [&profile](const Choice& choice) {
+            return choice.value == profile;
+        })) {
         profile = QStringLiteral("balanced");
     }
     values_.insert(buffer_capacity_key, std::clamp(capacity, 10, 10000));
@@ -81,6 +82,10 @@ SettingsSession::SettingsSession(QObject* parent) : QObject(parent) {
     read(QLatin1String(SettingsKeys::rating_backup_key), false);
     read(QLatin1String(SettingsKeys::rating_backup_tag_key),
          QString::fromLatin1(metadata::default_rating_backup_tag));
+    read(QLatin1String(SettingsKeys::undo_keep_days_key), SettingsKeys::undo_keep_days_default);
+    read(QLatin1String(SettingsKeys::undo_keep_writes_key), SettingsKeys::undo_keep_writes_default);
+    read(QLatin1String(SettingsKeys::undo_keep_gigabytes_key),
+         SettingsKeys::undo_keep_gigabytes_default);
     read(QLatin1String(SettingsKeys::engine_password_key), QString{});
     read(QLatin1String(SettingsKeys::library_show_local_key), true);
     read(QLatin1String(SettingsKeys::engine_upnp_key), false);
@@ -120,7 +125,8 @@ SettingsSession::SettingsSession(QObject* parent) : QObject(parent) {
     // Engines that announce themselves on the network, by name: chosen
     // rather than typed. The list fills as they answer.
     const QPointer self{this};
-    if (auto browser = discovery::Browser::start([self](const std::vector<discovery::Found>& found) {
+    if (auto browser = discovery::Browser::start([self](
+                                                     const std::vector<discovery::Found>& found) {
             QMetaObject::invokeMethod(
                 self,
                 [self, found] {
@@ -153,18 +159,18 @@ SettingsSession::SettingsSession(QObject* parent) : QObject(parent) {
 SettingsSession::~SettingsSession() = default;
 
 QStringList SettingsSession::pageTitles() {
-    return {QStringLiteral("General"),    QStringLiteral("Playback"),
-            QStringLiteral("Library"),    QStringLiteral("Engine"),
-            QStringLiteral("Naming"),     QStringLiteral("ReplayGain"),
-            QStringLiteral("Covers"),     QStringLiteral("Metadata services"),
-            QStringLiteral("Last.fm"),    QStringLiteral("Shortcuts")};
+    return {QStringLiteral("General"),         QStringLiteral("Playback"),
+            QStringLiteral("Library"),         QStringLiteral("Engine"),
+            QStringLiteral("File operations"), QStringLiteral("Ratings"),
+            QStringLiteral("Covers"),          QStringLiteral("Metadata services"),
+            QStringLiteral("Last.fm"),         QStringLiteral("Shortcuts")};
 }
 
 QString SettingsSession::saveNote(const Page page) {
     if (page == Page::library) {
         return QStringLiteral("Folder changes save immediately. Cancel does not undo them.");
     }
-    if (page == Page::naming) {
+    if (page == Page::file_operations) {
         return QStringLiteral("Save layout, Save destination, and Remove take effect immediately. "
                               "Cancel does not undo them.");
     }
@@ -208,9 +214,9 @@ std::vector<SettingsSession::Choice> SettingsSession::interfaceScales() {
     std::vector<Choice> choices;
     for (const auto scale : bench::interfaceScales()) {
         const auto percent = QString::number(qRound(scale * 100.0));
-        choices.push_back({scale == 1.0 ? QStringLiteral("As the system (100%)")
-                                        : percent + QLatin1Char('%'),
-                           QString::number(scale)});
+        choices.push_back(
+            {scale == 1.0 ? QStringLiteral("As the system (100%)") : percent + QLatin1Char('%'),
+             QString::number(scale)});
     }
     return choices;
 }
@@ -292,13 +298,11 @@ bool SettingsSession::bufferCustom() const {
 // fields: the one thing the sharing part of the page is for, spelled out.
 QString SettingsSession::agentCommand() const {
     if (!values_.value(QLatin1String(SettingsKeys::engine_share_key)).toBool()) {
-        return QStringLiteral(
-            "Only Trackknife on this computer controls this engine. UPnP speakers can "
-            "play when discovery is enabled.");
+        return QStringLiteral("Only Trackknife on this computer controls this engine. UPnP "
+                              "speakers can play when discovery is enabled.");
     }
-    const auto listen = values_.value(QLatin1String(SettingsKeys::engine_listen_key))
-                            .toString()
-                            .trimmed();
+    const auto listen =
+        values_.value(QLatin1String(SettingsKeys::engine_listen_key)).toString().trimmed();
     const auto colon = listen.lastIndexOf(QLatin1Char(':'));
     auto host = colon > 0 ? listen.left(colon) : listen;
     if (host.isEmpty() || host == QStringLiteral("0.0.0.0") || host == QStringLiteral("::")) {
@@ -402,7 +406,9 @@ std::optional<SettingsSession::Page> SettingsSession::save() {
         return Page::engine;
     }
     QSettings settings;
-    const auto trimmed = [this](const QString& key) { return values_.value(key).toString().trimmed(); };
+    const auto trimmed = [this](const QString& key) {
+        return values_.value(key).toString().trimmed();
+    };
     for (auto entry = values_.cbegin(); entry != values_.cend(); ++entry) {
         settings.setValue(entry.key(), entry.value());
     }

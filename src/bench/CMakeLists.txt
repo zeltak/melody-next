@@ -2,6 +2,8 @@
 
 qt_add_library(
     trackknife_bench_ui STATIC
+    apply_actions_popover.cpp
+    apply_actions_popover.hpp
     bench_main_window.cpp
     bench_main_window.hpp
     bench_list_tabs.cpp
@@ -62,12 +64,17 @@ qt_add_library(
     engine_folder_dialog.cpp
     output_profiles_widget.cpp
     output_profiles_widget.hpp
+    single_instance.cpp
+    single_instance.hpp
+    undo_location_widget.cpp
+    undo_location_widget.hpp
     shortcut_settings.cpp
     shortcut_settings.hpp
     settings_dialog.cpp
     settings_dialog.hpp
     metadata_transformation_dialog.cpp
     metadata_transformation_dialog.hpp
+    identify_albums_dialog.cpp
     musicbrainz_identify_dialog.cpp
     musicbrainz_identify_dialog.hpp
     musicbrainz_track_match_widget.cpp

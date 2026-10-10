@@ -69,6 +69,52 @@ local_replay_gain_override(const LocalTrackRow& row) {
 
 } // namespace
 
+std::vector<persistence::EngineListItem> Workspace::engineItemsOf(const ListTab& tab) {
+    std::vector<persistence::EngineListItem> items;
+    items.reserve(tab.model->rows().size());
+    for (const auto& row : tab.model->rows()) {
+        persistence::EngineListItem item;
+        item.entry_id = row.entry_id;
+        item.raw_path = row.raw_path;
+        item.logical_reference = row.logical_reference;
+        if (row.segment) {
+            item.segment = persistence::ListItemSegment{.start_sample = row.segment->start_sample,
+                                                        .end_sample = row.segment->end_sample};
+        }
+        if (row.selection.stream_index || row.selection.subsong_index) {
+            item.source_selection = persistence::ListItemSourceSelection{
+                .audio_stream_index = row.selection.stream_index,
+                .subsong_index = row.selection.subsong_index};
+        }
+        item.duration_ms = row.duration_ms;
+        item.title = row.title;
+        item.artist = row.artist;
+        item.album = row.album;
+        item.album_artist = row.album_artist;
+        item.date = row.date;
+        if (const auto gain = local_replay_gain_override(row)) {
+            item.replay_gain = persistence::ListItemReplayGain{.track_gain_db = gain->track_gain_db,
+                                                               .track_peak = gain->track_peak,
+                                                               .album_gain_db = gain->album_gain_db,
+                                                               .album_peak = gain->album_peak};
+        }
+        items.push_back(std::move(item));
+    }
+    return items;
+}
+
+EngineListSync::ItemsOf Workspace::engineItems() {
+    return
+        [this](
+            const core::StableId& id) -> std::optional<std::vector<persistence::EngineListItem>> {
+            const auto* tab = tabForDocument(id);
+            if (tab == nullptr) {
+                return std::nullopt;
+            }
+            return engineItemsOf(*tab);
+        };
+}
+
 namespace {
 // Not an engine's status: the one this window told to stop, until it has.
 const QString stopping_status = QStringLiteral("stopping (asked)");
@@ -88,13 +134,14 @@ void Workspace::saveLocalPlaybackModes() {
     settings.setValue(QStringLiteral("playback/rg-preamp-without"), local_rg_preamp_without_);
 }
 
-
 // As they were left, for the window: read once, when the workspace is
 // made, before any engine is reached.
 void Workspace::loadLocalPlaybackModes() {
     const QSettings settings;
-    playback_.modes.repeat = settings.value(QStringLiteral("playback/local-repeat"), false).toBool();
-    playback_.modes.random = settings.value(QStringLiteral("playback/local-random"), false).toBool();
+    playback_.modes.repeat =
+        settings.value(QStringLiteral("playback/local-repeat"), false).toBool();
+    playback_.modes.random =
+        settings.value(QStringLiteral("playback/local-random"), false).toBool();
     playback_.modes.album_random =
         settings.value(QStringLiteral("playback/local-album-random"), false).toBool();
     if (playback_.modes.album_random) {
@@ -162,7 +209,6 @@ void Workspace::applyLocalPlaybackModes() {
     view_->refreshLocalPlaybackControls();
 }
 
-
 void Workspace::syncEngineRequests() {
     // Asks go to the engine whose files they are, and only while it is the
     // one playing: the other would be asked for paths it does not have. No
@@ -170,6 +216,11 @@ void Workspace::syncEngineRequests() {
     // from before, saved across its own restart, and would play them.
     const auto* playing = linkOf(transport_);
     if (!playingOnEngine() || playing == nullptr) {
+        return;
+    }
+    // ADR-0269: not before the engine's own Up Next is known -- what another
+    // client asked for while this window was away is not overwritten.
+    if (!engine_requests_known_) {
         return;
     }
     if (playing->key != up_next_engine_ && !playback_.requests.pending().empty()) {
@@ -190,7 +241,6 @@ void Workspace::syncEngineRequests() {
     transport_->setRequests(rows, gains);
 }
 
-
 void Workspace::syncEngineQueue() {
     if (!playingOnEngine()) {
         return;
@@ -208,16 +258,37 @@ void Workspace::syncEngineQueue() {
         return;
     }
     engine_queue_ = stated;
-    std::vector<std::optional<formats::ReplayGainInfo>> overrides;
-    overrides.reserve(rows.size());
-    for (const auto& row : rows) {
-        overrides.push_back(local_replay_gain_override(row));
+    // A queue asked for before this edit answers with what the edit changed:
+    // taken up, it would bring a removed row back.
+    ++engine_queue_asked_;
+    // ADR-0256: the list is edited, now rather than at the next save, and
+    // the engine's queue played from it follows in the same request. The
+    // engine follows identity, so the playing entry survives its row moving
+    // -- or going.
+    const auto id = tab->document.id;
+    const QPointer<EnginePlayback> playback{transport_};
+    const auto replace = [this, id, playback](const bool on_engine) {
+        auto* playing = tabForDocument(id);
+        if (on_engine || playing == nullptr || playback == nullptr || playback != transport_) {
+            return;
+        }
+        // Not on the engine as shown: its rows are the queue, as before.
+        const auto& shown = playing->model->rows();
+        std::vector<std::optional<formats::ReplayGainInfo>> overrides;
+        overrides.reserve(shown.size());
+        for (const auto& row : shown) {
+            overrides.push_back(local_replay_gain_override(row));
+        }
+        playback->replaceQueue(shown, overrides, document_text(id));
+    };
+    if (list_sync_ != nullptr) {
+        list_sync_->sendNow(
+            persistence::ListDocumentWrite{.document = headerOf(*tab), .items = true},
+            engineItems(), replace);
+    } else {
+        replace(false);
     }
-    // The engine follows identity, so the playing entry survives being handed
-    // a queue that no longer holds it in the same row -- or at all.
-    transport_->replaceQueue(rows, overrides, document_text(tab->document.id));
 }
-
 
 void Workspace::adoptEngineQueue() {
     if (transport_ == nullptr) {
@@ -234,7 +305,6 @@ void Workspace::adoptEngineQueue() {
         }
     });
 }
-
 
 void Workspace::adoptEngineQueue(std::vector<LocalTrackRow> held) {
     auto* tab = tabForDocument(playback_.anchors.document);
@@ -288,7 +358,6 @@ void Workspace::adoptEngineQueue(std::vector<LocalTrackRow> held) {
     takeEngineChange(*tab);
 }
 
-
 void Workspace::reattachToEngine() {
     if (!playingOnEngine()) {
         return;
@@ -327,7 +396,6 @@ void Workspace::reattachToEngine() {
     });
 }
 
-
 void Workspace::reattachToQueue(std::vector<LocalTrackRow> rows) {
     const auto playing = core::StableId::parse(transport_->state().entry.toStdString());
     if (!playing || rows.empty()) {
@@ -355,12 +423,12 @@ void Workspace::reattachToQueue(std::vector<LocalTrackRow> rows) {
     auto* tab = playing_engine != nullptr && !playing_engine->key.isLocal()
                     ? engineTab(*playing_engine)
                     : addList(persistence::ListDocument{.id = core::StableId::random(),
-                                                           .kind = persistence::ListKind::scratch,
-                                                           .name = "Playing on the engine",
-                                                           .pinned = false,
-                                                           .dirty = false,
-                                                           .items = {}},
-                                 true);
+                                                        .kind = persistence::ListKind::scratch,
+                                                        .name = "Playing on the engine",
+                                                        .pinned = false,
+                                                        .dirty = false,
+                                                        .items = {}},
+                              true);
     if (tab == nullptr) {
         return;
     }
@@ -378,7 +446,6 @@ void Workspace::reattachToQueue(std::vector<LocalTrackRow> rows) {
     schedulePersist();
 }
 
-
 void Workspace::adoptEngineRow(ListTab& tab, const int row, const core::StableId& entry) {
     playback_.anchors.document = tab.document.id;
     playback_.anchors.current = entry;
@@ -389,7 +456,6 @@ void Workspace::adoptEngineRow(ListTab& tab, const int row, const core::StableId
     view_->refreshTransport();
     view_->refreshPlaybackCursor(true);
 }
-
 
 void Workspace::followPlayback(EnginePlayback* playback, const bool stop_other) {
     if (playback == nullptr || playback == transport_) {
@@ -424,9 +490,10 @@ void Workspace::followPlayback(EnginePlayback* playback, const bool stop_other) 
     engine_replay_gain_.reset();
     engine_consumed_.clear();
     engine_queue_revision_ = 0;
+    engine_requests_revision_.reset();
+    engine_requests_known_ = false;
     view_->refreshTransport();
 }
-
 
 void Workspace::rememberEngineState(EnginePlayback* playback) {
     auto* engine = linkOf(playback);
@@ -438,7 +505,6 @@ void Workspace::rememberEngineState(EnginePlayback* playback) {
     seen = SeenEngine{
         .status = state.status, .entry = state.entry, .queue_revision = state.queue_revision};
 }
-
 
 void Workspace::followIfStartedElsewhere(EnginePlayback* playback) {
     auto* engine = linkOf(playback);
@@ -477,7 +543,6 @@ void Workspace::followIfStartedElsewhere(EnginePlayback* playback) {
     reattachToEngine();
 }
 
-
 bool Workspace::playingOnEngine() const {
     // Ownership, not visibility: whether an engine is connected, never which
     // tab is on screen. Deciding it from the visible tab once let the local
@@ -485,7 +550,6 @@ bool Workspace::playingOnEngine() const {
     // from.
     return transport_ != nullptr && transport_->active();
 }
-
 
 int Workspace::resolvePlaybackRow(const ListTab* tab) const {
     if (tab == nullptr) {
@@ -495,34 +559,57 @@ int Workspace::resolvePlaybackRow(const ListTab* tab) const {
     return playback_.resolveRow(list);
 }
 
-
 void Workspace::playRow(ListTab& tab, const int row) {
     // ADR-0227: a tab plays on the engine whose files it lists.
     auto* target = playbackOf(EngineKey::of(tab.document));
     if (target == nullptr || !target->active()) {
         view_->showMessage(!EngineKey::of(tab.document).isLocal()
-                                     ? QStringLiteral("Nothing can play: the remote engine is "
-                                                      "not connected")
-                                     : QStringLiteral("Nothing can play: this computer's engine "
-                                                      "is not running"),
-                                 5'000);
+                               ? QStringLiteral("Nothing can play: the remote engine is "
+                                                "not connected")
+                               : QStringLiteral("Nothing can play: this computer's engine "
+                                                "is not running"),
+                           5'000);
         return;
     }
     followPlayback(target);
-    // The engine owns the queue, so it is given the whole list rather than
-    // one track: skipping, shuffling and gapless are its decisions, and it
-    // cannot make them from a single entry.
     const auto& rows = tab.model->rows();
     if (row < 0 || static_cast<std::size_t>(row) >= rows.size()) {
         return;
     }
-    std::vector<std::optional<formats::ReplayGainInfo>> overrides;
-    overrides.reserve(rows.size());
-    for (const auto& source_row : rows) {
-        overrides.push_back(local_replay_gain_override(source_row));
+    // The engine owns the queue, so it plays the whole list rather than one
+    // track: skipping, shuffling and gapless are its decisions, and it cannot
+    // make them from a single entry. ADR-0256: the list is on the engine
+    // already, so it is named, not sent -- once the edits the engine has not
+    // had yet have reached it.
+    const auto id = tab.document.id;
+    const auto entry = rows[static_cast<std::size_t>(row)].entry_id;
+    const QPointer<EnginePlayback> playback{target};
+    const auto play = [this, id, entry, playback](const bool on_engine) {
+        auto* playing = tabForDocument(id);
+        if (playing == nullptr || playback == nullptr || playback != transport_) {
+            return;
+        }
+        if (on_engine) {
+            playback->playList(document_text(id), entry);
+            return;
+        }
+        // Not on the engine as it is shown here -- a saved list's unsaved
+        // edits, an engine from before ADR-0256 -- so its rows are the queue.
+        const auto& shown = playing->model->rows();
+        std::vector<std::optional<formats::ReplayGainInfo>> overrides;
+        overrides.reserve(shown.size());
+        for (const auto& source_row : shown) {
+            overrides.push_back(local_replay_gain_override(source_row));
+        }
+        playback->play(shown, overrides, entry, document_text(id));
+    };
+    if (list_sync_ != nullptr) {
+        list_sync_->sendNow(
+            persistence::ListDocumentWrite{.document = headerOf(tab), .items = true}, engineItems(),
+            play);
+    } else {
+        play(false);
     }
-    transport_->play(rows, overrides, rows[static_cast<std::size_t>(row)].entry_id,
-                     document_text(tab.document.id));
     if (playback_.anchors.document != tab.document.id) {
         if (auto* previous = tabForDocument(playback_.anchors.document); previous != nullptr) {
             previous->model->setCurrentSource({}, -1);
@@ -535,7 +622,6 @@ void Workspace::playRow(ListTab& tab, const int row) {
     tab.model->setCurrentSource(tab.model->source(row), row);
 }
 
-
 void Workspace::togglePlayPause() {
     if (!playingOnEngine()) {
         return;
@@ -547,13 +633,11 @@ void Workspace::togglePlayPause() {
     }
 }
 
-
 void Workspace::seekToMs(const qint64 position_ms) {
     if (playingOnEngine()) {
         transport_->seek(position_ms);
     }
 }
-
 
 const LocalTrackRow* Workspace::playingRow(const QString& entry) {
     const auto identity = core::StableId::parse(entry.toStdString());
@@ -590,7 +674,6 @@ const LocalTrackRow* Workspace::playingRow(const QString& entry) {
     return nullptr;
 }
 
-
 Workspace::EngineLink* Workspace::linkOf(const EnginePlayback* playback) const {
     if (playback == nullptr) {
         return nullptr;
@@ -600,12 +683,10 @@ Workspace::EngineLink* Workspace::linkOf(const EnginePlayback* playback) const {
     return found != engines_.end() ? found->get() : nullptr;
 }
 
-
 Workspace::ListTab* Workspace::remoteQueueTab() {
     auto* remote = remoteEngine();
     return remote != nullptr ? engineTab(*remote) : nullptr;
 }
-
 
 Workspace::ListTab* Workspace::engineTab(EngineLink& engine) {
     // Its own, by its key: a list of an engine the address led to before
@@ -621,16 +702,15 @@ Workspace::ListTab* Workspace::engineTab(EngineLink& engine) {
     // Opened on first connection, named after the engine so it reads as a
     // place rather than a list.
     auto* tab = addList(persistence::ListDocument{.id = core::StableId::random(),
-                                                     .kind = persistence::ListKind::scratch,
-                                                     .name = utf8Bytes(engine.catalogue->name()),
-                                                     .pinned = false,
-                                                     .dirty = false,
-                                                     .items = {},
-                                                     .engine = engine.key.stored()},
-                           false);
+                                                  .kind = persistence::ListKind::scratch,
+                                                  .name = utf8Bytes(engine.catalogue->name()),
+                                                  .pinned = false,
+                                                  .dirty = false,
+                                                  .items = {},
+                                                  .engine = engine.key.stored()},
+                        false);
     schedulePersist();
     return tab;
 }
-
 
 } // namespace trackknife::bench

@@ -4,6 +4,7 @@
 
 #include "trackknife/core/cancellation.hpp"
 #include "trackknife/core/result.hpp"
+#include "trackknife/engine/dynamic_selection.hpp"
 #include "trackknife/engine/library_views.hpp"
 #include "trackknife/persistence/local_library.hpp"
 #include "trackknife/query/tkq.hpp"
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -116,7 +118,8 @@ class Catalogue {
     // library: this reads files on the engine's machine for anyone who can
     // reach it, so it reads nothing else. Empty when there is no cover.
     [[nodiscard]] virtual core::Result<std::vector<unsigned char>>
-    artwork(const std::string& raw_path, const core::CancellationToken& cancellation = {}) const = 0;
+    artwork(const std::string& raw_path,
+            const core::CancellationToken& cancellation = {}) const = 0;
 
     // Cached fields and technicals for the given raw paths, in input order,
     // preserving duplicates. No filesystem access: a path missing from the
@@ -124,6 +127,25 @@ class Catalogue {
     [[nodiscard]] virtual core::Result<std::vector<persistence::LibraryTrackSnapshot>>
     cached_tracks(const std::vector<std::string>& raw_paths,
                   const core::CancellationToken& cancellation = {}) const = 0;
+
+    // A query's matches, each as its file and one line in `format` (tkfmt-1,
+    // formatted with the track's whole row), at most `limit` (0: every one),
+    // in the query's order. For a list that shows lines: a search of 66,841
+    // tracks needs their lines, not every tag of every one. Made from the
+    // calls above; an engine elsewhere formats them where the tags are.
+    struct FoundTrack {
+        std::string raw_path;
+        std::string text;
+    };
+    [[nodiscard]] virtual core::Result<std::vector<FoundTrack>>
+    find(const query::CompiledTkq& compiled, const std::string& format, std::size_t limit,
+         const core::CancellationToken& cancellation = {}) const;
+    // ADR-0258: what a dynamic playlist's library rule picks -- at most 500
+    // files, chosen where the library is, so the matches never travel whole.
+    // Never what `exclude` names.
+    [[nodiscard]] virtual core::Result<DynamicSelected>
+    select(const DynamicSelection& selection, const std::set<std::string>& exclude = {},
+           const core::CancellationToken& cancellation = {}) const;
 
     // Play counts and timestamps for the given sources, in input order.
     [[nodiscard]] virtual core::Result<std::vector<std::array<std::int64_t, 6>>>
@@ -167,6 +189,18 @@ class Catalogue {
 class LocalCatalogue final : public Catalogue {
   public:
     explicit LocalCatalogue(std::filesystem::path database) : database_(std::move(database)) {}
+
+    // What changed in the library: the paths re-read or dropped, the albums
+    // they touched before and after (a cover's too), or, after a scan or a
+    // change of folders, everything.
+    struct Change {
+        std::vector<std::string> paths;
+        std::vector<std::string> albums;
+        bool everything{false};
+    };
+    using ChangeObserver = std::function<void(const Change&)>;
+    // Told of every change, on the thread that made it.
+    void observe(ChangeObserver observer) { observer_ = std::move(observer); }
 
     // Opens the catalogue once, creating and migrating it. Callers do not need
     // this -- every operation opens for itself -- but a daemon does: a
@@ -212,6 +246,12 @@ class LocalCatalogue final : public Catalogue {
     [[nodiscard]] core::Result<std::vector<persistence::LibraryTrackSnapshot>>
     cached_tracks(const std::vector<std::string>& raw_paths,
                   const core::CancellationToken& cancellation = {}) const override;
+    // ADR-0259: each path's indexed tags and revision, nothing for one the
+    // library does not index. The engine's own; no client asks it of a
+    // catalogue.
+    [[nodiscard]] core::Result<std::vector<std::optional<persistence::LibraryTrackSnapshot>>>
+    described_tracks(const std::vector<std::string>& raw_paths,
+                     const core::CancellationToken& cancellation = {}) const;
     [[nodiscard]] core::Result<std::vector<std::array<std::int64_t, 6>>>
     history_facts(const std::vector<persistence::LibraryHistorySource>& sources,
                   const core::CancellationToken& cancellation = {}) const override;
@@ -231,6 +271,13 @@ class LocalCatalogue final : public Catalogue {
     [[nodiscard]] core::Result<std::size_t> import_indexed_tag_ratings();
 
   private:
+    void changed(Change change) const {
+        if (observer_) {
+            observer_(change);
+        }
+    }
+    ChangeObserver observer_;
+
     [[nodiscard]] core::Result<persistence::LocalLibrary> open() const;
 
     std::filesystem::path database_;

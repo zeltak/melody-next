@@ -66,6 +66,27 @@ ports off the internet and use a VPN from outside -- or, if you want TLS, put
 a proxy (stunnel, an nginx or Caddy stream proxy) in front of an engine
 listening on `127.0.0.1`. `melodyd --help` lists everything.
 
+### The phone through a web proxy
+
+A phone away from home that does not run the VPN can reach an engine through
+a web server that does (ADR-0271). The engine's stream port serves the
+protocol as a WebSocket at `/protocol` beside its streams, so an ordinary
+HTTPS site in front of that port carries both -- with Caddy:
+
+```caddyfile
+music.example.org {
+	reverse_proxy 10.10.10.200:6604
+}
+```
+
+In the app, give the engine as `wss://music.example.org`, with its password
+-- without the port: the proxy's is the usual one. The engine needs a
+password (`--password-file`) for this, as for its TCP port.
+
+At home the app finds the engine on the network by the id it announces and
+connects to it there directly, streams too, and goes back through the proxy
+when the phone leaves (ADR-0272).
+
 ## A NAS that can't run the engine
 
 When the music is on a NAS and the engine runs on another machine, the engine
@@ -152,6 +173,7 @@ melody-cli play list road trip        # one of them, by name or its words
 melody-cli output "Pixel 10 Pro"
 melody-cli rating 8                   # what plays, 1-10; 0 clears
 melody-cli albumrating 9              # its album
+melody-cli cover /tmp/cover.jpg 512   # its cover, 512 pixels across at most
 melody-cli love                       # on Last.fm, with the engine's account
 melody-cli replaygain album doors 1967  # measured and written by the engine
 melody-cli --json watch               # a line each time something changes
@@ -185,6 +207,28 @@ with `melody-rofi tracks`, a track) in rofi and puts it in Up Next, adds it to
 the list that plays, or replaces that list and plays it (`melody-rofi tracks
 --engine gemenon` for a particular engine).
 
+## melody-musiclist
+
+Every album of an engine's library with its rating, as one sortable HTML
+page, copied with `scp` to where a web server serves it. It asks the engine
+through `melody-cli`, so it needs that and Python. Configured in
+`~/.config/melody/melody-musiclist.toml` (or the `melody-musicpage.toml` of
+earlier releases); the first run writes one to fill in:
+
+```toml
+[engine]
+name = "gemenon"        # or server = "HOST:PORT"; neither: this computer's
+password_file = ""      # for a TCP connection
+
+[upload]
+host = "webhost"
+path = "/srv/http/list"
+```
+
+An album's computed rating is the mean of its tracks' ratings, once at least
+70% of them are rated. `melody-musiclist --output page.html` writes the page
+and uploads nothing.
+
 ## When something doesn't work
 
 - **The engine isn't found by name.** Multicast DNS needs 5353/udp between
@@ -197,3 +241,24 @@ the list that plays, or replaces that list and plays it (`melody-rofi tracks
   on the LAN and that the renderer can reach the engine's HTTP stream port.
 - **Converted tracks** are kept in `transcodes/` in the engine's state
   directory. Deleting that folder is safe.
+- **"… speaks protocol 2; this Trackknife speaks protocol 1"**, or **"…'s
+  melodyd is older than this Trackknife"**: the engine and the client are
+  of releases too far apart (ADR-0260). Update the side the message names.
+  Within 1.x any client works with any engine, without what an older engine
+  lacks.
+
+## Going back to an older melodyd
+
+A newer `melodyd` moves its database forward on start, and an older one
+then refuses it ("created by a newer application version"). To go back:
+
+1. Stop the engine and copy its `lists.sqlite` somewhere safe.
+2. Read the schema the database is at:
+   `sqlite3 lists.sqlite "SELECT version FROM schema_version"`.
+3. For every migration above the one the older release knows, newest
+   first, apply its down file from `src/persistence/migrations` of the
+   newer release: `sqlite3 lists.sqlite < 0051_engine_list_drafts.down.sql`.
+4. Start the older engine.
+
+A down migration loses only what its release added -- drafts, say, become
+ordinary working lists.

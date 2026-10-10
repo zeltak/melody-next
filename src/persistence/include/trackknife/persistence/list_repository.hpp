@@ -108,6 +108,24 @@ struct ListDocument {
     friend bool operator==(const ListDocument&, const ListDocument&) = default;
 };
 
+// A list as a workspace save hands it over: always its header -- name, kind,
+// place, flags -- and its items only when they changed since they were last
+// saved. A list left out is deleted.
+struct ListDocumentWrite {
+    ListDocument document;
+    bool items{true};
+};
+
+// A ReplayGain given with a list entry rather than read from its file.
+struct ListItemReplayGain {
+    std::optional<double> track_gain_db;
+    std::optional<double> track_peak;
+    std::optional<double> album_gain_db;
+    std::optional<double> album_peak;
+
+    friend bool operator==(const ListItemReplayGain&, const ListItemReplayGain&) = default;
+};
+
 // ADR-0233: one entry of a list, as its engine stores it. The track
 // is named by its path on the engine's machine; the entry keeps its identity
 // (ADR-0221). Title, artist and album are what the client that saved it
@@ -122,6 +140,12 @@ struct EngineListItem {
     std::string title;
     std::string artist;
     std::string album;
+    // ADR-0256: what a queue entry needs that the engine cannot read for
+    // itself -- the album shuffle groups by album artist and date, and a
+    // sidecar's or CUE sheet's ReplayGain (ADR-0139/0141) is not in the file.
+    std::string album_artist;
+    std::string date;
+    std::optional<ListItemReplayGain> replay_gain;
 
     friend bool operator==(const EngineListItem&, const EngineListItem&) = default;
 };
@@ -138,9 +162,15 @@ struct EngineListSummary {
     std::uint64_t revision{0};
     std::size_t tracks{0};
     std::int64_t modified_ms{0};
+    // ADR-0259: a draft -- a working list holding the unsaved edits of the
+    // saved list `draft_of`, begun when that was at revision `draft_base`.
+    std::optional<core::StableId> draft_of;
+    std::uint64_t draft_base{0};
 
     friend bool operator==(const EngineListSummary&, const EngineListSummary&) = default;
 };
+
+struct ListEdit;
 
 struct EngineList {
     EngineListSummary summary;
@@ -281,6 +311,10 @@ class ListRepository final {
     [[nodiscard]] core::Result<unsigned> schema_version() const;
     [[nodiscard]] core::Result<std::vector<ListDocument>> load_all() const;
     [[nodiscard]] core::Result<void> replace_all(std::span<const ListDocument> documents);
+    // The workspace's lists as they are now, writing items only where they
+    // changed: a save costs what changed, not the size of every list -- two
+    // kept searches of 66,841 tracks had every save rewrite 3.2 million rows.
+    [[nodiscard]] core::Result<void> save_workspace(std::span<const ListDocumentWrite> documents);
     // Atomically refreshes every local occurrence of one physical source and
     // its source cache. The operation identity makes recovery replay a no-op.
     [[nodiscard]] core::Result<LocalMetadataRefreshResult>
@@ -354,21 +388,52 @@ class ListRepository final {
     // which is Trackknife's workspace and rewritten whole by it.
     [[nodiscard]] core::Result<std::vector<EngineListSummary>> load_engine_lists() const;
     // Empty when there is no such list.
-    [[nodiscard]] core::Result<std::optional<EngineList>> load_engine_list(const core::StableId& id) const;
+    [[nodiscard]] core::Result<std::optional<EngineList>>
+    load_engine_list(const core::StableId& id) const;
     // Creates it, or replaces its name and items. With `expected_revision`
     // the write is refused as a conflict unless the list is still at
     // that revision -- or, for 0, does not exist yet; without, it is written
     // whatever changed meanwhile.
     [[nodiscard]] core::Result<EngineListSummary>
     save_engine_list(const core::StableId& id, std::string_view name, EngineListKind kind,
-                  const std::vector<EngineListItem>& items,
-                  std::optional<std::uint64_t> expected_revision, std::int64_t now_ms);
+                     const std::vector<EngineListItem>& items,
+                     std::optional<std::uint64_t> expected_revision, std::int64_t now_ms);
+    // ADR-0256: applies `edits` in order to the list at `expected_revision`,
+    // with its name or kind when given -- "Save" is a change of kind -- in
+    // one transaction, and answers the list as it is afterwards -- its items
+    // only `with_items`, as reading a long one back costs. Refused
+    // as a conflict at any other revision, as not_found without the list,
+    // and as apply_list_edits refuses; nothing is written then.
+    [[nodiscard]] core::Result<EngineList>
+    edit_engine_list(const core::StableId& id, std::uint64_t expected_revision,
+                     const std::vector<ListEdit>& edits, std::int64_t now_ms,
+                     std::optional<std::string_view> name = std::nullopt,
+                     std::optional<EngineListKind> kind = std::nullopt, bool with_items = true);
     [[nodiscard]] core::Result<EngineListSummary>
     rename_engine_list(const core::StableId& id, std::string_view name,
-                    std::optional<std::uint64_t> expected_revision, std::int64_t now_ms);
-    // False when there was no such list.
-    [[nodiscard]] core::Result<bool> delete_engine_list(const core::StableId& id,
-                                                     std::optional<std::uint64_t> expected_revision);
+                       std::optional<std::uint64_t> expected_revision, std::int64_t now_ms);
+    // False when there was no such list. A saved list's draft goes with it.
+    [[nodiscard]] core::Result<bool>
+    delete_engine_list(const core::StableId& id, std::optional<std::uint64_t> expected_revision);
+    // ADR-0259: the list's revision and the path of each of `entries`, in
+    // that order; nothing for an entry it does not hold. Not found without
+    // the list.
+    [[nodiscard]] core::Result<std::pair<std::uint64_t, std::vector<std::optional<std::string>>>>
+    engine_list_entry_paths(const core::StableId& id,
+                            const std::vector<core::StableId>& entries) const;
+    // ADR-0259: the draft of the saved list `of` -- the one there is, or a
+    // new working list `id` with its name and entries, entry identities
+    // kept, begun at its revision. Refused as not_found without the list and
+    // as invalid_argument for one that is not saved.
+    [[nodiscard]] core::Result<EngineListSummary>
+    draft_engine_list(const core::StableId& of, const core::StableId& id, std::int64_t now_ms);
+    // Writes the draft `id` -- its name and entries -- to the saved list it
+    // drafts, and deletes the draft, answering the saved list. Refused as a
+    // conflict when the saved list moved on since the draft began, unless
+    // `force`; as not_found when it is gone; as invalid_argument for a list
+    // that is no draft.
+    [[nodiscard]] core::Result<EngineListSummary>
+    commit_engine_list_draft(const core::StableId& id, bool force, std::int64_t now_ms);
     // ADR-0233: files moved or renamed. Every entry of every list naming a
     // `from` names its `to` instead, in one transaction; each list changed
     // gets a new revision, and is returned.

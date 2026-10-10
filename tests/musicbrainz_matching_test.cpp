@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+#include "trackknife/musicbrainz/album_groups.hpp"
+#include "trackknife/musicbrainz/album_lookup.hpp"
 #include "trackknife/musicbrainz/matching.hpp"
 #include "trackknife/musicbrainz/proposal_bridge.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -387,6 +390,172 @@ void manualMappingValidatesIdentityAndAllowsUntaggedFiles() {
     CHECK(align_release_tracks(local, release, cancellation.token()).tracks.empty());
 }
 
+// ADR-0261: an alignment says how it paired and how well, and only a
+// numbered or ordered pairing with every length and title close is clear.
+void clearMatchesNeedNoOne() {
+    auto release = two_disc_release();
+    release.media.pop_back();
+    release.track_count = 2U;
+    const auto file = [](std::string title, std::optional<std::size_t> number,
+                         std::optional<std::int64_t> length) {
+        return LocalTrackDescriptor{.title = std::move(title),
+                                    .artist = {},
+                                    .album = {},
+                                    .track_number = number,
+                                    .disc_number = {},
+                                    .duration_ms = length};
+    };
+    const std::vector exact{file("One", 1U, 61'500), file("Two", 2U, 58'000)};
+    const auto numbered = align_release_tracks(exact, release);
+    CHECK(numbered.method == AlignmentMethod::numbers);
+    CHECK(numbered.durations_compared == 2U);
+    CHECK(numbered.worst_duration_delta_ms == 1'000);
+    CHECK(numbered.weakest_title == 1.0);
+    CHECK(is_clear_match(numbered, exact.size()));
+
+    const std::vector unnumbered{file("One", {}, 61'000), file("Two", {}, 59'000)};
+    const auto ordered = align_release_tracks(unnumbered, release);
+    CHECK(ordered.method == AlignmentMethod::order);
+    CHECK(is_clear_match(ordered, unnumbered.size()));
+
+    const std::vector far{file("One", 1U, 61'000), file("Two", 2U, 70'000)};
+    const auto too_long = align_release_tracks(far, release);
+    CHECK(too_long.worst_duration_delta_ms == 11'000);
+    CHECK(!is_clear_match(too_long, far.size()));
+    CHECK(is_clear_match(
+        too_long, far.size(),
+        ClearMatchRule{.maximum_duration_delta_ms = 12'000, .minimum_title_similarity = 0.8}));
+
+    const std::vector unknown{file("One", 1U, 61'000), file("Two", 2U, {})};
+    const auto no_length = align_release_tracks(unknown, release);
+    CHECK(no_length.durations_compared == 1U);
+    CHECK(!is_clear_match(no_length, unknown.size()));
+
+    const std::vector renamed{file("One", 1U, 61'000), file("Something else", 2U, 59'000)};
+    const auto unlike = align_release_tracks(renamed, release);
+    CHECK(unlike.weakest_title < 0.8);
+    CHECK(!is_clear_match(unlike, renamed.size()));
+
+    const std::vector extra{file("Two", {}, 59'000), file("Stranger", {}, 200'000),
+                            file("One", {}, 61'000)};
+    const auto by_titles = align_release_tracks(extra, release);
+    CHECK(by_titles.method == AlignmentMethod::titles);
+    CHECK(!is_clear_match(by_titles, extra.size()));
+
+    const std::vector one_short{file("One", 1U, 61'000)};
+    CHECK(!is_clear_match(align_release_tracks(one_short, release), one_short.size()));
+}
+
+// ADR-0261: a selection's albums -- by release id, else tags across disc
+// folders, else folder.
+void selectionsGroupIntoAlbums() {
+    const auto in = [](std::string path, std::string id, std::string album_artist,
+                       std::string artist, std::string album, std::string date) {
+        return AlbumGroupInput{.raw_path = std::move(path),
+                               .release_id = std::move(id),
+                               .album_artist = std::move(album_artist),
+                               .artist = std::move(artist),
+                               .album = std::move(album),
+                               .date = std::move(date)};
+    };
+    const std::vector<AlbumGroupInput> files{
+        in("/m/Wilson/Cover/CD 1/01.flac", "AAAA-1", "Steven Wilson", "", "Cover Version", "2014"),
+        in("/m/Wilson/Cover/CD 2/01.flac", "aaaa-1", "Steven Wilson", "", "Cover Version", "2014"),
+        in("/m/Schandmaul/Stern/01.flac", "", "Schandmaul", "", "Sternensegler", "2026-03-06"),
+        in("/m/Schandmaul/Stern/CD 2/01.flac", "", "", "Schandmaul", "Sternensegler (CD 2)",
+           "2026"),
+        in("/m/Schandmaul/Old/01.flac", "", "Schandmaul", "", "Sternensegler", "2001"),
+        in("/m/incoming/rip-0412/CD 1/track01.flac", "", "", "", "", ""),
+        in("/m/incoming/rip-0412/CD 2/track01.flac", "", "", "", "", ""),
+        in("/m/incoming/other/track01.flac", "", "", "", "  ", ""),
+    };
+    const auto groups = group_albums(files);
+    CHECK(groups.size() == 5U);
+    CHECK(groups[0].basis == AlbumGroupBasis::release_id);
+    CHECK(groups[0].items == (std::vector<std::size_t>{0U, 1U}));
+    CHECK(groups[0].folders ==
+          (std::vector<std::string>{"/m/Wilson/Cover/CD 1", "/m/Wilson/Cover/CD 2"}));
+    CHECK(groups[1].basis == AlbumGroupBasis::tags);
+    CHECK(groups[1].items == (std::vector<std::size_t>{2U, 3U}));
+    CHECK(groups[2].items == (std::vector<std::size_t>{4U}));
+    CHECK(groups[3].basis == AlbumGroupBasis::folder);
+    CHECK(groups[3].key == "/m/incoming/rip-0412");
+    CHECK(groups[3].items == (std::vector<std::size_t>{5U, 6U}));
+    CHECK(groups[4].key == "/m/incoming/other");
+
+    CHECK(is_disc_folder("CD 2") && is_disc_folder("disc1") && is_disc_folder("Disk_03") &&
+          is_disc_folder("cd-12"));
+    CHECK(!is_disc_folder("CD") && !is_disc_folder("Discography") &&
+          !is_disc_folder("CD 2 bonus") && !is_disc_folder("2"));
+}
+
+// ADR-0261: which releases of a search are looked up, and what the lookups
+// make of an album.
+void albumsAreLookedUpAndJudged() {
+    const auto file = [](std::string title, std::size_t number, std::int64_t length) {
+        return LocalTrackDescriptor{.title = std::move(title),
+                                    .artist = {},
+                                    .album = {},
+                                    .track_number = number,
+                                    .disc_number = {},
+                                    .duration_ms = length};
+    };
+    const AlbumQuery query{
+        .release_id = {},
+        .artist = "Band",
+        .album = "Alpha",
+        .tracks = {file("One", 1U, 61'000), file("Two", 2U, 59'000), file("Three", 3U, 63'000)}};
+    ReleaseSearchResult found;
+    const auto listed = [](std::string id, int score, std::size_t tracks) {
+        auto release = two_disc_release();
+        release.id = std::move(id);
+        release.search_score = score;
+        release.track_count = tracks;
+        return release;
+    };
+    found.releases = {listed("a", 100, 12U), listed("b", 90, 3U), listed("c", 95, 3U),
+                      listed("d", 80, 4U),   listed("e", 70, 3U), listed("c", 60, 3U)};
+    CHECK(releases_to_examine(query, found) == (std::vector<std::string>{"c", "b", "e"}));
+    CHECK(releases_to_examine(query, found, 5U) ==
+          (std::vector<std::string>{"c", "b", "e", "a", "d"}));
+
+    // The release's tracks are on two discs, numbered 1, 2 and 1: the files
+    // say disc nothing, so they pair in order.
+    auto fits = two_disc_release();
+    fits.id = "fits";
+    auto shorter = two_disc_release();
+    shorter.id = "shorter";
+    shorter.media.pop_back();
+    auto stranger = two_disc_release();
+    stranger.id = "stranger";
+    for (auto& medium : stranger.media) {
+        for (auto& each : medium.tracks) {
+            each.title = "Unrelated " + each.title;
+            each.length_ms = 400'000;
+            each.position = 90U;
+        }
+    }
+    const auto one = judge_album(query, {shorter, fits, stranger});
+    CHECK(one.outcome == AlbumLookupOutcome::matched);
+    CHECK(one.candidates.front().release.id == "fits" && one.candidates.front().clear);
+    CHECK(std::ranges::none_of(one.candidates, [](const AlbumCandidate& candidate) {
+        return candidate.release.id == "stranger";
+    }));
+
+    auto twin = fits;
+    twin.id = "twin";
+    const auto two = judge_album(query, {fits, twin});
+    CHECK(two.outcome == AlbumLookupOutcome::needs_choice);
+    CHECK(two.candidates.size() == 2U);
+
+    const auto unsure = judge_album(query, {shorter});
+    CHECK(unsure.outcome == AlbumLookupOutcome::needs_choice);
+    CHECK(!unsure.candidates.front().clear);
+
+    CHECK(judge_album(query, {stranger}).outcome == AlbumLookupOutcome::no_match);
+    CHECK(judge_album(query, {}).outcome == AlbumLookupOutcome::no_match);
+}
+
 } // namespace
 
 int main() {
@@ -396,6 +565,9 @@ int main() {
     alignsByOrderAndThenGreedyTitles();
     proposalsCarryTagsIdentifiersAndVersion();
     lowConfidenceTracksReceiveNothing();
+    clearMatchesNeedNoOne();
+    selectionsGroupIntoAlbums();
+    albumsAreLookedUpAndJudged();
     if (failures != 0) {
         std::cerr << failures << " check(s) failed\n";
         return 1;

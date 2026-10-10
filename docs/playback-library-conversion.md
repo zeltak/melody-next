@@ -8,7 +8,7 @@
 
 Current local engine output uses PipeWire on Linux and CoreAudio on macOS. Both
 adapters consume the same bounded PCM ring and playback worker; see
-[ADR-0240](adr/0240-coreaudio-output-on-macos.md) for the macOS adapter.
+[ADR-0255](adr/0255-coreaudio-output-on-macos.md) for the macOS adapter.
 
 ADR-0058 unifies the authorities in Trackbench. ADR-0115 adds the optional
 [local library](local-library.md): chosen folders, background indexing,

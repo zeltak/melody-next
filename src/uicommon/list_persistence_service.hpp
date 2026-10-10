@@ -49,8 +49,10 @@ class ListPersistenceService final : public QObject {
     ListPersistenceService(const ListPersistenceService&) = delete;
     ListPersistenceService& operator=(const ListPersistenceService&) = delete;
 
-    void initialize(WorkspaceCallback callback);
-    void saveWorkspace(std::vector<persistence::ListDocument> lists,
+    // ADR-0259: `lists` false once the window keeps its tabs elsewhere; the
+    // lists stored here are then not read at all.
+    void initialize(WorkspaceCallback callback, bool lists = true);
+    void saveWorkspace(std::vector<persistence::ListDocumentWrite> lists,
                        std::vector<persistence::TrackViewPreset> presets,
                        CompletionCallback callback = {});
     void saveProfiles(std::vector<persistence::ConnectionProfile> profiles,
@@ -81,7 +83,7 @@ class ListPersistenceService final : public QObject {
 
     // Window shutdown is the only blocking persistence boundary. Database work
     // still runs on the service thread and the call guarantees durable edits.
-    [[nodiscard]] QString saveWorkspaceAndWait(std::vector<persistence::ListDocument> lists,
+    [[nodiscard]] QString saveWorkspaceAndWait(std::vector<persistence::ListDocumentWrite> lists,
                                                std::vector<persistence::TrackViewPreset> presets);
     // Called from a mutation worker after physical publication. The SQLite
     // transaction stays on the serialized persistence thread.

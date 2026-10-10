@@ -23,7 +23,7 @@ enum class PipeWireOutputState {
 };
 
 // Historical internal names retained while this contract is implemented by
-// PipeWire on Linux and CoreAudio on macOS (ADR-0240).
+// PipeWire on Linux and CoreAudio on macOS (ADR-0255).
 struct PipeWireOutputConfig {
     std::string stream_name{"Trackknife local playback"};
     std::optional<std::string> target_object;

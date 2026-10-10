@@ -5,14 +5,23 @@
 From the AUR:
 
 - `trackknife-git`: the desktop app
-- `melody-git`: the engine (`melodyd-git`) and `melody-agent-git`. On a server
-  you only need `melodyd-git`.
+- `melodyd-git`: the engine, `melodyd`, with its systemd user unit. A server
+  needs only this.
+- `melody-agent-git`: `melody-agent`, the speakers of a machine for engines
+  elsewhere
 - `melody-cli-git`: `melody-cli`, for scripts, key bindings and status bars
 - `melody-watch-git`: `melody-watch`, for a NAS that can't run the engine
   ([what it does](melody.md#a-nas-that-cant-run-the-engine))
 
-The same packages are in [`packaging/arch/`](../packaging/arch/README.md), one
-directory each:
+Name the packages you want: `yay -S melodyd-git melody-agent-git`.
+`melodyd-git` and `melody-agent-git` are built from one recipe called
+`melody-git`; installing `melody-git` alone installs only an empty
+metapackage, and leaves an engine already installed as it was. `-git`
+packages are rebuilt when their repository moves on with
+`yay -Syu --devel`.
+
+The recipes are in [`packaging/arch/`](../packaging/arch/README.md), one
+directory each; the engine and the agent are both in `melody-git`:
 
 ```sh
 cd packaging/arch/melody-git
@@ -107,35 +116,11 @@ cmake --build --preset release
 ./build/release/src/bench/trackknife
 ```
 
-For this fork's two-machine setup, the helper fast-forwards the desktop checkout
-from the fork's `main`, fetches and merges the original repository's `main`,
-builds Trackknife and Melody on the desktop, and pushes the updated fork
-`main`. It then connects to `192.168.1.111`, switches that checkout to the
-fork's `main`, fast-forwards it, and builds the Release `melodyd` natively on
-that machine so its macOS deployment target and Homebrew libraries match. The
-binary is installed atomically at `~/melody/melodyd` after its SHA-256 checksum
-matches, then exercised with `melodyd --help`. A successful deployment prints
-its host, path, commit, size, checksum, and launch-test result. Both builds use
-eight jobs by default; on macOS the helper selects the Homebrew dependencies.
-If the server's old `main` has diverged, the helper preserves it under a
-timestamped `backup/server-main-before-sync-*` branch before aligning the
-deployment checkout with the fork:
-
-```sh
-./scripts/build-latest.sh
-```
-
-Use `--jobs N`, `--desktop-only`, or `--no-update` to change the parallelism,
-skip the server, or build both existing checkouts without changing Git. The
-server and its checkout can be overridden with `--server`, `--server-path`,
-`--server-install-dir`, `MELODY_SERVER_HOST`, `MELODY_SERVER_PATH`, and
-`MELODY_SERVER_INSTALL_DIR`.
-
 Relevant build switches are:
 
 | Switch | Default | Effect |
 | --- | --- | --- |
-| `TRACKKNIFE_ENABLE_UPNP` | On | Builds SSDP discovery and UPnP playback and requires libupnp. Set it to `OFF` for a build with no UPnP code or dependency. |
+| `TRACKKNIFE_ENABLE_UPNP` | `AUTO` | Builds SSDP discovery and UPnP playback when libupnp is installed, and leaves them out when it is not. `ON` requires libupnp; `OFF` builds no UPnP code. |
 | `TRACKKNIFE_ENABLE_LOCAL_AUDIO` | On on Linux and macOS | Builds PipeWire on Linux or CoreAudio on macOS. |
 | `TRACKKNIFE_BUILD_WATCH` | On on Linux; off elsewhere | Builds the inotify-based `melody-watch` utility. |
 

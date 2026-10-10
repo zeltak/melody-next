@@ -5,6 +5,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.melody.next.engine.Endpoint
+import com.melody.next.engine.Transport
+import com.melody.next.engine.sameAddress
 
 /** What this phone remembers: the engine it talks to and how it looks. */
 class Settings(context: Context) {
@@ -13,19 +15,36 @@ class Settings(context: Context) {
     var endpoint: Endpoint?
         get() {
             val host = preferences.getString("host", null) ?: return null
-            return Endpoint(host, preferences.getInt("port", Endpoint.DEFAULT_PORT), preferences.getString("password", "") ?: "")
+            return Endpoint(
+                host, preferences.getInt("port", Endpoint.DEFAULT_PORT), preferences.getString("password", "") ?: "",
+                transportOf(preferences.getString("transport", null)),
+                preferences.getString("path", null) ?: Endpoint.DEFAULT_PATH,
+            )
         }
         set(value) {
+            val before = endpoint
             preferences.edit().apply {
+                // Another engine: the id known was the last one's.
+                if (value == null || before == null || !before.sameAddress(value)) remove("engine_id")
                 if (value == null) {
-                    remove("host"); remove("port"); remove("password")
+                    remove("host"); remove("port"); remove("password"); remove("transport"); remove("path")
                 } else {
                     putString("host", value.host)
                     putInt("port", value.port)
                     putString("password", value.password)
+                    putString("transport", value.transport.name)
+                    putString("path", value.path)
                 }
             }.apply()
         }
+
+    /**
+     * ADR-0272: the id of the engine at [endpoint], as it gave it -- what it
+     * is found by on this network, before the first connection is made.
+     */
+    var engineId: String?
+        get() = preferences.getString("engine_id", null)
+        set(value) = preferences.edit().putString("engine_id", value).apply()
 
     /**
      * ADR-0234: engines besides the one this phone plays through, whose lists
@@ -38,7 +57,10 @@ class Settings(context: Context) {
         otherEngines = engines.distinctBy { it.host to it.port }
         val stored = org.json.JSONArray()
         otherEngines.forEach {
-            stored.put(org.json.JSONObject().put("host", it.host).put("port", it.port).put("password", it.password))
+            stored.put(
+                org.json.JSONObject().put("host", it.host).put("port", it.port).put("password", it.password)
+                    .put("transport", it.transport.name).put("path", it.path)
+            )
         }
         preferences.edit().putString("other_engines", stored.toString()).apply()
     }
@@ -47,7 +69,11 @@ class Settings(context: Context) {
         val stored = org.json.JSONArray(preferences.getString("other_engines", "[]") ?: "[]")
         (0 until stored.length()).map { index ->
             val engine = stored.getJSONObject(index)
-            Endpoint(engine.getString("host"), engine.optInt("port", Endpoint.DEFAULT_PORT), engine.optString("password"))
+            Endpoint(
+                engine.getString("host"), engine.optInt("port", Endpoint.DEFAULT_PORT), engine.optString("password"),
+                transportOf(engine.optString("transport", "")),
+                engine.optString("path", Endpoint.DEFAULT_PATH).ifEmpty { Endpoint.DEFAULT_PATH },
+            )
         }
     }.getOrDefault(emptyList())
 
@@ -105,6 +131,18 @@ class Settings(context: Context) {
         preferences.edit().putBoolean("download_wifi_only", on).apply()
     }
 
+    /**
+     * ReplayGain left to the phone: Automatic, resolved against the engine's
+     * Random. Off, track and album are the engine's own setting.
+     */
+    var replayGainAuto by mutableStateOf(preferences.getBoolean("replay_gain_auto", false))
+        private set
+
+    fun updateReplayGainAuto(on: Boolean) {
+        replayGainAuto = on
+        preferences.edit().putBoolean("replay_gain_auto", on).apply()
+    }
+
     /** "system", "dark" or "light". */
     var theme by mutableStateOf(preferences.getString("theme", "system") ?: "system")
         private set
@@ -122,3 +160,6 @@ class Settings(context: Context) {
         preferences.edit().putBoolean("dynamic_color", on).apply()
     }
 }
+
+private fun transportOf(name: String?): Transport =
+    Transport.entries.firstOrNull { it.name == name } ?: Transport.TCP
