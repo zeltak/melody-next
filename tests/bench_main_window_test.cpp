@@ -32,6 +32,7 @@
 #include "bench/trackknife_style.hpp"
 #include "bench/up_next_delegate.hpp"
 #include "bench/widget_color_scheme.hpp"
+#include "workspace/keep_awake.hpp"
 #include "drag_position.hpp"
 #include "test_engine.hpp"
 #include "trackknife/discovery/mdns.hpp"
@@ -128,6 +129,10 @@
 #include <QScrollBar>
 #include <QSettings>
 #include <QSignalSpy>
+#include <QDBusMessage>
+#include <QDBusConnection>
+#include <QDBusArgument>
+#include <QWheelEvent>
 #include <QSlider>
 #include <QSpinBox>
 #include <QSplitter>
@@ -295,6 +300,8 @@ class BenchMainWindowTest final : public QObject {
     void committedMetadataRefreshesDuplicatesAndPreservesCueOverlay();
     void metadataReadyPlanAppliesAndRefreshesHistory();
     void metadataRenameMovesTheFileAndItsRow();
+    void applyReadsAgainAFileChangedElsewhere();
+    void listRowsFollowChangedFiles();
     void fileWorkWithoutAnEngineSaysWhy();
     void metadataApplyCancellationPreservesDraftForFreshPreview();
     void metadataDialogLayoutsPersistAsynchronously();
@@ -433,6 +440,7 @@ class BenchMainWindowTest final : public QObject {
     void headerPillsFollowAPaletteChangedLater();
     void listTabCloseButtonsClose();
     void mprisOrderAndCoverFollowTheWorkspace();
+    void longJobsKeepTheComputerAwake();
     void lyricsPanelFollowsThePosition();
     void windowListTabsCloseFromTheirButtons();
     void localListOrderingActionsRespectAuthorityAndPersist();
@@ -995,8 +1003,10 @@ void BenchMainWindowTest::cachedRowsAreReadEvenWithARevision() {
     const auto second = reader(1U);
     const auto third = reader(2U);
     QVERIFY(first && second && third);
+    // ADR-0268: a row read from the file is read again too -- the file may
+    // have changed since, through another tagger -- so every one is read.
     QVERIFY(first->source.needs_metadata_capture && !first->source.source_revision);
-    QVERIFY(!second->source.needs_metadata_capture && second->source.source_revision);
+    QVERIFY(second->source.needs_metadata_capture && !second->source.source_revision);
     QVERIFY(third->source.needs_metadata_capture && !third->source.source_revision);
 }
 
@@ -3931,6 +3941,197 @@ void BenchMainWindowTest::metadataRenameMovesTheFileAndItsRow() {
     QTRY_VERIFY(window.findChild<QDialog*>(QStringLiteral("bench-metadata-properties")) == nullptr);
     QTRY_VERIFY_WITH_TIMEOUT(!window.property("trackknife-metadata-operation-running").toBool(),
                              5'000);
+}
+
+// ADR-0268: a file changed by another tagger after the editor read it is no
+// dead end. Apply reads it again, the draft kept, for another look; the
+// next Apply writes it.
+void BenchMainWindowTest::applyReadsAgainAFileChangedElsewhere() {
+    QTemporaryDir media;
+    QVERIFY(media.isValid());
+    const auto path = media.filePath(QStringLiteral("changed-elsewhere.flac"));
+    QVERIFY(materialize_audio_fixture(QStringLiteral("rich-metadata-flac.b64"), path));
+    const auto encoded = QFile::encodeName(path);
+    const std::string raw_path{encoded.constData(), static_cast<std::size_t>(encoded.size())};
+
+    BenchMainWindow window;
+    window.show();
+    QTRY_VERIFY(window.lists_restored_);
+    window.openLocalPaths({raw_path});
+    auto* tabs = window.findChild<QTabWidget*>(QStringLiteral("bench-tabs"));
+    auto* properties_action = window.findChild<QAction*>(QStringLiteral("action-track-properties"));
+    QVERIFY(tabs != nullptr && properties_action != nullptr);
+    QTRY_COMPARE(tabs->count(), 1);
+    auto* view = qobject_cast<QTableView*>(tabs->currentWidget());
+    QVERIFY(view != nullptr);
+    auto* list_model = qobject_cast<LocalListModel*>(view->model());
+    QVERIFY(list_model != nullptr);
+    QTRY_COMPARE_WITH_TIMEOUT(list_model->rowCount(), 1, 5'000);
+    QTRY_VERIFY_WITH_TIMEOUT(list_model->rows().front().probed, 5'000);
+    view->selectionModel()->select(list_model->index(0, 0),
+                                   QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    QTRY_VERIFY(properties_action->isEnabled());
+    QTRY_VERIFY_WITH_TIMEOUT(window.localEngine().does_file_work, 10'000);
+    properties_action->trigger();
+
+    auto* properties = window.findChild<QDialog*>(QStringLiteral("bench-metadata-properties"));
+    QVERIFY(properties != nullptr);
+    QTableView* fields = nullptr;
+    QTRY_VERIFY((fields = properties->findChild<QTableView*>(
+                     QStringLiteral("bench-metadata-fields"))) != nullptr);
+    auto* aggregate_model = qobject_cast<MetadataAggregateModel*>(fields->model());
+    auto* status = properties->findChild<QLabel*>(QStringLiteral("bench-metadata-read-only"));
+    auto* apply = properties->findChild<QPushButton*>(QStringLiteral("bench-metadata-apply-changes"));
+    QVERIFY(aggregate_model != nullptr && status != nullptr && apply != nullptr);
+    // Read and ready: the status says so, or has moved on to the draft.
+    QTRY_VERIFY2_WITH_TIMEOUT(status->text().contains(QStringLiteral("Tags read")) ||
+                                  status->text().contains(QStringLiteral("No pending edits")),
+                              qPrintable(status->text()), 10'000);
+    const auto title_row = aggregate_model->fieldRow(QStringLiteral("title"));
+    QVERIFY(title_row.has_value());
+    QVERIFY(aggregate_model->setData(aggregate_model->index(*title_row, 2),
+                                     QStringLiteral("Edited here"), Qt::EditRole));
+
+    // Another tagger writes the file meanwhile: it is no longer the one read.
+    const auto before = metadata::read_local_metadata(raw_path);
+    QVERIFY(before.has_value());
+    {
+        QFile file{path};
+        QVERIFY(file.open(QIODevice::ReadWrite));
+        QVERIFY(file.setFileTime(QDateTime::currentDateTime().addSecs(-3'600),
+                                 QFileDevice::FileModificationTime));
+    }
+
+    QTRY_VERIFY(apply->isEnabled());
+    QTest::mouseClick(apply, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(status->text().contains(QStringLiteral("Changed since read")),
+                             10'000);
+    QVERIFY(status->text().contains(QStringLiteral("1 draft kept")));
+    QVERIFY(window.findChild<QDialog*>(QStringLiteral("bench-preparation-feedback")) == nullptr);
+    QTRY_COMPARE(aggregate_model->index(*title_row, 2).data(Qt::DisplayRole).toString(),
+                 QStringLiteral("Edited here"));
+    const auto untouched = metadata::read_local_metadata(raw_path);
+    QVERIFY(untouched.has_value());
+    QCOMPARE(untouched->document.effective_values("title"),
+             before->document.effective_values("title"));
+
+    // Looked at again, applied again: written.
+    QTRY_VERIFY(apply->isEnabled());
+    QTest::mouseClick(apply, Qt::LeftButton);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        window.findChild<QDialog*>(QStringLiteral("bench-metadata-properties")) == nullptr, 10'000);
+    const auto written = metadata::read_local_metadata(raw_path);
+    QVERIFY(written.has_value());
+    QCOMPARE(written->document.effective_values("title"),
+             (std::vector<std::string>{"Edited here"}));
+    QTRY_VERIFY_WITH_TIMEOUT(!window.property("trackknife-metadata-operation-running").toBool(),
+                             5'000);
+}
+
+// ADR-0268: the rows a change names -- at its paths, or under a folder of
+// them -- are described again, a CUE track by its sheet and not; and a row
+// described again after a rename, naming the file as written, still follows
+// the file to its new name.
+void BenchMainWindowTest::listRowsFollowChangedFiles() {
+    LocalListModel model;
+    const auto row = [](const char* path) {
+        LocalTrackRow track;
+        track.raw_path = path;
+        track.probed = true;
+        return track;
+    };
+    auto cue = row("/music/A/live.flac");
+    cue.segment = formats::SampleRange{.start_sample = 0, .end_sample = 100};
+    model.replaceRows({row("/music/A/01.flac"), row("/music/A/02.flac"), row("/music/B/01.flac"),
+                       row("/music/AB/01.flac"), cue});
+    const auto ids = [&model](const std::vector<core::StableId>& entries) {
+        std::vector<std::string> paths;
+        for (const auto& entry : entries) {
+            for (const auto& track : model.rows()) {
+                if (track.entry_id == entry) {
+                    paths.push_back(track.raw_path);
+                }
+            }
+        }
+        return paths;
+    };
+    QCOMPARE(ids(model.entriesAt({"/music/A/02.flac"}, false)),
+             (std::vector<std::string>{"/music/A/02.flac"}));
+    QCOMPARE(ids(model.entriesAt({"/music/A"}, false)),
+             (std::vector<std::string>{"/music/A/01.flac", "/music/A/02.flac"}));
+    QCOMPARE(model.entriesAt({}, true).size(), std::size_t{4U});
+
+    const core::LocalSourceRevision before{.device = 1, .inode = 10};
+    const core::LocalSourceRevision written{.device = 1, .inode = 11};
+    auto described = row("/music/old.flac");
+    described.source_revision = written;
+    model.replaceRows({described});
+    const auto moved =
+        model.applyCommittedRelocation("/music/old.flac", "/music/new.flac", before, written);
+    QVERIFY(moved && *moved == 1U);
+    QCOMPARE(model.rows().front().raw_path, std::string{"/music/new.flac"});
+    auto other = row("/music/old.flac");
+    other.source_revision = core::LocalSourceRevision{.device = 1, .inode = 99};
+    model.replaceRows({other});
+    QVERIFY(!model.applyCommittedRelocation("/music/old.flac", "/music/new.flac", before, written));
+}
+
+// ADR-0277: a long file job holds idle sleep off, one platform hold however
+// many jobs run, let go with the last. Where logind answers, it lists the
+// hold while it lasts.
+void BenchMainWindowTest::longJobsKeepTheComputerAwake() {
+    const auto ours = [] {
+        auto bus = QDBusConnection::systemBus();
+        if (!bus.isConnected()) {
+            return -1;
+        }
+        auto call = QDBusMessage::createMethodCall(
+            QStringLiteral("org.freedesktop.login1"), QStringLiteral("/org/freedesktop/login1"),
+            QStringLiteral("org.freedesktop.login1.Manager"), QStringLiteral("ListInhibitors"));
+        const auto reply = bus.call(call, QDBus::Block, 2'000);
+        if (reply.type() != QDBusMessage::ReplyMessage) {
+            return -1;
+        }
+        const auto listed = reply.arguments().front().value<QDBusArgument>();
+        int count = 0;
+        listed.beginArray();
+        while (!listed.atEnd()) {
+            QString what;
+            QString who;
+            QString why;
+            QString mode;
+            uint uid = 0;
+            uint pid = 0;
+            listed.beginStructure();
+            listed >> what >> who >> why >> mode >> uid >> pid;
+            listed.endStructure();
+            if (who == QStringLiteral("Trackknife") &&
+                pid == static_cast<uint>(QCoreApplication::applicationPid())) {
+                ++count;
+            }
+        }
+        listed.endArray();
+        return count;
+    };
+    QCOMPARE(KeepAwake::holds(), 0);
+    auto first = KeepAwake::hold(QStringLiteral("Writing tags"));
+    auto second = KeepAwake::hold(QStringLiteral("Measuring ReplayGain"));
+    QCOMPARE(KeepAwake::holds(), 2);
+    const bool logind = ours() >= 0;
+    if (logind) {
+        QTRY_COMPARE_WITH_TIMEOUT(ours(), 1, 3'000);
+    }
+    first.reset();
+    QCOMPARE(KeepAwake::holds(), 1);
+    if (logind) {
+        QTest::qWait(200);
+        QCOMPARE(ours(), 1);
+    }
+    second.reset();
+    QCOMPARE(KeepAwake::holds(), 0);
+    if (logind) {
+        QTRY_COMPARE_WITH_TIMEOUT(ours(), 0, 3'000);
+    }
 }
 
 // ADR-0237: files are written only by the engine holding them. Without one
@@ -14842,7 +15043,8 @@ void BenchMainWindowTest::lyricsPanelFollowsThePosition() {
     QVERIFY(lines != nullptr && source != nullptr);
     QCOMPARE(lines->count(), 1); // "Nothing is playing"
 
-    metadata::Lyrics synced{.source = "sidecar", .synced = true, .lines = {}};
+    metadata::Lyrics synced{
+        .source = "sidecar", .synced = true, .lines = {}, .declared_length_ms = {}};
     for (const auto& [time, text] : {std::pair{1'000, "One"}, std::pair{2'000, "Two"},
                                      std::pair{3'000, ""}, std::pair{60'000, "Late"}}) {
         synced.lines.push_back({.time_ms = time, .text = text});
@@ -14867,6 +15069,25 @@ void BenchMainWindowTest::lyricsPanelFollowsThePosition() {
     panel.setPosition(61'000, false);
     QCOMPARE(panel.currentLine(), 3);
 
+    // A seek asked for here moves the highlight at once; reports from
+    // before it, still on their way, are not believed; one that agrees is.
+    panel.seekTo(1'500);
+    QCOMPARE(panel.currentLine(), 0);
+    panel.setPosition(61'000, false);
+    QCOMPARE(panel.currentLine(), 0);
+    panel.setPosition(1'550, false);
+    QCOMPARE(panel.currentLine(), 0);
+    // A seek made elsewhere -- far from what the clock says -- is followed.
+    panel.setPosition(2'200, false);
+    QCOMPARE(panel.currentLine(), 1);
+    // Playing, a report a little behind the clock does not pull it back.
+    panel.setPosition(2'000, true);
+    QTRY_VERIFY_WITH_TIMEOUT((panel.setPosition(2'000, true), panel.position() >= 2'250), 2'000);
+    const auto before_late_report = panel.position();
+    panel.setPosition(before_late_report - 200, true);
+    QVERIFY(panel.position() >= before_late_report);
+    panel.setPosition(0, false);
+
     QSignalSpy seeks{&panel, &LyricsPanel::seekRequested};
     QTest::mouseClick(lines->viewport(), Qt::LeftButton, {},
                       lines->visualItemRect(lines->item(1)).center());
@@ -14876,13 +15097,42 @@ void BenchMainWindowTest::lyricsPanelFollowsThePosition() {
     // Plain lyrics: text, nothing highlighted, a click seeks nowhere.
     panel.showLyrics({.source = "tag:LYRICS",
                       .synced = false,
-                      .lines = {{.time_ms = std::nullopt, .text = "Words"}}});
+                      .lines = {{.time_ms = std::nullopt, .text = "Words"}},
+                      .declared_length_ms = {}});
     QCOMPARE(source->text(), QStringLiteral("Plain · LYRICS tag"));
     panel.setPosition(5'000, true);
     QCOMPARE(panel.currentLine(), -1);
     QTest::mouseClick(lines->viewport(), Qt::LeftButton, {},
                       lines->visualItemRect(lines->item(0)).center());
     QCOMPARE(seeks.size(), 1);
+
+    // Long lyrics scroll the line sung to the middle, gliding there; a
+    // scroll by hand is left alone for a moment.
+    metadata::Lyrics song{
+        .source = "sidecar", .synced = true, .lines = {}, .declared_length_ms = {}};
+    for (int line = 0; line < 60; ++line) {
+        song.lines.push_back({.time_ms = line * 1'000, .text = "Line " + std::to_string(line)});
+    }
+    panel.showLyrics(song);
+    panel.setPosition(30'200, false);
+    QCOMPARE(panel.currentLine(), 30);
+    const auto centred = [&] {
+        const auto rect = lines->visualItemRect(lines->item(panel.currentLine()));
+        return std::abs(rect.center().y() - lines->viewport()->height() / 2) <= rect.height();
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(centred(), 2'000);
+    QWheelEvent wheel{QPointF{10, 10}, lines->viewport()->mapToGlobal(QPointF{10, 10}),
+                      QPoint{}, QPoint{0, 120}, Qt::NoButton, Qt::NoModifier,
+                      Qt::NoScrollPhase, false};
+    QApplication::sendEvent(lines->viewport(), &wheel);
+    const auto scrolled_to = lines->verticalScrollBar()->value();
+    panel.setPosition(33'200, false);
+    QCOMPARE(panel.currentLine(), 33);
+    QTest::qWait(600);
+    QCOMPARE(lines->verticalScrollBar()->value(), scrolled_to);
+    // A seek from here shows the line again.
+    panel.seekTo(40'100);
+    QTRY_VERIFY_WITH_TIMEOUT(centred(), 2'000);
 
     panel.showMessage(QStringLiteral("No lyrics"));
     QCOMPARE(lines->count(), 1);
@@ -15985,8 +16235,9 @@ void BenchMainWindowTest::metadataPropertiesFileSelectionDrivesIndividualAndBulk
     QVERIFY2(summary->text().contains(QStringLiteral("2 of 2 files selected")),
              qPrintable(QStringLiteral("unexpected summary: %1").arg(summary->text())));
     QVERIFY(summary->text().contains(QStringLiteral("2 sources")));
-    QVERIFY2(read_only->text().contains(QStringLiteral("No pending edits")),
-             qPrintable(QStringLiteral("unexpected status: %1").arg(read_only->text())));
+    // The files are read on opening, whatever the rows knew (ADR-0268).
+    QTRY_VERIFY2(read_only->text().contains(QStringLiteral("Tags read")),
+                 qPrintable(QStringLiteral("unexpected status: %1").arg(read_only->text())));
     QCOMPARE(buttons->standardButtons(), QDialogButtonBox::Close);
     QVERIFY(buttons->button(QDialogButtonBox::Apply) == nullptr);
     QCOMPARE(files->selectionBehavior(), QAbstractItemView::SelectRows);
@@ -16138,6 +16389,52 @@ void BenchMainWindowTest::metadataPropertiesFileSelectionDrivesIndividualAndBulk
     field_prompt->reject();
     QTRY_VERIFY(dialog->findChild<QInputDialog*>(
                     QStringLiteral("bench-metadata-add-field-dialog")) == nullptr);
+
+    // ADR-0276: lyrics are many lines. Their editor takes Enter as a new
+    // line, keeps the text on Ctrl+Enter and drops it on Escape; the row
+    // shows the line breaks as marks.
+    QTest::mouseClick(add_field, Qt::LeftButton);
+    QTRY_VERIFY((field_prompt = dialog->findChild<QInputDialog*>(
+                     QStringLiteral("bench-metadata-add-field-dialog"))) != nullptr);
+    field_prompt->setTextValue(QStringLiteral("Lyrics"));
+    field_prompt->accept();
+    std::optional<int> lyrics_row;
+    QTRY_VERIFY((lyrics_row = aggregate_model->fieldRow(QStringLiteral("lyrics"))).has_value());
+    const auto lyrics_column = grid_model->fieldColumn(QStringLiteral("lyrics"));
+    QVERIFY(lyrics_column.has_value());
+    const auto lyrics_draft = aggregate_model->index(*lyrics_row, 2);
+    QTRY_COMPARE(fields->currentIndex(), lyrics_draft);
+    QTest::keyClick(fields, Qt::Key_F2);
+    QPlainTextEdit* lyrics_editor = nullptr;
+    QTRY_VERIFY((lyrics_editor = fields->findChild<QPlainTextEdit*>(
+                     QStringLiteral("metadata-long-text-editor"))) != nullptr);
+    QVERIFY(fields->findChild<QLineEdit*>() == nullptr);
+    QVERIFY(lyrics_editor->height() > fields->visualRect(lyrics_draft).height() * 4);
+    QTest::keyClicks(lyrics_editor, QStringLiteral("First line"));
+    QTest::keyClick(lyrics_editor, Qt::Key_Return);
+    QTest::keyClicks(lyrics_editor, QStringLiteral("Second line"));
+    QVERIFY(fields->findChild<QPlainTextEdit*>(QStringLiteral("metadata-long-text-editor")) !=
+            nullptr);
+    QTest::keyClick(lyrics_editor, Qt::Key_Return, Qt::ControlModifier);
+    QTRY_VERIFY(fields->findChild<QPlainTextEdit*>(QStringLiteral("metadata-long-text-editor")) ==
+                nullptr);
+    QCOMPARE(grid_model->index(0, *lyrics_column).data(metadata_cell_values_role).toStringList(),
+             (QStringList{QStringLiteral("First line\nSecond line")}));
+    QCOMPARE(lyrics_draft.data(Qt::DisplayRole).toString(),
+             QStringLiteral("First line ↵ Second line"));
+    QTest::keyClick(fields, Qt::Key_F2);
+    QTRY_VERIFY((lyrics_editor = fields->findChild<QPlainTextEdit*>(
+                     QStringLiteral("metadata-long-text-editor"))) != nullptr);
+    QCOMPARE(lyrics_editor->toPlainText(), QStringLiteral("First line\nSecond line"));
+    QTest::keyClicks(lyrics_editor, QStringLiteral(" and more"));
+    QTest::keyClick(lyrics_editor, Qt::Key_Escape);
+    QTRY_VERIFY(fields->findChild<QPlainTextEdit*>(QStringLiteral("metadata-long-text-editor")) ==
+                nullptr);
+    QCOMPARE(grid_model->index(0, *lyrics_column).data(metadata_cell_values_role).toStringList(),
+             (QStringList{QStringLiteral("First line\nSecond line")}));
+    QTRY_VERIFY(remove_field->isEnabled());
+    QTest::mouseClick(remove_field, Qt::LeftButton);
+    QTRY_VERIFY(!grid_model->index(0, *lyrics_column).data(metadata_cell_staged_role).toBool());
 
     // One selected file exposes exact values in the same lower table and limits
     // edits to that source row.

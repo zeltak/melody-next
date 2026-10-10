@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "workspace/keep_awake.hpp"
+
 #include "bench/artwork_services.hpp"
 #include "bench/file_work_tools.hpp"
 #include "bench/musicbrainz_lookup.hpp"
@@ -402,6 +404,10 @@ class TaggerSession final : public QObject {
     // `stale`: files found changed since they were read, read again too,
     // their drafts kept, so the next write can take them.
     void finishWriteElsewhere(std::vector<Rewritten> written, std::vector<std::size_t> stale = {});
+    // ADR-0268: Apply found these files changed since they were read --
+    // another tagger, another window. Read again, the draft carried onto
+    // what they now hold, for the person to look at and apply again.
+    void readChangedAgain(std::vector<std::size_t> items);
 
     // Apply.
     void startWritePlan();
@@ -633,6 +639,8 @@ class TaggerSession final : public QObject {
     // ADR-0257: the grid shows cached tags while the files are read; scripts,
     // suggestions and Save wait for the files' own.
     bool provisional_{false};
+    // Reading again files Apply found changed: done, the person is told.
+    bool reading_changed_{false};
     bool writing_elsewhere_{false};
     // Proposals waiting for the automatic scripts to finish staging, and
     // the set being staged, previewed again when the draft moved under it.
@@ -664,6 +672,8 @@ class TaggerSession final : public QObject {
     std::optional<std::string> move_folder_;
     bool write_plan_running_{false};
     bool apply_running_{false};
+    // ADR-0277: the computer kept awake while this runs.
+    KeepAwake::Hold awake_;
     bool applying_file_paths_{false};
     bool apply_stop_requested_{false};
     bool apply_committed_{false};
