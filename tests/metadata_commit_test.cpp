@@ -3743,12 +3743,6 @@ void folder_cover_without_hard_links(const std::filesystem::path& fixtures) {
         { // ADR-0266: undo works without an exchange
             CHECK(undone.has_value());
             CHECK(read_bytes(cover) == read_bytes(donor));
-        } else {
-            // Undo is unavailable on macOS and some network mounts. Restore
-            // the blue cover through an ordinary save so the recovery test
-            // below still publishes a different image.
-            CHECK(operations::commit_folder_image(replace(*blue_image), *journal).has_value());
-            CHECK(read_bytes(cover) == read_bytes(donor));
         }
     }
 
