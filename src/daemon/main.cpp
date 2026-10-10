@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+#include "trackknife/core/posix.hpp"
 
 // ADR-0220: the engine as a process, melodyd.
 //
@@ -722,7 +723,7 @@ int main(int argc, char** argv) {
         if (tcp_server) {
             connect = [&tcp_server]() -> int {
                 std::array<int, 2> pair{-1, -1};
-                if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair.data()) < 0) {
+                if (core::socketpair_cloexec(AF_UNIX, SOCK_STREAM, 0, pair.data()) < 0) {
                     return -1;
                 }
                 tcp_server->attach(pair[0], false);
