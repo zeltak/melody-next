@@ -2,6 +2,8 @@
 
 #include "bench/now_playing_macos.hpp"
 
+#include <cfloat>
+
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <MediaPlayer/MediaPlayer.h>
