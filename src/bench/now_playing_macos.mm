@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-#include "bench/now_playing_macos.hpp"
-
 #include <cfloat>
+
+#include "bench/now_playing_macos.hpp"
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
