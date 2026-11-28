@@ -2,11 +2,13 @@
 
 #include "bench/bench_main_window.hpp"
 #include "bench/lists_panel.hpp"
+#include "bench/output_names_widget.hpp"
 #include "bench/playlist_folder_widget.hpp"
 #include "bench/themed_icon.hpp"
 #include "bench/undo_location_widget.hpp"
 #include "workspace/library_watch_session.hpp"
 #include "workspace/list_view_definitions.hpp"
+#include "workspace/output_names_session.hpp"
 #include "workspace/playlist_folder_session.hpp"
 #include "workspace/undo_location_session.hpp"
 
@@ -837,10 +839,29 @@ trackknife::bench::BenchMainWindow::showSettingsDialog(const SettingsDialog::Pag
         }
         return pages;
     };
+    // ADR-0361: each engine's outputs, named and shown or not, asked of it;
+    // the Engines page shows the one chosen there.
+    std::function<QWidget*(QWidget*)> output_names = [this](QWidget* parent) -> QWidget* {
+        auto* pages = new QWidget(parent);
+        for (const auto& engine : engines_) {
+            if (engine->catalogue == nullptr || !engine->catalogue->endpoint()) {
+                continue;
+            }
+            auto* session = new OutputNamesSession(*engine->catalogue->endpoint());
+            auto* page = new OutputNamesWidget(*session, pages);
+            session->setParent(page);
+            page->setProperty("engine-address",
+                              engine->key.isLocal()
+                                  ? QString::fromLatin1(SettingsKeys::library_engine_local)
+                                  : engine->setting.address);
+        }
+        return pages;
+    };
     auto* dialog = new SettingsDialog(
         this, buildOutputProfileStore(), std::move(library_folders),
         [this](QWidget* parent) { return buildLastFmSettings(parent); }, configurable_shortcuts_,
-        std::move(undo_locations), std::move(playlist_folders), std::move(library_watch));
+        std::move(undo_locations), std::move(playlist_folders), std::move(library_watch),
+        std::move(output_names));
     // ADR-0185: profile edits in Settings refresh every open tag editor's
     // selectors immediately.
     connect(dialog, &SettingsDialog::outputProfilesChanged, this, [this] {

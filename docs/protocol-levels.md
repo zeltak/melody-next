@@ -10,6 +10,17 @@ client keeps a path for what an older engine lacked.
 
 ## Protocol 1
 
+### Level 37 (2026-11-28)
+
+ADR-0361: outputs named as the user names them, and hidden.
+
+- `outputs.list` and `outputs.changed` give each output's `name` as the
+  user named it, `reported_name` as it calls itself, and `hidden`. A hidden
+  output is left out unless it is the one playing; `outputs.list {all:
+  true}` gives every output.
+- `outputs.configure {id, name?, hidden?}` -> `{}`: a name of at most 100
+  bytes, empty or null for the output's own; hidden true or false.
+
 ### Level 36 (2026-11-18)
 
 ADR-0358: an imported playlist is read by this computer's engine.

@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 
 #include <chrono>
@@ -118,7 +119,100 @@ Outputs::Outputs(Player& player, output::AgentPaths paths, Workspace* workspace,
             }
         }
     }
+    // ADR-0361: names given and outputs hidden.
+    if (workspace_ != nullptr) {
+        if (auto stored = workspace_->load_engine_state(custom_key); stored && *stored) {
+            const auto parsed = Json::parse(**stored, nullptr, false);
+            if (parsed.is_object()) {
+                for (const auto& [id, kept] : parsed.items()) {
+                    if (!kept.is_object()) {
+                        continue;
+                    }
+                    Custom custom{.name = kept.value("name", std::string{}),
+                                  .hidden = kept.value("hidden", false)};
+                    if (!custom.name.empty() || custom.hidden) {
+                        custom_[id] = std::move(custom);
+                    }
+                }
+            }
+        }
+    }
     player_->on_output_settings([this] { remember(); });
+}
+
+std::vector<Outputs::Listed> Outputs::shown(std::vector<Listed> listed,
+                                            const std::map<std::string, Custom>& custom,
+                                            const bool all) {
+    std::vector<Listed> visible;
+    for (auto& output : listed) {
+        output.reported_name = output.name;
+        if (const auto found = custom.find(output.id); found != custom.end()) {
+            if (!found->second.name.empty()) {
+                output.name = found->second.name;
+            }
+            output.hidden = found->second.hidden;
+        }
+        if (all || !output.hidden || output.selected) {
+            visible.push_back(std::move(output));
+        }
+    }
+    return visible;
+}
+
+core::Result<void> Outputs::configure(const std::string& id, std::optional<std::string> name,
+                                      const std::optional<bool> hidden) {
+    if (name) {
+        // Spaces around it are not part of it; inside, any text.
+        const auto first = name->find_first_not_of(" \t\r\n");
+        const auto last = name->find_last_not_of(" \t\r\n");
+        *name = first == std::string::npos ? std::string{} : name->substr(first, last - first + 1);
+        if (name->size() > longest_name) {
+            return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                               .message = "an output's name is at most 100 bytes",
+                                               .context = {{.key = "param", .value = "name"}}});
+        }
+    }
+    const auto known =
+        std::ranges::any_of(list(), [&id](const Listed& output) { return output.id == id; });
+    {
+        const std::lock_guard guard{mutex_};
+        if (!known && !custom_.contains(id)) {
+            return std::unexpected(not_found(id));
+        }
+        auto& custom = custom_[id];
+        if (name) {
+            custom.name = std::move(*name);
+        }
+        if (hidden) {
+            custom.hidden = *hidden;
+        }
+        if (custom.name.empty() && !custom.hidden) {
+            custom_.erase(id);
+        }
+    }
+    keep_custom();
+    announce();
+    return {};
+}
+
+void Outputs::keep_custom() {
+    auto stored = Json::object();
+    {
+        const std::lock_guard guard{mutex_};
+        for (const auto& [id, custom] : custom_) {
+            auto entry = Json::object();
+            if (!custom.name.empty()) {
+                entry["name"] = custom.name;
+            }
+            if (custom.hidden) {
+                entry["hidden"] = true;
+            }
+            stored[id] = std::move(entry);
+        }
+    }
+    if (workspace_ != nullptr) {
+        static_cast<void>(workspace_->save_engine_state(custom_key, stored.dump(), now_ms()));
+    }
 }
 
 void Outputs::remember() {
@@ -406,36 +500,87 @@ void Outputs::renderer_changed(const discovery::UpnpRenderer& renderer) {
 }
 #endif
 
+namespace {
+
+[[nodiscard]] Json described(const std::vector<Outputs::Listed>& listed) {
+    auto outputs = Json::array();
+    for (const auto& output : listed) {
+        outputs.push_back(Json{{"id", output.id},
+                               {"name", output.name},
+                               {"reported_name", output.reported_name},
+                               {"hidden", output.hidden},
+                               {"local", output.local},
+                               {"online", output.online},
+                               {"selected", output.selected},
+                               {"files", output.files},
+                               {"replay_gain", output.replay_gain}});
+    }
+    return outputs;
+}
+
+} // namespace
+
+std::vector<Outputs::Listed> Outputs::visible(const bool all) const {
+    auto listed = list();
+    const std::lock_guard guard{mutex_};
+    return shown(std::move(listed), custom_, all);
+}
+
 void Outputs::announce() {
     if (!sink_) {
         return;
     }
-    auto outputs = Json::array();
-    for (const auto& listed : list()) {
-        outputs.push_back(Json{{"id", listed.id},
-                               {"name", listed.name},
-                               {"local", listed.local},
-                               {"online", listed.online},
-                               {"selected", listed.selected},
-                               {"files", listed.files},
-                               {"replay_gain", listed.replay_gain}});
-    }
-    sink_(protocol::Event{.name = "outputs.changed", .data = Json{{"outputs", outputs}}});
+    // ADR-0361: as clients are shown them -- hidden ones left out.
+    sink_(protocol::Event{.name = "outputs.changed",
+                          .data = Json{{"outputs", described(visible(false))}}});
 }
 
 void register_output_methods(protocol::Dispatcher& dispatcher, Outputs& outputs) {
-    dispatcher.on("outputs.list", [&outputs](const Json&) -> core::Result<Json> {
-        auto listed = Json::array();
-        for (const auto& output : outputs.list()) {
-            listed.push_back(Json{{"id", output.id},
-                                  {"name", output.name},
-                                  {"local", output.local},
-                                  {"online", output.online},
-                                  {"selected", output.selected},
-                                  {"files", output.files},
-                                  {"replay_gain", output.replay_gain}});
+    // ADR-0361: `all` lists hidden outputs too, for whoever names and hides
+    // them; otherwise they are left out, unless one is playing.
+    dispatcher.on("outputs.list", [&outputs](const Json& params) -> core::Result<Json> {
+        const auto all = params.is_object() && params.value("all", false);
+        return Json{{"outputs", described(outputs.visible(all))}};
+    });
+    dispatcher.on("outputs.configure", [&outputs](const Json& params) -> core::Result<Json> {
+        const auto id = params.find("id");
+        if (id == params.end() || !id->is_string()) {
+            return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                               .message = "an output id is required",
+                                               .context = {{.key = "param", .value = "id"}}});
         }
-        return Json{{"outputs", std::move(listed)}};
+        std::optional<std::string> name;
+        if (const auto given = params.find("name"); given != params.end()) {
+            if (given->is_null()) {
+                name = std::string{};
+            } else if (given->is_string()) {
+                name = given->get<std::string>();
+            } else {
+                return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                                   .message = "an output's name is text",
+                                                   .context = {{.key = "param", .value = "name"}}});
+            }
+        }
+        std::optional<bool> hidden;
+        if (const auto given = params.find("hidden"); given != params.end()) {
+            if (!given->is_boolean()) {
+                return std::unexpected(
+                    core::Error{.code = core::ErrorCode::invalid_argument,
+                                .message = "hidden is true or false",
+                                .context = {{.key = "param", .value = "hidden"}}});
+            }
+            hidden = given->get<bool>();
+        }
+        if (!name && !hidden) {
+            return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                               .message = "give a name, hidden, or both",
+                                               .context = {}});
+        }
+        auto configured = outputs.configure(id->get<std::string>(), std::move(name), hidden);
+        if (!configured) {
+            return std::unexpected(std::move(configured.error()));
+        }
+        return Json::object();
     });
     dispatcher.on("outputs.select", [&outputs](const Json& params) -> core::Result<Json> {
         const auto id = params.find("id");

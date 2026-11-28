@@ -86,7 +86,8 @@ class SettingsDialog final : public QDialog, public SettingsKeys {
                             QList<QAction*> shortcuts = {},
                             std::function<QWidget*(QWidget*)> undo_locations = {},
                             std::function<QWidget*(QWidget*)> playlist_folders = {},
-                            std::function<QWidget*(QWidget*)> library_watch = {});
+                            std::function<QWidget*(QWidget*)> library_watch = {},
+                            std::function<QWidget*(QWidget*)> output_names = {});
     ~SettingsDialog() override;
     void showPage(Page page);
     // ADR-0237: the Naming page, with the move destinations of the engine
@@ -152,6 +153,9 @@ class SettingsDialog final : public QDialog, public SettingsKeys {
     QStackedWidget* playlist_folders_{nullptr};
     // ADR-0322: whether the engine chosen watches its library's folders.
     QStackedWidget* library_watch_{nullptr};
+    // ADR-0361: the chosen engine's outputs, named and shown or not.
+    QGroupBox* outputs_box_{nullptr};
+    QStackedWidget* output_names_{nullptr};
     QGroupBox* remote_box_{nullptr};
     QWidget* own_password_{nullptr};
     QPushButton* remove_engine_{nullptr};

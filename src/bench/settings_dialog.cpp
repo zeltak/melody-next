@@ -96,7 +96,8 @@ SettingsDialog::SettingsDialog(QWidget* parent, OutputProfileStore profile_store
                                std::function<QWidget*(QWidget*)> lastfm, QList<QAction*> shortcuts,
                                std::function<QWidget*(QWidget*)> undo_locations,
                                std::function<QWidget*(QWidget*)> playlist_folders,
-                               std::function<QWidget*(QWidget*)> library_watch)
+                               std::function<QWidget*(QWidget*)> library_watch,
+                               std::function<QWidget*(QWidget*)> output_names)
     : QDialog(parent) {
     setWindowTitle(QStringLiteral("Settings"));
     setObjectName(QStringLiteral("bench-settings-dialog"));
@@ -401,6 +402,27 @@ SettingsDialog::SettingsDialog(QWidget* parent, OutputProfileStore profile_store
     library_watch_->setVisible(false);
     engines_layout->addWidget(library_watch_);
     engine_layout->addWidget(engines_box);
+
+    // ADR-0361: the outputs of the engine chosen above -- its own audio, its
+    // agents, the UPnP speakers it found -- each named and shown or not.
+    outputs_box_ = new QGroupBox(QStringLiteral("Outputs"), engine);
+    outputs_box_->setObjectName(QStringLiteral("bench-settings-outputs"));
+    auto* outputs_layout = new QVBoxLayout(outputs_box_);
+    output_names_ = new QStackedWidget(outputs_box_);
+    output_names_->setObjectName(QStringLiteral("bench-settings-output-names"));
+    if (output_names) {
+        auto* pages = output_names(output_names_);
+        for (auto* page : pages->findChildren<QWidget*>(Qt::FindDirectChildrenOnly)) {
+            if (page->property("engine-address").isValid()) {
+                page->setParent(nullptr);
+                output_names_->addWidget(page);
+            }
+        }
+        pages->deleteLater();
+    }
+    outputs_layout->addWidget(output_names_);
+    outputs_box_->setVisible(false);
+    engine_layout->addWidget(outputs_box_);
 
     // The library's music folders: the same folders its Folders… opens,
     // shown for the engine that holds it.
@@ -1336,6 +1358,17 @@ void SettingsDialog::showChosenEngine() {
         }
     }
     library_watch_->setVisible(watched);
+    bool outputs = false;
+    for (int index = 0; index < output_names_->count(); ++index) {
+        if (output_names_->widget(index)->property("engine-address").toString() == address) {
+            output_names_->setCurrentIndex(index);
+            outputs = true;
+        }
+    }
+    outputs_box_->setTitle(elsewhere
+                               ? QStringLiteral("Outputs of %1").arg(session_->engine().label())
+                               : QStringLiteral("Outputs of this computer's engine"));
+    outputs_box_->setVisible(outputs);
     if (elsewhere) {
         const auto engine = session_->engine();
         remote_box_->setTitle(engine.address.isEmpty() ? QStringLiteral("New engine")

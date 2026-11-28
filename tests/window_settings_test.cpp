@@ -5,6 +5,7 @@
 #include "window_test.hpp"
 
 #include "bench/file_scope_view.hpp"
+#include "bench/output_names_widget.hpp"
 #include "trackknife/core/engine_state.hpp"
 #include "trackknife/persistence/list_repository.hpp"
 #include "uicommon/library_tree_view.hpp"
@@ -18,6 +19,7 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QStandardItemModel>
+#include <QTreeWidget>
 #include <sqlite3.h>
 
 namespace trackknife::bench {
@@ -39,7 +41,60 @@ class BenchMainWindowTest::Settings final : public window_test::Fixture {
     void playbackSettingsApplyLiveAndCancel();
     void ratingsInTagsIsAnEngineOption();
     void settingsLeftOffReadAsOff();
+    void outputsAreNamedAndShownOnTheEngine();
 };
+
+// ADR-0361: Settings › Engines lists the chosen engine's outputs; one named
+// there, or unticked, is named or hidden by the engine for every client.
+void BenchMainWindowTest::Settings::outputsAreNamedAndShownOnTheEngine() {
+    BenchMainWindow window;
+    window.show();
+    QTRY_VERIFY(window.lists_restored_);
+    auto* dialog = window.showSettingsDialog(SettingsDialog::Page::engine);
+    QVERIFY(dialog != nullptr);
+    auto* box = dialog->findChild<QGroupBox*>(QStringLiteral("bench-settings-outputs"));
+    QVERIFY(box != nullptr);
+    QVERIFY(box->isVisibleTo(dialog));
+    QCOMPARE(box->title(), QStringLiteral("Outputs of this computer's engine"));
+    auto* view = dialog->findChild<QTreeWidget*>(QStringLiteral("bench-output-names-view"));
+    QVERIFY(view != nullptr);
+    QTRY_VERIFY_WITH_TIMEOUT(view->isEnabled(), 10'000);
+    if (view->topLevelItemCount() == 0) {
+        QSKIP("the test engine has no outputs to name");
+    }
+    const auto id = view->topLevelItem(0)->data(OutputNamesWidget::shown, Qt::UserRole).toString();
+    const auto own = view->topLevelItem(0)->text(OutputNamesWidget::name);
+    const auto row = [view, &id]() -> QTreeWidgetItem* {
+        for (int index = 0; index < view->topLevelItemCount(); ++index) {
+            if (view->topLevelItem(index)->data(OutputNamesWidget::shown, Qt::UserRole) == id) {
+                return view->topLevelItem(index);
+            }
+        }
+        return nullptr;
+    };
+    // Named as the user types it, and its own name said beside.
+    row()->setText(OutputNamesWidget::name, QStringLiteral("Desk speakers"));
+    QTRY_VERIFY_WITH_TIMEOUT(view->isEnabled() && row() != nullptr &&
+                                 row()->text(OutputNamesWidget::name) ==
+                                     QStringLiteral("Desk speakers"),
+                             10'000);
+    QVERIFY(row()->text(OutputNamesWidget::found_as).contains(own));
+    // Unticked: hidden by the engine, though the one playing still shows.
+    row()->setCheckState(OutputNamesWidget::shown, Qt::Unchecked);
+    QTRY_VERIFY_WITH_TIMEOUT(view->isEnabled() && row() != nullptr &&
+                                 row()->checkState(OutputNamesWidget::shown) == Qt::Unchecked,
+                             10'000);
+    // An empty name gives it its own back; ticked, it is shown again.
+    row()->setText(OutputNamesWidget::name, QString{});
+    QTRY_VERIFY_WITH_TIMEOUT(view->isEnabled() && row() != nullptr &&
+                                 row()->text(OutputNamesWidget::name) == own,
+                             10'000);
+    row()->setCheckState(OutputNamesWidget::shown, Qt::Checked);
+    QTRY_VERIFY_WITH_TIMEOUT(view->isEnabled() && row() != nullptr &&
+                                 row()->checkState(OutputNamesWidget::shown) == Qt::Checked,
+                             10'000);
+    dialog->close();
+}
 
 // Settings by what they are about: writing files (rename and move,
 // ReplayGain, undo) as tabs of one page, ratings on their own, and the music

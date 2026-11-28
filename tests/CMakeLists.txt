@@ -602,6 +602,18 @@ add_test(
 )
 set_tests_properties(output-agent PROPERTIES TIMEOUT 90)
 
+# ADR-0361: outputs named as the user names them, and hidden from clients.
+add_executable(trackknife_output_names_tests output_names_test.cpp)
+target_link_libraries(
+    trackknife_output_names_tests
+    PRIVATE Trackknife::Engine Trackknife::Protocol Trackknife::Core trackknife_project_options
+            trackknife_project_warnings
+)
+add_test(
+    NAME output-names
+    COMMAND trackknife_output_names_tests
+)
+
 # ADR-0274: a speaker that drops plays on, and is taken as it is on return.
 add_executable(trackknife_speaker_plays_through_tests speaker_plays_through_test.cpp)
 target_link_libraries(
