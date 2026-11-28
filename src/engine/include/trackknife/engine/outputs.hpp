@@ -11,6 +11,7 @@
 #endif
 #include "trackknife/protocol/dispatch.hpp"
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -38,6 +39,13 @@ class Outputs final {
     static constexpr auto custom_key = "outputs.custom.v1";
     // A name given an output is at most this long, in bytes.
     static constexpr std::size_t longest_name = 100;
+    // ADR-0361: the order the user put the outputs in.
+    static constexpr auto order_key = "outputs.order.v1";
+    // ADR-0361: the icons an output can be given, by name. Each client draws
+    // its own for each: the names are the protocol, not the pictures.
+    static constexpr std::array<std::string_view, 15> icons{
+        "speaker",     "headphones", "tv",   "computer", "laptop", "phone",  "car",  "radio",
+        "living-room", "kitchen",    "bath", "bedroom",  "office", "garden", "music"};
 
     // `own_name` is what the engine's own audio is listed as: the engine's
     // name, so a client shows "gemenon", not "this machine".
@@ -61,6 +69,8 @@ class Outputs final {
         std::string reported_name;
         // ADR-0361: left out of what clients are shown, unless it plays.
         bool hidden{false};
+        // ADR-0361: one of `icons`, or empty for the client's own choice.
+        std::string icon;
         bool local{false};
         bool online{false};
         bool selected{false};
@@ -72,20 +82,31 @@ class Outputs final {
     [[nodiscard]] std::vector<Listed> list() const;
     // ADR-0361: as clients are shown them; `all` keeps the hidden ones.
     [[nodiscard]] std::vector<Listed> visible(bool all) const;
-    // ADR-0361: a name of the user's own for an output -- empty gives it
-    // back its own -- and whether clients are shown it. Kept by the engine.
-    [[nodiscard]] core::Result<void>
-    configure(const std::string& id, std::optional<std::string> name, std::optional<bool> hidden);
+    // ADR-0361: what the user changes of an output; each left out is kept.
+    struct Change final {
+        // Empty gives the output back its own.
+        std::optional<std::string> name;
+        std::optional<bool> hidden;
+        // One of `icons`; empty leaves the choice to each client.
+        std::optional<std::string> icon;
+    };
+    // Kept by the engine, and told to every client.
+    [[nodiscard]] core::Result<void> configure(const std::string& id, Change change);
+    // ADR-0361: the outputs in this order, first to last; those not named
+    // follow, in the order they were.
+    [[nodiscard]] core::Result<void> arrange(std::vector<std::string> ids);
 
     struct Custom final {
         std::string name;
         bool hidden{false};
+        std::string icon;
     };
     // The outputs as clients are shown them: each named as the user named
-    // it, and those hidden left out -- unless `all`, or it is the one
-    // playing, which is never hidden from view.
-    [[nodiscard]] static std::vector<Listed>
-    shown(std::vector<Listed> listed, const std::map<std::string, Custom>& custom, bool all);
+    // it, in the user's order, and those hidden left out -- unless `all`, or
+    // it is the one playing, which is never hidden from view.
+    [[nodiscard]] static std::vector<Listed> shown(std::vector<Listed> listed,
+                                                   const std::map<std::string, Custom>& custom,
+                                                   const std::vector<std::string>& order, bool all);
     // "local", or "agent:<name>". Persisted, so a restart plays on the same.
     [[nodiscard]] core::Result<void> select(const std::string& id);
     // What was chosen last time. An agent chosen then and not connected yet
@@ -103,6 +124,7 @@ class Outputs final {
     [[nodiscard]] std::unique_ptr<output::AgentAudition> make_agent(const std::string& name);
     void announce();
     void keep_custom();
+    void keep_order();
     // ADR-0325: the volume and ReplayGain mode just set, kept for the output
     // playing; and those kept for `id`, given back to it.
     void remember();
@@ -124,6 +146,7 @@ class Outputs final {
     std::string selected_;
     std::map<std::string, Remembered> remembered_;
     std::map<std::string, Custom> custom_;
+    std::vector<std::string> order_;
     // Set while recall() gives settings back: what it sets is not news.
     std::atomic<bool> recalling_{false};
 #if MELODY_ENABLE_UPNP

@@ -17,6 +17,7 @@ must be inventoried before binary distribution.
 | PipeWire 0.3.50+ | M4 direct local audio output and real-time stream callback | Dynamic system library | MIT; compatible with GPLv3. PipeWire and SPA notices remain with their distribution packages. |
 | libupnp/pupnp 1.14+ | Optional SSDP discovery, GENA events, and UPnP renderer control (ADR-0235) | Dynamic system library, only with `MELODY_ENABLE_UPNP=ON` | BSD-3-Clause; compatible with GPLv3. The retained notice is in `packaging/licenses/pupnp.txt`. |
 | libebur128 1.2+ | EBU R128 integrated loudness and peak analysis | Dynamic system library | MIT; compatible with GPLv3. Copyright and license notices remain with the distribution package. |
+| Lucide icons (lucide-static 1.70.0) | The icons an output can be given (ADR-0361), in `packaging/icons/outputs` | 15 SVG files copied unchanged, built into the app as Qt resources | ISC; compatible with GPLv3. The license is retained in `packaging/icons/outputs/LICENSE-lucide`, and each file keeps its license comment. |
 | nlohmann/json 3.11+ | Test-only title-format corpus loader | Header-only, test target only | MIT; compatible with GPLv3. |
 | Chromaprint `fpcalc` | Optional AcoustID fingerprint subprocess | Separate optional executable, never linked | LGPL-2.1-or-later; Melody works without it and invokes an independently installed executable. |
 

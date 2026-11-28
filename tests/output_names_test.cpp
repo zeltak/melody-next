@@ -55,6 +55,20 @@ void check(const bool condition, const char* expression, const int line) {
     return found;
 }
 
+// Their ids, in the order a client is given them.
+[[nodiscard]] std::vector<std::string> ordered(const protocol::Dispatcher& dispatcher,
+                                               const bool all = false) {
+    std::vector<std::string> ids;
+    const auto answer =
+        call(dispatcher, "outputs.list", all ? Json{{"all", true}} : Json::object());
+    if (answer.result) {
+        for (const auto& output : answer.result->value("outputs", Json::array())) {
+            ids.push_back(output.value("id", std::string{}));
+        }
+    }
+    return ids;
+}
+
 void theRulesAlone() {
     using Listed = engine::Outputs::Listed;
     const std::vector<Listed> listed{
@@ -68,16 +82,28 @@ void theRulesAlone() {
         {"upnp:b", {.name = "", .hidden = true}},
         {"agent:porch", {.name = "Porch", .hidden = true}},
     };
-    const auto shown = engine::Outputs::shown(listed, custom, false);
+    const auto shown = engine::Outputs::shown(listed, custom, {}, false);
     CHECK(shown.size() == 3U);
     CHECK(shown[0].name == "Living room" && shown[0].reported_name == "LS50 Wireless II-c4e3");
     // Hidden, but playing: still shown, or no one could see what plays.
     CHECK(shown[1].id == "agent:porch" && shown[1].hidden && shown[1].name == "Porch");
     CHECK(shown[2].name == "melody-mini" && shown[2].reported_name == "melody-mini" &&
           !shown[2].hidden);
-    const auto every = engine::Outputs::shown(listed, custom, true);
+    const auto every = engine::Outputs::shown(listed, custom, {}, true);
     CHECK(every.size() == 4U);
     CHECK(every[1].hidden && every[1].name == "Samsung TV");
+
+    // In the user's order; those not in it after, as they were -- among
+    // them an id no longer found, which is passed over.
+    const auto arranged =
+        engine::Outputs::shown(listed, {}, {"local", "upnp:gone", "upnp:b"}, true);
+    CHECK(arranged.size() == 4U);
+    CHECK(arranged[0].id == "local" && arranged[1].id == "upnp:b" && arranged[2].id == "upnp:a" &&
+          arranged[3].id == "agent:porch");
+    // An icon chosen is given; none chosen, none.
+    const auto pictured = engine::Outputs::shown(
+        listed, {{"upnp:a", {.name = "", .hidden = false, .icon = "living-room"}}}, {}, true);
+    CHECK(pictured[0].icon == "living-room" && pictured[1].icon.empty());
 }
 
 } // namespace
@@ -149,6 +175,27 @@ int main() {
             CHECK(listed(dispatcher).count("agent:porch") == 1U);
             CHECK(listed(dispatcher)["agent:porch"].value("hidden", false));
 
+            // ADR-0361: put in the user's order, and given an icon.
+            CHECK(ordered(dispatcher, true) ==
+                  (std::vector<std::string>{"agent:kitchen", "agent:porch"}));
+            CHECK(!call(dispatcher, "outputs.arrange",
+                        Json{{"ids", {"agent:porch", "agent:kitchen"}}})
+                       .error);
+            CHECK(ordered(dispatcher, true) ==
+                  (std::vector<std::string>{"agent:porch", "agent:kitchen"}));
+            CHECK(announced.back().value("outputs", Json::array()).front().value("id", "") ==
+                  "agent:porch");
+            CHECK(!call(dispatcher, "outputs.configure",
+                        Json{{"id", "agent:porch"}, {"icon", "bath"}})
+                       .error);
+            CHECK(listed(dispatcher)["agent:porch"].value("icon", "") == "bath");
+            CHECK(call(dispatcher, "outputs.configure",
+                       Json{{"id", "agent:porch"}, {"icon", "spaceship"}})
+                      .error.has_value());
+            CHECK(call(dispatcher, "outputs.arrange", Json{{"ids", "agent:porch"}})
+                      .error.has_value());
+            CHECK(call(dispatcher, "outputs.arrange", Json{{"ids", {1, 2}}}).error.has_value());
+
             // Refused: no such output, a name too long, nothing to change.
             CHECK(call(dispatcher, "outputs.configure",
                        Json{{"id", "upnp:nothing"}, {"hidden", true}})
@@ -170,9 +217,17 @@ int main() {
         CHECK(workspace->save_engine_state(engine::Outputs::selection_key, "agent:kitchen", 2)
                   .has_value());
         restarted.restore();
+        CHECK(workspace->save_engine_state(engine::Outputs::selection_key, "agent:porch", 3)
+                  .has_value());
+        restarted.restore();
         auto kept = listed(again, true);
         CHECK(kept["agent:kitchen"].value("name", "") == "Kitchen radio");
         CHECK(kept["agent:kitchen"].value("hidden", false));
+        CHECK(kept["agent:porch"].value("icon", "") == "bath");
+        CHECK(ordered(again, true) == (std::vector<std::string>{"agent:porch", "agent:kitchen"}));
+        // An empty icon leaves the choice to each client again.
+        CHECK(!call(again, "outputs.configure", Json{{"id", "agent:porch"}, {"icon", ""}}).error);
+        CHECK(listed(again, true)["agent:porch"].value("icon", "x").empty());
 
         // An empty name gives the output its own back; shown again, it is
         // as it was, and nothing is kept for it.

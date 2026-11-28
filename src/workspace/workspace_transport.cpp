@@ -657,7 +657,9 @@ Workspace::OutputMenu Workspace::outputMenu() const {
             menu.speakers.push_back(OutputMenu::Speaker{.id = output.id,
                                                         .label = std::move(label),
                                                         .tooltip = std::move(tooltip),
-                                                        .checked = output.selected});
+                                                        .checked = output.selected,
+                                                        .icon = output.icon,
+                                                        .local = output.local});
         }
         const auto chosen =
             std::ranges::find_if(output_choices_, &EnginePlayback::State::Output::selected);

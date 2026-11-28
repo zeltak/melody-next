@@ -15,6 +15,7 @@
 #include "workspace/tab_store.hpp"
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QGroupBox>
 #include <QMessageBox>
 #include <QPainter>
@@ -93,6 +94,36 @@ void BenchMainWindowTest::Settings::outputsAreNamedAndShownOnTheEngine() {
     QTRY_VERIFY_WITH_TIMEOUT(view->isEnabled() && row() != nullptr &&
                                  row()->checkState(OutputNamesWidget::shown) == Qt::Checked,
                              10'000);
+    // Given an icon from the picker: the engine keeps it, the picker says it.
+    const auto picker = [view, &row] {
+        return qobject_cast<QComboBox*>(view->itemWidget(row(), OutputNamesWidget::icon));
+    };
+    QVERIFY(picker() != nullptr);
+    QCOMPARE(picker()->currentData().toString(), QString{});
+    const auto bath = picker()->findData(QStringLiteral("bath"));
+    QVERIFY(bath > 0);
+    picker()->setCurrentIndex(bath);
+    emit picker() -> activated(bath);
+    QTRY_VERIFY_WITH_TIMEOUT(view->isEnabled() && row() != nullptr && picker() != nullptr &&
+                                 picker()->currentData().toString() == QStringLiteral("bath"),
+                             10'000);
+    picker()->setCurrentIndex(0);
+    emit picker() -> activated(0);
+    QTRY_VERIFY_WITH_TIMEOUT(view->isEnabled() && row() != nullptr && picker() != nullptr &&
+                                 picker()->currentData().toString().isEmpty(),
+                             10'000);
+    // ADR-0361: moved down, and the engine lists it there.
+    if (view->topLevelItemCount() > 1) {
+        view->setCurrentItem(row());
+        QCOMPARE(view->indexOfTopLevelItem(row()), 0);
+        dialog->findChild<QPushButton*>(QStringLiteral("bench-output-names-down"))->click();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            view->isEnabled() && row() != nullptr && view->indexOfTopLevelItem(row()) == 1, 10'000);
+        view->setCurrentItem(row());
+        dialog->findChild<QPushButton*>(QStringLiteral("bench-output-names-up"))->click();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            view->isEnabled() && row() != nullptr && view->indexOfTopLevelItem(row()) == 0, 10'000);
+    }
     dialog->close();
 }
 

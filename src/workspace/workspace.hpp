@@ -926,6 +926,10 @@ class Workspace final : public QObject {
             QString label;
             QString tooltip;
             bool checked{false};
+            // ADR-0361: the icon chosen for it, or empty; and whether it is
+            // an engine's own audio, which has an icon of its own.
+            std::string icon;
+            bool local{false};
         };
         struct Device {
             std::optional<std::string> target;

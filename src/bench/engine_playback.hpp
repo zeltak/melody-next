@@ -141,6 +141,8 @@ class EnginePlayback final : public QObject {
             bool selected{false};
             // False for an agent that streams from the engine.
             bool files{true};
+            // ADR-0361: the icon chosen for it, or empty.
+            std::string icon;
             friend bool operator==(const Output&, const Output&) = default;
         };
         std::vector<Output> outputs;

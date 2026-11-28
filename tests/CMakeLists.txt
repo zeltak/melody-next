@@ -1068,6 +1068,16 @@ if(MELODY_BUILD_UI)
     add_dependencies(trackknife_m3u8_tests trackknife_engine_daemon)
     add_test(NAME m3u8 COMMAND trackknife_m3u8_tests)
     # ADR-0220: the library panel routed through an engine by a setting.
+    # ADR-0361: Settings' outputs moved, dragged and given icons, on an engine.
+    qt_add_executable(trackknife_output_names_widget_tests output_names_widget_test.cpp)
+    target_link_libraries(
+        trackknife_output_names_widget_tests
+        PRIVATE Trackknife::BenchUi Trackknife::Engine Trackknife::Protocol Qt6::Test
+                trackknife_project_options trackknife_project_warnings
+    )
+    add_test(NAME output-names-widget COMMAND trackknife_output_names_widget_tests)
+    set_tests_properties(output-names-widget PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     qt_add_executable(trackknife_library_panel_engine_tests library_panel_engine_test.cpp)
     target_link_libraries(
         trackknife_library_panel_engine_tests

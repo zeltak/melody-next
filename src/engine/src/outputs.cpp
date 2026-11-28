@@ -13,6 +13,7 @@
 #include <array>
 
 #include <chrono>
+#include <functional>
 #include <iostream>
 #include <utility>
 
@@ -129,9 +130,20 @@ Outputs::Outputs(Player& player, output::AgentPaths paths, Workspace* workspace,
                         continue;
                     }
                     Custom custom{.name = kept.value("name", std::string{}),
-                                  .hidden = kept.value("hidden", false)};
-                    if (!custom.name.empty() || custom.hidden) {
+                                  .hidden = kept.value("hidden", false),
+                                  .icon = kept.value("icon", std::string{})};
+                    if (!custom.name.empty() || custom.hidden || !custom.icon.empty()) {
                         custom_[id] = std::move(custom);
+                    }
+                }
+            }
+        }
+        if (auto stored = workspace_->load_engine_state(order_key); stored && *stored) {
+            const auto parsed = Json::parse(**stored, nullptr, false);
+            if (parsed.is_array()) {
+                for (const auto& id : parsed) {
+                    if (id.is_string()) {
+                        order_.push_back(id.get<std::string>());
                     }
                 }
             }
@@ -142,7 +154,13 @@ Outputs::Outputs(Player& player, output::AgentPaths paths, Workspace* workspace,
 
 std::vector<Outputs::Listed> Outputs::shown(std::vector<Listed> listed,
                                             const std::map<std::string, Custom>& custom,
-                                            const bool all) {
+                                            const std::vector<std::string>& order, const bool all) {
+    // The user's order first; those not in it after, as they were.
+    const auto place = [&order](const Listed& output) {
+        const auto found = std::ranges::find(order, output.id);
+        return static_cast<std::size_t>(found - order.begin());
+    };
+    std::ranges::stable_sort(listed, std::less{}, place);
     std::vector<Listed> visible;
     for (auto& output : listed) {
         output.reported_name = output.name;
@@ -151,6 +169,7 @@ std::vector<Outputs::Listed> Outputs::shown(std::vector<Listed> listed,
                 output.name = found->second.name;
             }
             output.hidden = found->second.hidden;
+            output.icon = found->second.icon;
         }
         if (all || !output.hidden || output.selected) {
             visible.push_back(std::move(output));
@@ -159,8 +178,14 @@ std::vector<Outputs::Listed> Outputs::shown(std::vector<Listed> listed,
     return visible;
 }
 
-core::Result<void> Outputs::configure(const std::string& id, std::optional<std::string> name,
-                                      const std::optional<bool> hidden) {
+core::Result<void> Outputs::configure(const std::string& id, Change change) {
+    auto& name = change.name;
+    if (change.icon && !change.icon->empty() &&
+        std::ranges::find(icons, std::string_view{*change.icon}) == icons.end()) {
+        return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                           .message = "no such output icon",
+                                           .context = {{.key = "icon", .value = *change.icon}}});
+    }
     if (name) {
         // Spaces around it are not part of it; inside, any text.
         const auto first = name->find_first_not_of(" \t\r\n");
@@ -183,16 +208,53 @@ core::Result<void> Outputs::configure(const std::string& id, std::optional<std::
         if (name) {
             custom.name = std::move(*name);
         }
-        if (hidden) {
-            custom.hidden = *hidden;
+        if (change.hidden) {
+            custom.hidden = *change.hidden;
         }
-        if (custom.name.empty() && !custom.hidden) {
+        if (change.icon) {
+            custom.icon = std::move(*change.icon);
+        }
+        if (custom.name.empty() && !custom.hidden && custom.icon.empty()) {
             custom_.erase(id);
         }
     }
     keep_custom();
     announce();
     return {};
+}
+
+core::Result<void> Outputs::arrange(std::vector<std::string> ids) {
+    std::vector<std::string> order;
+    for (auto& id : ids) {
+        if (std::ranges::find(order, id) == order.end()) {
+            order.push_back(std::move(id));
+        }
+    }
+    {
+        const std::lock_guard guard{mutex_};
+        // Outputs not named keep their place after those that are, among
+        // them any not found since: a renderer off now stays where it was.
+        for (const auto& id : order_) {
+            if (std::ranges::find(order, id) == order.end()) {
+                order.push_back(id);
+            }
+        }
+        order_ = std::move(order);
+    }
+    keep_order();
+    announce();
+    return {};
+}
+
+void Outputs::keep_order() {
+    Json stored;
+    {
+        const std::lock_guard guard{mutex_};
+        stored = order_;
+    }
+    if (workspace_ != nullptr) {
+        static_cast<void>(workspace_->save_engine_state(order_key, stored.dump(), now_ms()));
+    }
 }
 
 void Outputs::keep_custom() {
@@ -206,6 +268,9 @@ void Outputs::keep_custom() {
             }
             if (custom.hidden) {
                 entry["hidden"] = true;
+            }
+            if (!custom.icon.empty()) {
+                entry["icon"] = custom.icon;
             }
             stored[id] = std::move(entry);
         }
@@ -509,6 +574,7 @@ namespace {
                                {"name", output.name},
                                {"reported_name", output.reported_name},
                                {"hidden", output.hidden},
+                               {"icon", output.icon},
                                {"local", output.local},
                                {"online", output.online},
                                {"selected", output.selected},
@@ -523,7 +589,7 @@ namespace {
 std::vector<Outputs::Listed> Outputs::visible(const bool all) const {
     auto listed = list();
     const std::lock_guard guard{mutex_};
-    return shown(std::move(listed), custom_, all);
+    return shown(std::move(listed), custom_, order_, all);
 }
 
 void Outputs::announce() {
@@ -571,14 +637,43 @@ void register_output_methods(protocol::Dispatcher& dispatcher, Outputs& outputs)
             }
             hidden = given->get<bool>();
         }
-        if (!name && !hidden) {
+        std::optional<std::string> icon;
+        if (const auto given = params.find("icon"); given != params.end()) {
+            if (given->is_null()) {
+                icon = std::string{};
+            } else if (given->is_string()) {
+                icon = given->get<std::string>();
+            } else {
+                return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                                   .message = "an output's icon is a name",
+                                                   .context = {{.key = "param", .value = "icon"}}});
+            }
+        }
+        if (!name && !hidden && !icon) {
             return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
-                                               .message = "give a name, hidden, or both",
+                                               .message = "give a name, hidden or an icon",
                                                .context = {}});
         }
-        auto configured = outputs.configure(id->get<std::string>(), std::move(name), hidden);
+        auto configured = outputs.configure(
+            id->get<std::string>(),
+            Outputs::Change{.name = std::move(name), .hidden = hidden, .icon = std::move(icon)});
         if (!configured) {
             return std::unexpected(std::move(configured.error()));
+        }
+        return Json::object();
+    });
+    // ADR-0361: the outputs in the user's order, first to last.
+    dispatcher.on("outputs.arrange", [&outputs](const Json& params) -> core::Result<Json> {
+        const auto ids = params.find("ids");
+        if (ids == params.end() || !ids->is_array() || ids->size() > 1'000U ||
+            !std::ranges::all_of(*ids, [](const Json& id) { return id.is_string(); })) {
+            return std::unexpected(core::Error{.code = core::ErrorCode::invalid_argument,
+                                               .message = "ids is a list of output ids",
+                                               .context = {{.key = "param", .value = "ids"}}});
+        }
+        auto arranged = outputs.arrange(ids->get<std::vector<std::string>>());
+        if (!arranged) {
+            return std::unexpected(std::move(arranged.error()));
         }
         return Json::object();
     });

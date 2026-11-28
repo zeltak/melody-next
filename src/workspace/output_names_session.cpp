@@ -59,6 +59,8 @@ std::vector<OutputNamesSession::Output> outputsFrom(const protocol::Json& answer
             output.contains("reported_name") ? text(output, "reported_name") : kept.name;
         kept.renamed = kept.name != kept.reported;
         kept.hidden = output.value("hidden", false);
+        kept.icon = output.value("icon", std::string{});
+        kept.local = output.value("local", false);
         kept.online = output.value("online", false);
         kept.selected = output.value("selected", false);
         if (output.value("local", false)) {
@@ -105,37 +107,44 @@ void OutputNamesSession::load() {
 }
 
 void OutputNamesSession::rename(const QString& id, const QString& name) {
-    configure(id, name.trimmed(), std::nullopt);
+    send("outputs.configure",
+         protocol::Json{{"id", id.toStdString()}, {"name", name.trimmed().toStdString()}});
 }
 
 void OutputNamesSession::setShown(const QString& id, const bool shown) {
-    configure(id, std::nullopt, !shown);
+    send("outputs.configure", protocol::Json{{"id", id.toStdString()}, {"hidden", !shown}});
 }
 
-void OutputNamesSession::configure(const QString& id, std::optional<QString> name,
-                                   const std::optional<bool> hidden) {
+void OutputNamesSession::setIcon(const QString& id, const QString& icon) {
+    send("outputs.configure",
+         protocol::Json{{"id", id.toStdString()}, {"icon", icon.toStdString()}});
+}
+
+void OutputNamesSession::arrange(const std::vector<QString>& ids) {
+    auto listed = protocol::Json::array();
+    for (const auto& id : ids) {
+        listed.push_back(id.toStdString());
+    }
+    send("outputs.arrange", protocol::Json{{"ids", std::move(listed)}});
+}
+
+void OutputNamesSession::send(const char* method, protocol::Json params) {
     if (busy_ || !known_) {
         return;
     }
     busy_ = true;
     emit changed();
-    auto params = protocol::Json{{"id", id.toStdString()}};
-    if (name) {
-        params["name"] = name->toStdString();
-    }
-    if (hidden) {
-        params["hidden"] = *hidden;
-    }
     const QPointer self{this};
-    static_cast<void>(QtConcurrent::run([self, endpoint = endpoint_, params = std::move(params)] {
+    static_cast<void>(QtConcurrent::run([self, endpoint = endpoint_, method = std::string{method},
+                                         params = std::move(params)] {
         QString error;
         if (auto client = protocol::Client::connect(endpoint); !client) {
             error = QString::fromStdString(client.error().message);
         } else {
-            auto set = (*client)->call("outputs.configure", params, std::chrono::seconds{5});
+            auto set = (*client)->call(method, params, std::chrono::seconds{5});
             if (!set) {
                 error = set.error().code == core::ErrorCode::unsupported
-                            ? tr("This engine is too old to name or hide outputs; update it")
+                            ? tr("This engine is too old to name, hide or order outputs; update it")
                             : QString::fromStdString(set.error().message);
             }
             (*client)->close();

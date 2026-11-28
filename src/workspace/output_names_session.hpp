@@ -7,6 +7,7 @@
 #include <QString>
 
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace trackknife::bench {
@@ -27,6 +28,9 @@ class OutputNamesSession final : public QObject {
         QString reported;
         bool renamed{false};
         bool hidden{false};
+        // The icon chosen for it, or empty for Melody's own choice.
+        std::string icon;
+        bool local{false};
         bool online{false};
         bool selected{false};
         // What it is, in a word or two: "This engine", "Agent", "UPnP".
@@ -45,12 +49,17 @@ class OutputNamesSession final : public QObject {
     // An empty name gives the output its own back.
     void rename(const QString& id, const QString& name);
     void setShown(const QString& id, bool shown);
+    // One of the protocol's icon names; empty for Melody's own choice.
+    void setIcon(const QString& id, const QString& icon);
+    // ADR-0361: the outputs in this order, first to last.
+    void arrange(const std::vector<QString>& ids);
 
   signals:
     void changed();
 
   private:
-    void configure(const QString& id, std::optional<QString> name, std::optional<bool> hidden);
+    // Sends a change to the engine, then asks it again.
+    void send(const char* method, protocol::Json params);
 
     protocol::Endpoint endpoint_;
     bool known_{false};

@@ -89,9 +89,11 @@ qt_add_library(
     single_instance.cpp
     single_instance.hpp
     undo_location_widget.cpp
+    output_icons.cpp
     output_names_widget.cpp
     playlist_folder_widget.cpp
     undo_location_widget.hpp
+    output_icons.hpp
     output_names_widget.hpp
     playlist_folder_widget.hpp
     shortcut_settings.cpp
@@ -128,6 +130,22 @@ qt_add_resources(
     BASE "${PROJECT_SOURCE_DIR}/packaging/icons"
     FILES "${PROJECT_SOURCE_DIR}/packaging/icons/melody.svg"
           "${PROJECT_SOURCE_DIR}/packaging/icons/melody-mascot.svg"
+          # ADR-0361: the icons an output can be given.
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/speaker.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/headphones.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/tv.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/computer.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/laptop.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/phone.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/car.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/radio.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/living-room.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/kitchen.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/bath.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/bedroom.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/office.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/garden.svg"
+          "${PROJECT_SOURCE_DIR}/packaging/icons/outputs/music.svg"
 )
 # The release and the commit it was built from, for About Melody.
 execute_process(

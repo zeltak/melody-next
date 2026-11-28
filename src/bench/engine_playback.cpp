@@ -646,7 +646,8 @@ void EnginePlayback::adoptOutputs(const protocol::Json& payload) {
                 .local = output.value("local", false),
                 .online = output.value("online", false),
                 .selected = output.value("selected", false),
-                .files = output.value("files", true)});
+                .files = output.value("files", true),
+                .icon = output.value("icon", std::string{})});
         }
     }
     const std::lock_guard guard{mutex_};

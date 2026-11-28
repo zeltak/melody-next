@@ -12,14 +12,21 @@ client keeps a path for what an older engine lacked.
 
 ### Level 37 (2026-11-28)
 
-ADR-0361: outputs named as the user names them, and hidden.
+ADR-0361: outputs named, hidden, ordered and given icons by the user.
 
 - `outputs.list` and `outputs.changed` give each output's `name` as the
   user named it, `reported_name` as it calls itself, and `hidden`. A hidden
   output is left out unless it is the one playing; `outputs.list {all:
   true}` gives every output.
-- `outputs.configure {id, name?, hidden?}` -> `{}`: a name of at most 100
-  bytes, empty or null for the output's own; hidden true or false.
+- `outputs.configure {id, name?, hidden?, icon?}` -> `{}`: a name of at
+  most 100 bytes, empty or null for the output's own; hidden true or false;
+  icon one of speaker, headphones, tv, computer, laptop, phone, car, radio,
+  living-room, kitchen, bath, bedroom, office, garden, music, or empty or
+  null for none.
+- Each output also has `icon`: the name chosen, or empty.
+- `outputs.list` and `outputs.changed` give the outputs in the user's order;
+  `outputs.arrange {ids}` -> `{}` sets it, first to last, outputs not named
+  keeping their place after.
 
 ### Level 36 (2026-11-18)
 

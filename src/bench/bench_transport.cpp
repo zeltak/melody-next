@@ -5,6 +5,7 @@
 #include "bench/desktop_media_session.hpp"
 #include "bench/desktop_notifier.hpp"
 #include "bench/lyrics_panel.hpp"
+#include "bench/output_icons.hpp"
 #include <QDockWidget>
 
 #include "bench/bench_main_window_helpers.hpp"
@@ -626,6 +627,9 @@ void BenchMainWindow::rebuildDeviceMenu() {
                 QStringLiteral("action-output-%1").arg(QString::fromStdString(speaker.id)));
             action->setCheckable(true);
             action->setChecked(speaker.checked);
+            // ADR-0361: the icon chosen for it, or one for what it is.
+            action->setIcon(outputIcon(outputIconName(speaker.icon, speaker.local), palette()));
+            action->setIconVisibleInMenu(true);
             if (!speaker.tooltip.isEmpty()) {
                 action->setToolTip(speaker.tooltip);
             }
